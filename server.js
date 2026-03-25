@@ -3,6 +3,7 @@
 const express = require('express');
 const { DatabaseSync: Database } = require('node:sqlite');
 const path = require('path');
+const fs = require('fs');
 const crypto = require('crypto');
 const { runADASEngine } = require('./adasEngine');
 
@@ -11,7 +12,12 @@ const PORT = process.env.PORT || 3000;
 
 // ─── Database Setup ───────────────────────────────────────────────────────────
 
-const db = new Database(process.env.DB_PATH || path.join(__dirname, 'collisioniq.db'));
+const dbPath = process.env.DB_PATH || path.join(__dirname, 'collisioniq.db');
+const dbDir = path.dirname(dbPath);
+if (!fs.existsSync(dbDir)) {
+  fs.mkdirSync(dbDir, { recursive: true });
+}
+const db = new Database(dbPath);
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS jobs (
