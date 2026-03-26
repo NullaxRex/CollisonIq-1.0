@@ -219,44 +219,183 @@ function runADASEngine(make, model, year, repairs) {
   }
 
   // ─── Honda / Acura ────────────────────────────────────────────────────────
+  // Source: American Honda — Aiming Driving Support Systems Job Aid v12 (August 2025)
+  //         Acura — Aiming Driving Support Systems Job Aid v7 (August 2025)
+  //         American Honda — Post-Collision Diagnostic Scan and Calibration Requirements v6 (July 2025)
   else if (makeLower.includes('honda') || makeLower.includes('acura')) {
-    preScanRequired  = 'REQUIRED — all collisions exceeding minor outer panel cosmetic distortion — American Honda Position Statement May 2019';
-    postScanRequired = 'REQUIRED — all collisions, any electrical disconnect, any body part replacement';
-    approvedScanTool = 'Honda i-HDS with Denso DST-i VCI device (techinfo.honda.com)';
-    sourceCitation   = 'American Honda Position Statement, May 2019';
+    // ── Steps 2 & 10: Source citation and scan language ──────────────────────
+    sourceCitation =
+      'American Honda — Aiming Driving Support Systems Job Aid v12 (August 2025); ' +
+      'Acura — Aiming Driving Support Systems Job Aid v7 (August 2025); ' +
+      'American Honda — Post-Collision Diagnostic Scan and Calibration Requirements v6 (July 2025)';
 
-    if (hasRepair('windshield', 'front camera')) {
-      adasSystems.push('Multipurpose Camera Unit (Honda Sensing) Calibration Required — Static');
+    preScanRequired =
+      'REQUIRED — Pre-repair scan required on all Honda/Acura collision jobs. ' +
+      'Perform during repair estimation phase to identify existing DTCs before repair begins. ' +
+      'Absence of dashboard warning lights does NOT waive this requirement — ' +
+      'many DTCs do not illuminate indicators.';
+
+    postScanRequired =
+      'REQUIRED — Post-repair scan required on all Honda/Acura collision jobs. ' +
+      'Any repair requiring disconnection of electrical components requires a post-repair scan ' +
+      'to confirm reconnection and proper function. Body part replacement always requires a post-repair scan.';
+
+    // ── Step 3: Approved scan tool ────────────────────────────────────────────
+    approvedScanTool =
+      "i-HDS with Denso DST-i VCI (Honda factory-authorized only). 'OEM Compatible' or 'OEM-C' labeled " +
+      'scan tools have NOT been validated by American Honda and cannot be recorded as an OEM Diagnostic Scan.';
+
+    // ── Step 4: Structural damage definition (governs radar/camera/BSI triggers) ─
+    const HONDA_STRUCTURAL_DAMAGE_DEF =
+      'Structural damage means any damage beyond minor cosmetic abrasions to the welded, riveted, or bonded ' +
+      'parts of the main unibody, as well as the bumper reinforcements, door intrusion beams, or bolt-on ' +
+      'front bulkheads.';
+
+    const hasStructural = hasRepair(
+      'structural', 'unibody', 'frame', 'bumper reinforcement', 'door intrusion beam', 'front bulkhead'
+    );
+    const hasFrontStructural = hasStructural;
+    const hasRearStructural  = hasRepair(
+      'rear structural', 'rear unibody', 'rear frame', 'rear bumper reinforcement'
+    );
+    const hasSRS = hasRepair('airbag', 'srs', 'air bag', 'deployed');
+
+    // ── Step 5A: Front Millimeter Wave Radar ─────────────────────────────────
+    if (hasRepair('front bumper') || hasFrontStructural || hasSRS || hasRepair('radar')) {
+      adasSystems.push('Front Millimeter Wave Radar — Aiming Required');
       rationaleItems.push(
-        'Windshield or front camera area repair detected: Multipurpose Camera Unit (Honda Sensing) ' +
-        'calibration required. Static calibration — requires target board. Refer to techinfo.honda.com ' +
-        "and search keyword 'Aiming'."
+        'Front Millimeter Wave Radar — Aiming Required (STATIC). ' +
+        'Triggered by: front bumper repair/replacement, structural body repair, airbag/SRS deployment, ' +
+        'or radar unit removed/replaced (order replacement by VIN). ' +
+        'Pre-condition: 4-wheel alignment check required before radar aiming if calibration is collision-related. ' +
+        'Source: Honda Job Aid v12 / Acura Job Aid v7 (August 2025). ' +
+        'Structural damage definition (August 2025): ' + HONDA_STRUCTURAL_DAMAGE_DEF
       );
     }
-    if (hasRepair('front bumper', 'radar')) {
-      adasSystems.push('Millimeter Wave Radar Unit Calibration Required');
+
+    // ── Step 5B: Multipurpose Camera / FCW-LDW Camera (Windshield-Mounted) ───
+    if (hasRepair('windshield') || hasFrontStructural || hasSRS) {
+      adasSystems.push('Multipurpose Camera / FCW-LDW Camera — Aiming Required');
       rationaleItems.push(
-        'Front bumper or radar repair detected: Millimeter Wave Radar Unit calibration required per Honda/Acura OEM procedure.'
+        'Multipurpose Camera / FCW-LDW Camera — Aiming Required (STATIC). ' +
+        'Triggered by: windshield repair/replacement, structural body repair, or airbag/SRS deployment. ' +
+        'OE PARTS REQUIRED: Honda/Acura genuine replacement windshield required. ' +
+        'Aftermarket windshield will cause camera aiming failure. Order by VIN. ' +
+        'Pre-condition: 4-wheel alignment check required before camera aiming if calibration is collision-related. ' +
+        'Source: Honda Job Aid v12 / Acura Job Aid v7 (August 2025).'
       );
     }
-    if (hasRepair('rear bumper', 'mirror')) {
-      adasSystems.push('Blind Spot Information System Calibration Required');
+
+    // ── Step 5C: Blind Spot Information (BSI) Radar — Rear ───────────────────
+    if (hasRepair('rear bumper') || hasRearStructural) {
+      adasSystems.push('BSI Radar (Blind Spot Information) — Aiming Required');
       rationaleItems.push(
-        'Rear bumper or mirror area repair detected: Blind Spot Information System calibration required per Honda/Acura OEM procedure.'
+        'BSI Radar (Blind Spot Information) — Aiming Required (STATIC). ' +
+        'Triggered by: rear bumper repair/replacement or rear structural body repair ' +
+        '(rear-of-vehicle only — front structural rule does NOT apply to BSI). ' +
+        'Pre-condition: Perform BSI Mounting Area Check before installing replacement unit. ' +
+        'Inspect replacement rear bumper cover for damage in radar wave emission range before installation — ' +
+        'cracks, dents, or gouges in this zone require replacement, not repair. ' +
+        'Source: Honda Job Aid v12 / Acura Job Aid v7 (August 2025) + ' +
+        'American Honda Non-Repairable Zones on Bumper Covers v1 (September 2024).'
       );
     }
-    if (hasRepair('passenger door', 'door', 'mirror')) {
-      adasSystems.push('LaneWatch / Multi-View Camera System Calibration Required');
+
+    // ── Step 5D: LaneWatch Camera (Honda only) ───────────────────────────────
+    if (makeLower.includes('honda') && hasRepair('door', 'mirror', 'passenger door', 'passenger side')) {
+      adasSystems.push('LaneWatch Camera — Aiming Required (Honda only)');
       rationaleItems.push(
-        'Door or mirror repair detected: LaneWatch camera (Honda) or Multi-View Camera System (Acura) calibration may be required.'
+        'LaneWatch Camera — Aiming Required (Honda only, STATIC). ' +
+        'Triggered by: door/mirror repair (passenger side) or front passenger door removed, replaced, or adjusted. ' +
+        'NOTE: LaneWatch aiming does not require i-HDS. Uses audio/nav unit with LaneWatch switch. ' +
+        'Not accessible via i-HDS scan — refer to techinfo.honda.com for procedure. ' +
+        'Source: Honda Job Aid v12 (August 2025).'
       );
     }
+
+    // ── Step 5E: Multi View Camera System (MVCS) ─────────────────────────────
+    const mvcsTriggers = [];
+    if (hasRepair('front bumper'))                                          mvcsTriggers.push('front camera');
+    if (hasRepair('windshield') && !mvcsTriggers.includes('front camera')) mvcsTriggers.push('front camera (windshield)');
+    if (hasRepair('driver', 'driver door', 'driver mirror', 'driver side')) mvcsTriggers.push('left side camera');
+    if (hasRepair('passenger door', 'passenger mirror', 'passenger side'))  mvcsTriggers.push('right side camera');
+    if (hasRepair('rear bumper'))                                           mvcsTriggers.push('rear camera');
+
+    if (mvcsTriggers.length > 0) {
+      adasSystems.push('Multi View Camera System (MVCS) — Aiming Required');
+      rationaleItems.push(
+        'Multi View Camera System (MVCS) — Aiming Required (STATIC). ' +
+        'Cameras requiring aiming: ' + mvcsTriggers.join(', ') + '. ' +
+        'NOTE: Aim only the camera(s) applicable to the component removed, replaced, or adjusted. ' +
+        'It is not necessary to aim all four cameras unless all applicable components were affected. ' +
+        'Source: Honda Job Aid v12 / Acura Job Aid v7 (August 2025).'
+      );
+    }
+
+    // ── Step 6: 4-Wheel Alignment Pre-Condition (any ADAS trigger from collision) ─
+    if (adasSystems.length > 0) {
+      rationaleItems.push(
+        '4-Wheel Alignment Check Required — Honda/Acura OEM Rule (August 2025): ' +
+        'If aiming a radar or camera is necessary due to a collision, a four-wheel alignment check MUST be performed. ' +
+        'If wheel alignment is not within specifications, it must be corrected BEFORE aiming or calibrating any camera or radar. ' +
+        'NOTE: Alignment alone (e.g., tire replacement + alignment) does NOT require ADAS recalibration unless ' +
+        'service info specifically states otherwise.'
+      );
+    }
+
+    // ── Step 7A: Front Passenger Seat Weight Sensor (mandatory — every job) ──
+    rationaleItems.push(
+      'MANDATORY: Front passenger seat weight sensor (SWS/ODS) inspection required after ANY collision ' +
+      'regardless of damage severity and even if no airbags deployed. ' +
+      'Requires scan tool verification of empty-seat detection. ' +
+      'Controls front passenger airbag operation and PASSENGER AIRBAG OFF indicator.'
+    );
+
+    // ── Step 7B: Battery Reconnect Reset Procedures (mandatory — every job) ──
+    rationaleItems.push(
+      'Battery Reconnect Reset Required: After collision repairs and battery reconnection, verify and perform ' +
+      'reset procedures for: Audio/Navigation system, Steering Angle Position Sensor, engine idle speed learn, ' +
+      'power windows/tailgate/moonroof/power sliding door (position and pinch detection), ' +
+      "keyless access and immobilizer/security system. Search 'Reset' at techinfo.honda.com for " +
+      'vehicle-specific reset procedure list.'
+    );
+
+    // ── Step 8: OE Parts Warning Flags ───────────────────────────────────────
+    if (hasRepair('windshield')) {
+      rationaleItems.push(
+        'OE PARTS REQUIRED: Honda/Acura genuine replacement windshield required for all models with forward camera (2013-present). ' +
+        'Aftermarket windshield causes aiming failure. ' +
+        'For HUD-equipped vehicles (2014+): non-OE windshield causes double image in HUD display. ' +
+        'Order by VIN — no visual difference exists between OE HUD and non-HUD glass.'
+      );
+    }
+    if (hasRepair('front bumper', 'grille', 'front grille', 'radar cover')) {
+      rationaleItems.push(
+        'OE PARTS REQUIRED: Front grille and radar-area emblem are radar-transparent by design. ' +
+        'Non-OE grille parts obstruct radar and will trigger DTC P2583-97. ' +
+        'Wrong trim-level parts also obstruct radar even if they fit physically. ' +
+        'Do not paint radar covers or apply wraps to any grille or radar cover.'
+      );
+    }
+    if (hasRepair('rear bumper')) {
+      rationaleItems.push(
+        'OE PARTS REQUIRED: Non-Honda Genuine rear bumper covers may differ in material or thickness, ' +
+        'affecting BSI radar performance. Cracks, dents, or gouges within the BSI radar wave emission range ' +
+        'CANNOT be repaired — replacement required. ' +
+        'Paint scratches in emission range: sand and repaint entire emission zone — do NOT blend.'
+      );
+    }
+
+    // ── Step 9: Rationale and liability warning ───────────────────────────────
     liabilityWarning =
-      'American Honda requires pre AND post-repair diagnostic scans on ALL collision repairs. Dashboard warning lights are NOT ' +
-      'sufficient to determine scan necessity. Only i-HDS can perform complete All DTC Check.';
+      'Honda/Acura ADAS calibration required. Dynamic calibration requires a four-wheel alignment check before any aiming procedure. ' +
+      'All replacement radar, camera, and sensor units must be ordered by VIN. ' +
+      "'OEM Compatible' scan tools are not accepted for Honda/Acura OEM scan documentation — " +
+      'i-HDS with Denso DST-i VCI required.';
+
     makeSpecificNotes =
-      'Use i-HDS All DTC Check feature. Front passenger seat weight sensor inspection required after any collision regardless ' +
-      "of damage. Refer to techinfo.honda.com for aiming procedures by searching keyword 'Aiming'.";
+      'Honda/Acura ADAS calibration required per American Honda Aiming Driving Support Systems Job Aid v12 (Honda) ' +
+      'and v7 (Acura), August 2025, and Post-Collision Diagnostic Scan and Calibration Requirements v6, July 2025.';
   }
 
   // ─── Nissan / Infiniti ────────────────────────────────────────────────────
@@ -674,10 +813,8 @@ function runADASEngine(make, model, year, repairs) {
       );
       rationaleItems.push('Ford/Lincoln: SODCM operation check required after door/mirror repair per Ford WSM Section 413-13A.');
     } else if (makeLower.includes('honda') || makeLower.includes('acura')) {
-      adasSystems.push(
-        'LaneWatch Camera (Honda) / Multi-View Camera System Side Cameras (Acura) — Calibration Required if camera or attached body component adjusted or replaced.'
-      );
-      rationaleItems.push('Honda/Acura: LaneWatch / Multi-View Camera System calibration required after door/mirror repair.');
+      // LaneWatch and MVCS are handled in the main Honda/Acura block above.
+      // This branch intentionally left as a no-op to avoid double-flagging.
     } else if (
       makeLower.includes('chevy') || makeLower.includes('chevrolet') ||
       makeLower.includes('gmc') || makeLower.includes('buick') || makeLower.includes('cadillac')
