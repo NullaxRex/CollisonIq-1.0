@@ -262,6 +262,24 @@ function applyGradeFlag(vin, shopId, jobId, techName, itemType, subItem, grade, 
   }
 }
 
+/** Photo placeholder card (used in /new collision form) */
+function photoPlaceholderCard(label, required, hint) {
+  const badge = required
+    ? '<span class="photo-badge photo-badge-required">REQUIRED</span>'
+    : '<span class="photo-badge photo-badge-optional">OPTIONAL</span>';
+  return `
+    <div class="photo-placeholder-card" onclick="alert('Photo upload coming soon')">
+      ${badge}
+      <svg class="photo-placeholder-icon" viewBox="0 0 24 24" fill="none" stroke="#AAAAAA" stroke-width="1.5"
+           stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg">
+        <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+        <circle cx="12" cy="13" r="4"/>
+      </svg>
+      <div class="photo-placeholder-label">${escapeHtml(label)}</div>
+      <div class="photo-placeholder-hint">${escapeHtml(hint)}</div>
+    </div>`;
+}
+
 /** Server-side grade button HTML (used in tech view form) */
 function gradeButtonHtml(fieldId, currentGrade) {
   const g = currentGrade || '';
@@ -458,6 +476,13 @@ app.get('/new', (req, res) => {
 
     <!-- VIN Flag Warning Panel (populated via JS on VIN blur) -->
     <div id="vin-flags-panel" class="vin-flag-panel hidden" role="alert"></div>
+
+    <!-- Change track bar (shown after a track is selected) -->
+    <div id="changeTrackBar" class="change-track-bar hidden">
+      <button type="button" onclick="changeTrack()" class="btn btn-ghost btn-sm">
+        &larr; Change job type
+      </button>
+    </div>
 
     <!-- ── STEP 2: TRACK SELECTOR ───────────────────────────────────────────── -->
     <div class="track-selector" id="trackSelector">
@@ -822,6 +847,106 @@ app.get('/new', (req, res) => {
           </div>
         </div>
 
+        <!-- ── Photo Documentation Placeholder (renders after grade selected) ── -->
+        <div id="photo-doc-section" class="hidden">
+
+          <!-- TOTAL grade notice -->
+          <div id="total-loss-notice" class="total-loss-notice hidden">
+            This job is graded <strong>TOTAL LOSS</strong>. Photo documentation preserves the pre-repair state
+            for the insurance claim. Complete Layer 1 in full. Layer 2 is not required unless partial repairs
+            were authorized by the insurer.
+          </div>
+
+          <!-- ── LAYER 1 ──────────────────────────────────────────────────── -->
+          <div class="photo-layer-section">
+            <div class="photo-layer-header">
+              <div>
+                <h2 class="photo-layer-title-form">Layer 1 &mdash; General Area</h2>
+                <p class="photo-layer-subtitle">Establish full context before documenting specific damage.</p>
+              </div>
+              <div class="photo-progress-pill" id="layer1-progress">Layer 1 Complete: 0 of 6 photos</div>
+            </div>
+
+            <div class="photo-placeholder-grid" id="layer1-grid">
+              ${[
+                { label: 'Front Full View',            req: true,  hint: 'Full front of vehicle, all lights and panels visible' },
+                { label: 'Driver Side Full View',      req: true,  hint: 'Full driver side from bumper to bumper' },
+                { label: 'Passenger Side Full View',   req: true,  hint: 'Full passenger side from bumper to bumper' },
+                { label: 'Rear Full View',             req: true,  hint: 'Full rear of vehicle, all lights and panels visible' },
+                { label: 'Impact Zone — Wide',         req: true,  hint: 'Full impact area in context, show surrounding panels' },
+                { label: 'Adjacent Panels',            req: true,  hint: 'Panels directly neighboring primary damage zone' },
+              ].map(p => photoPlaceholderCard(p.label, p.req, p.hint)).join('')}
+            </div>
+          </div>
+
+          <!-- ── LAYER 2 ──────────────────────────────────────────────────── -->
+          <div class="photo-layer-section" id="layer2-section">
+            <div class="photo-layer-header">
+              <div>
+                <h2 class="photo-layer-title-form">Layer 2 &mdash; Focused Damage &amp; Repair</h2>
+                <p class="photo-layer-subtitle">Document specific damage, repair process, and ADAS verification.</p>
+              </div>
+              <div class="photo-progress-pill" id="layer2-progress">Layer 2 Complete: 0 of 12 required photos</div>
+            </div>
+
+            <!-- Locked overlay (shown until Layer 1 complete) -->
+            <div class="layer2-lock-overlay" id="layer2-lock">
+              <span class="layer2-lock-icon">&#128274;</span>
+              <span>Complete Layer 1 to unlock focused damage documentation</span>
+            </div>
+
+            <!-- Damage Detail sub-group -->
+            <div class="photo-subgroup">
+              <div class="photo-subgroup-header">Damage Detail</div>
+              <div class="photo-placeholder-grid">
+                ${[
+                  { label: 'Primary Damage — Close',  req: true,  hint: 'Closest detail shot of primary impact point' },
+                  { label: 'Secondary Damage — Close',req: false, hint: 'Any secondary damage points, close detail' },
+                  { label: 'Structural Concern',      req: false, hint: 'Any visible structural deformation, close detail' },
+                ].map(p => photoPlaceholderCard(p.label, p.req, p.hint)).join('')}
+              </div>
+            </div>
+
+            <!-- In-Process Repair sub-group -->
+            <div class="photo-subgroup">
+              <div class="photo-subgroup-header">In-Process Repair</div>
+              <div class="photo-placeholder-grid">
+                ${[
+                  { label: 'Disassembly State',              req: true,  hint: 'Vehicle at full disassembly before repair begins' },
+                  { label: 'Structural Repair — In Progress',req: false, hint: 'Frame or structural work in progress' },
+                  { label: 'Panel Work — In Progress',       req: false, hint: 'Panel replacement or repair in progress' },
+                  { label: 'Pre-Paint / Pre-Assembly',       req: true,  hint: 'Vehicle state before reassembly begins' },
+                ].map(p => photoPlaceholderCard(p.label, p.req, p.hint)).join('')}
+              </div>
+            </div>
+
+            <!-- ADAS Setup Documentation sub-group (hidden for MINOR grade) -->
+            <div class="photo-subgroup" id="adas-doc-subgroup">
+              <div class="photo-subgroup-header">ADAS Setup Documentation</div>
+              <div class="photo-placeholder-grid">
+                ${[
+                  { label: 'Calibration Target Placement', req: true, hint: 'Target board or fixture positioned per OEM spec' },
+                  { label: 'Tool Connection',              req: true, hint: 'Scan tool or calibration tool connected and active' },
+                  { label: 'Calibration Readings',         req: true, hint: 'Screen showing calibration result or completion confirmation' },
+                ].map(p => photoPlaceholderCard(p.label, p.req, p.hint)).join('')}
+              </div>
+            </div>
+
+            <!-- Finished State sub-group -->
+            <div class="photo-subgroup">
+              <div class="photo-subgroup-header">Finished State</div>
+              <div class="photo-placeholder-grid">
+                ${[
+                  { label: 'Repair Complete — Full View',   req: true, hint: 'Full vehicle showing completed repair area' },
+                  { label: 'Repair Complete — Close Detail',req: true, hint: 'Close shot of repaired area matching opening damage photo' },
+                  { label: 'Post-Repair Scan Screen',       req: true, hint: 'Scan tool showing no active ADAS-related DTCs' },
+                ].map(p => photoPlaceholderCard(p.label, p.req, p.hint)).join('')}
+              </div>
+            </div>
+
+          </div><!-- /layer2-section -->
+        </div><!-- /photo-doc-section -->
+
         <div class="form-actions">
           <a href="/" class="btn btn-ghost">Cancel</a>
           <button type="submit" class="btn btn-primary btn-lg">Submit &amp; Generate ADAS Report</button>
@@ -832,10 +957,23 @@ app.get('/new', (req, res) => {
     <script>
     /* ── Track Selection ─────────────────────────────────────────────────── */
     function selectTrack(track) {
+      // Hide selector, show only the chosen form
+      document.getElementById('trackSelector').classList.add('hidden');
+      document.querySelectorAll('.track-form').forEach(function(f) { f.classList.add('hidden'); });
       document.querySelectorAll('.track-btn').forEach(function(b) { b.classList.remove('selected'); });
       document.getElementById(track === 'general-maintenance' ? 'btn-gm' : 'btn-collision').classList.add('selected');
-      document.querySelectorAll('.track-form').forEach(function(f) { f.classList.add('hidden'); });
       document.getElementById(track === 'general-maintenance' ? 'gm-form' : 'collision-form').classList.remove('hidden');
+      document.getElementById('changeTrackBar').classList.remove('hidden');
+    }
+
+    function changeTrack() {
+      // Reset to selector, clear both forms
+      document.getElementById('trackSelector').classList.remove('hidden');
+      document.querySelectorAll('.track-form').forEach(function(f) { f.classList.add('hidden'); });
+      document.querySelectorAll('.track-btn').forEach(function(b) { b.classList.remove('selected'); });
+      document.getElementById('changeTrackBar').classList.add('hidden');
+      document.getElementById('vin-flags-panel').classList.add('hidden');
+      document.getElementById('vin-flags-panel').innerHTML = '';
     }
 
     /* ── Service Module Expand/Collapse ─────────────────────────────────── */
@@ -864,6 +1002,29 @@ app.get('/new', (req, res) => {
       });
       document.getElementById('collision_grade').value = grade;
       document.getElementById('collision-rest').classList.remove('hidden');
+
+      // Show photo section
+      document.getElementById('photo-doc-section').classList.remove('hidden');
+
+      // TOTAL grade notice
+      document.getElementById('total-loss-notice').classList.toggle('hidden', grade !== 'TOTAL');
+
+      // MINOR grade: hide ADAS Setup Documentation sub-group
+      document.getElementById('adas-doc-subgroup').classList.toggle('hidden', grade === 'MINOR');
+
+      // TOTAL grade: flip all Layer 2 badges to OPTIONAL
+      var l2 = document.getElementById('layer2-section');
+      l2.querySelectorAll('.photo-badge-required').forEach(function(b) {
+        if (grade === 'TOTAL') {
+          b.textContent = 'OPTIONAL';
+          b.classList.replace('photo-badge-required', 'photo-badge-optional');
+          b.dataset.wasRequired = '1';
+        } else if (b.dataset.wasRequired) {
+          b.textContent = 'REQUIRED';
+          b.classList.replace('photo-badge-optional', 'photo-badge-required');
+          delete b.dataset.wasRequired;
+        }
+      });
     }
 
     /* ── Oil Change Auto-Calculate ───────────────────────────────────────── */
