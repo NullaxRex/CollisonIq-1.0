@@ -1401,3 +1401,389 @@ a:hover {
 
   .ref-trigger-table thead th:first-child { width: 40%; }
 }
+
+/* ─── Track Selector ──────────────────────────────────────────────────────── */
+
+.track-selector {
+  background: #fff;
+  border: 1px solid #d0dce8;
+  border-radius: 8px;
+  padding: 2rem;
+  margin-bottom: 2rem;
+  text-align: center;
+}
+
+.track-selector-label {
+  font-size: 1rem;
+  color: #5a6a7a;
+  margin-bottom: 1.25rem;
+  font-weight: 500;
+}
+
+.track-btn-row {
+  display: flex;
+  gap: 1.25rem;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.track-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 1.5rem 2.5rem;
+  border: 2px solid #c5d4e0;
+  border-radius: 8px;
+  background: #fff;
+  color: #2c3e50;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+  min-width: 220px;
+}
+
+.track-btn:hover {
+  border-color: #2980b9;
+  background: #f0f7fd;
+}
+
+.track-btn.selected {
+  border-color: #1a3a5c;
+  background: #1a3a5c;
+  color: #fff;
+}
+
+.track-btn-icon {
+  font-size: 1.75rem;
+}
+
+.track-btn-title {
+  font-size: 1rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+
+.track-btn-sub {
+  font-size: 0.78rem;
+  opacity: 0.75;
+  text-align: center;
+  max-width: 200px;
+}
+
+.track-form {
+  animation: fadeIn 0.15s ease;
+}
+
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; } }
+
+/* ─── Service Modules ─────────────────────────────────────────────────────── */
+
+.service-module {
+  border: 1px solid #d0dce8;
+  border-radius: 6px;
+  margin-bottom: 1rem;
+  overflow: hidden;
+}
+
+.module-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.85rem 1.25rem;
+  background: #f5f8fb;
+  cursor: pointer;
+  user-select: none;
+  font-weight: 600;
+  color: #1a3a5c;
+}
+
+.module-toggle input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+  accent-color: #2980b9;
+}
+
+.module-toggle-label {
+  font-size: 0.95rem;
+}
+
+.module-body {
+  padding: 1.25rem;
+  border-top: 1px solid #d0dce8;
+  background: #fff;
+}
+
+/* ─── Service Sub-Item Rows ───────────────────────────────────────────────── */
+
+.service-sub-items {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.sub-item-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.sub-item-label {
+  min-width: 110px;
+  font-weight: 500;
+  font-size: 0.875rem;
+  color: #344;
+}
+
+.measurement-input {
+  width: 90px;
+  padding: 0.3rem 0.6rem;
+  border: 1px solid #c5d4e0;
+  border-radius: 4px;
+  font-size: 0.85rem;
+}
+
+/* ─── Grade Buttons ───────────────────────────────────────────────────────── */
+
+.grade-btn-row {
+  display: flex;
+  gap: 0.3rem;
+}
+
+.grade-btn {
+  padding: 0.3rem 0.75rem;
+  border: 1px solid #c5d4e0;
+  border-radius: 4px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  background: #fff;
+  transition: background 0.1s, color 0.1s, border-color 0.1s;
+  letter-spacing: 0.03em;
+}
+
+.grade-btn:hover { filter: brightness(0.93); }
+
+.grade-green            { color: #1A6B1A; border-color: #a8d5a8; }
+.grade-green.selected   { background: #D6F0D6; border-color: #1A6B1A; color: #1A6B1A; box-shadow: 0 0 0 2px #1A6B1A44; }
+
+.grade-yellow           { color: #7A6000; border-color: #ffe080; }
+.grade-yellow.selected  { background: #FFF9CC; border-color: #7A6000; color: #7A6000; box-shadow: 0 0 0 2px #7A600044; }
+
+.grade-red              { color: #8B0000; border-color: #ffb3b3; }
+.grade-red.selected     { background: #FFD6D6; border-color: #8B0000; color: #8B0000; box-shadow: 0 0 0 2px #8B000044; }
+
+/* Grade badges (display) */
+.grade-badge { font-weight: 700; font-size: 0.78rem; padding: 0.15rem 0.55rem; border-radius: 4px; }
+.grade-badge-green  { background: #D6F0D6; color: #1A6B1A; }
+.grade-badge-yellow { background: #FFF9CC; color: #7A6000; }
+.grade-badge-red    { background: #FFD6D6; color: #8B0000; }
+
+.grade-text-green  { color: #1A6B1A; }
+.grade-text-yellow { color: #7A6000; }
+.grade-text-red    { color: #8B0000; }
+
+/* ─── VIN Flag Warning Panel ──────────────────────────────────────────────── */
+
+.vin-flag-panel {
+  background: #FFF3CD;
+  border-left: 4px solid #E6AC00;
+  border-radius: 4px;
+  padding: 1rem 1.25rem;
+  margin-bottom: 1.5rem;
+  font-size: 0.9rem;
+  color: #5a4500;
+}
+
+.vin-flag-item {
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid #f0d980;
+}
+
+/* ─── Form helpers ────────────────────────────────────────────────────────── */
+
+.form-group-full { grid-column: 1 / -1; }
+
+.field-hint       { display: block; font-size: 0.78rem; margin-top: 0.2rem; color: #888; }
+.hint-ok          { color: #1A6B1A; }
+.hint-err         { color: #8B0000; }
+
+.field-readonly {
+  background: #f5f8fb;
+  color: #555;
+}
+
+/* ─── Collision Grade Selector ────────────────────────────────────────────── */
+
+.collision-grade-row {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-top: 0.75rem;
+}
+
+.collision-grade-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 1rem 1.5rem;
+  border: 2px solid #c5d4e0;
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+  min-width: 150px;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+
+.collision-grade-btn:hover   { border-color: #2980b9; background: #f0f7fd; }
+.collision-grade-btn.selected { border-color: #1a3a5c; background: #1a3a5c; color: #fff; }
+
+.cgb-label { font-size: 1rem; font-weight: 800; letter-spacing: 0.05em; }
+.cgb-def   { font-size: 0.72rem; text-align: center; opacity: 0.75; max-width: 160px; }
+
+/* ─── Checkpoint List ─────────────────────────────────────────────────────── */
+
+.checkpoint-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.checkpoint-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid #d0dce8;
+  border-radius: 5px;
+  background: #fff;
+  flex-wrap: wrap;
+}
+
+.checkpoint-row.checkpoint-done {
+  background: #f0faf0;
+  border-color: #aaddaa;
+}
+
+.checkpoint-num {
+  width: 1.8rem;
+  height: 1.8rem;
+  background: #1a3a5c;
+  color: #fff;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.8rem;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.checkpoint-done .checkpoint-num { background: #1A6B1A; }
+
+.checkpoint-label  { flex: 1; font-size: 0.9rem; font-weight: 500; min-width: 180px; }
+.checkpoint-status { font-size: 0.83rem; color: #444; }
+
+.cp-print-row { font-size: 0.85rem; padding: 0.3rem 0; border-bottom: 1px solid #eee; }
+
+/* ─── Photo Grid ──────────────────────────────────────────────────────────── */
+
+.photo-layer-block {
+  margin-bottom: 1.5rem;
+  padding: 1rem;
+  border: 1px solid #d0dce8;
+  border-radius: 6px;
+}
+
+.photo-layer-block.layer-locked { opacity: 0.6; pointer-events: none; }
+
+.photo-layer-title {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: #1a3a5c;
+  margin-bottom: 0.75rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.photo-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+.photo-thumb {
+  border: 1px solid #d0dce8;
+  border-radius: 5px;
+  overflow: hidden;
+  background: #f5f8fb;
+}
+
+.photo-thumb img {
+  width: 100%;
+  height: 110px;
+  object-fit: cover;
+  display: block;
+}
+
+.photo-caption {
+  font-size: 0.72rem;
+  padding: 0.3rem 0.5rem;
+  color: #555;
+  border-top: 1px solid #e0e8f0;
+}
+
+.photo-upload-form {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid #e0e8f0;
+}
+
+.photo-locked-msg { color: #888; font-size: 0.85rem; font-style: italic; }
+
+/* ─── Share URL ───────────────────────────────────────────────────────────── */
+
+.share-url-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.share-url {
+  background: #f0f7fd;
+  border: 1px solid #c5d4e0;
+  border-radius: 4px;
+  padding: 0.3rem 0.6rem;
+  font-size: 0.85rem;
+  word-break: break-all;
+}
+
+/* ─── Tech PDF Notice ─────────────────────────────────────────────────────── */
+
+.tech-pdf-notice {
+  background: #1a3a5c;
+  color: #fff;
+  padding: 1rem 1.5rem;
+  border-radius: 6px;
+  margin-bottom: 1.5rem;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+/* ─── Print overrides ─────────────────────────────────────────────────────── */
+
+@media print {
+  .photo-upload-form, .no-print { display: none !important; }
+  .print-only { display: block !important; }
+}
+.print-only { display: none; }
