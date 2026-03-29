@@ -1,0 +1,12 @@
+{
+  "name": "collisioniq",
+  "version": "1.0.0",
+  "description": "ADAS Calibration Documentation and Compliance Management Platform",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
