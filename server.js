@@ -7,6 +7,9 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { runADASEngine } = require('./adasEngine');
 const multer = require('multer');
+const bcrypt = require('bcrypt');
+const session = require('express-session');
+const SQLiteStore = require('connect-sqlite3')(session);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -50,7 +53,7 @@ for (const col of ['preScanRequired', 'postScanRequired', 'approvedScanTool']) {
 }
 
 // Step 1 — New column migrations
-for (const col of ['track', 'collision_grade', 'mileage', 'service_date', 'assigned_tech', 'return_mileage', 'return_date']) {
+for (const col of ['track', 'collision_grade', 'mileage', 'service_date', 'assigned_tech', 'return_mileage', 'return_date', 'last_changed']) {
   try { db.exec(`ALTER TABLE jobs ADD COLUMN ${col} TEXT`); } catch (e) {}
 }
 
@@ -127,11 +130,47 @@ db.exec(`
   );
 `);
 
+// Auth table migrations
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS shops (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      address TEXT,
+      phone TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      shop_id INTEGER,
+      username TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL,
+      full_name TEXT,
+      active INTEGER DEFAULT 1,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (shop_id) REFERENCES shops(id)
+    );
+  `);
+} catch (e) {}
+
+for (const col of ['shop_id', 'created_by']) {
+  try { db.exec(`ALTER TABLE jobs ADD COLUMN ${col} INTEGER`); } catch (e) {}
+}
+
 // ─── Middleware ───────────────────────────────────────────────────────────────
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+
+app.use(session({
+  store: new SQLiteStore({ db: 'sessions.db', dir: './' }),
+  secret: process.env.SESSION_SECRET || 'collisioniq-dev-secret',
+  resave: false,
+  saveUninitialized: false,
+  cookie: { maxAge: 8 * 60 * 60 * 1000 }
+}));
 
 // Uploads directory (photo storage)
 const uploadsDir = path.join(__dirname, 'uploads');
@@ -139,8 +178,48 @@ if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 const upload = multer({ dest: uploadsDir, limits: { fileSize: 20 * 1024 * 1024 } });
 app.use('/uploads', express.static(uploadsDir));
 
-// No auth yet — placeholder shop ID for flag/audit tables
-const DEFAULT_SHOP_ID = 1;
+const DEFAULT_SHOP_ID = 1; // fallback for contexts without req
+
+// ─── Auth Middleware ──────────────────────────────────────────────────────────
+
+function requireAuth(req, res, next) {
+  if (!req.session.user) return res.redirect('/login');
+  next();
+}
+
+function requireAdmin(req, res, next) {
+  if (!req.session.user) return res.redirect('/login');
+  const role = req.session.user.role;
+  if (role !== 'shop_admin' && role !== 'platform_admin') {
+    return res.status(403).send('Access denied.');
+  }
+  next();
+}
+
+function requirePlatformAdmin(req, res, next) {
+  if (!req.session.user || req.session.user.role !== 'platform_admin') {
+    return res.status(403).send('Access denied.');
+  }
+  next();
+}
+
+function requireQC(req, res, next) {
+  if (!req.session.user) return res.redirect('/login');
+  const role = req.session.user.role;
+  const allowed = ['platform_admin', 'shop_admin', 'qc_manager'];
+  if (!allowed.includes(role)) return res.status(403).send('Access denied.');
+  next();
+}
+
+function shopScope(req, res, next) {
+  if (req.session.user.role === 'platform_admin') {
+    // Platform admin uses voluntary shop filter (from shop switcher), never hard-restricted
+    req.shopId = req.session.shopFilter || null;
+  } else {
+    req.shopId = req.session.user.shop_id;
+  }
+  next();
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -293,9 +372,70 @@ function gradeButtonHtml(fieldId, currentGrade) {
 
 // ─── Layout ───────────────────────────────────────────────────────────────────
 
-function layout(title, content, activeNav = '') {
+function layout(title, content, activeNav = '', user = null, shopFilter = null) {
   const nav = (href, key, label) =>
     `<a href="${href}" class="${activeNav === key ? 'active' : ''}">${label}</a>`;
+
+  const role = user ? user.role : null;
+  let navLinks = '';
+
+  if (role === 'platform_admin') {
+    // Shop switcher dropdown
+    const shops = db.prepare('SELECT id, name FROM shops ORDER BY name').all();
+    const shopOptions = [
+      `<option value=""${!shopFilter ? ' selected' : ''}>All Shops</option>`,
+      ...shops.map(s => `<option value="${s.id}"${String(shopFilter) === String(s.id) ? ' selected' : ''}>${escapeHtml(s.name)}</option>`),
+    ].join('');
+    const shopSwitcher = `
+        <form method="POST" action="/platform/shop-filter" style="display:inline;margin-left:0.5rem">
+          <select name="shop_id" onchange="this.form.submit()" class="shop-switcher-select">
+            ${shopOptions}
+          </select>
+        </form>`;
+    navLinks = `
+        ${nav('/', 'list', 'Jobs')}
+        ${nav('/new', 'new', 'New Job')}
+        ${nav('/reference', 'reference', 'ADAS Reference')}
+        ${nav('/admin', 'admin', 'Admin')}
+        ${nav('/platform/shops', 'shops', 'Shops')}
+        ${nav('/dashboard/flags', 'flags', 'Flag Dashboard')}
+        ${nav('/platform/demo-credentials', 'demo', 'Demo Credentials')}
+        ${shopSwitcher}
+        <a href="/logout">Logout</a>`;
+  } else if (role === 'shop_admin') {
+    navLinks = `
+        ${nav('/', 'list', 'Jobs')}
+        ${nav('/new', 'new', 'New Job')}
+        ${nav('/reference', 'reference', 'ADAS Reference')}
+        ${nav('/admin', 'admin', 'Admin')}
+        ${nav('/admin/users', 'users', 'Users')}
+        ${nav('/dashboard/flags', 'flags', 'Flag Dashboard')}
+        <a href="/logout">Logout</a>`;
+  } else if (role === 'qc_manager') {
+    navLinks = `
+        ${nav('/', 'list', 'Jobs')}
+        ${nav('/reference', 'reference', 'ADAS Reference')}
+        ${nav('/dashboard/flags', 'flags', 'Flag Dashboard')}
+        <a href="/logout">Logout</a>`;
+  } else if (role === 'technician') {
+    navLinks = `
+        ${nav('/', 'list', 'My Jobs')}
+        ${nav('/reference', 'reference', 'ADAS Reference')}
+        <a href="/logout">Logout</a>`;
+  } else if (role === 'service_writer') {
+    navLinks = `
+        ${nav('/', 'list', 'Jobs')}
+        ${nav('/reference', 'reference', 'ADAS Reference')}
+        <a href="/logout">Logout</a>`;
+  }
+
+  const userDisplay = user
+    ? `<span class="nav-user">${escapeHtml(user.full_name || user.username)}&nbsp;<span class="nav-role">[${escapeHtml(user.role)}]</span></span>`
+    : '';
+
+  const adminBanner = role === 'platform_admin'
+    ? `<div style="background:#1B3A6B;color:#fff;text-align:center;padding:6px 12px;font-size:13px;font-family:Arial,sans-serif;letter-spacing:0.5px">&#9881; PLATFORM ADMIN &mdash; MASTER ACCESS &mdash; CUELJURIS LLC${shopFilter ? ` &mdash; VIEWING: ${escapeHtml(db.prepare('SELECT name FROM shops WHERE id=?').get(shopFilter)?.name || '')}` : ''}</div>`
+    : '';
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -306,6 +446,7 @@ function layout(title, content, activeNav = '') {
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
+  ${adminBanner}
   <header class="site-header">
     <div class="header-inner">
       <div class="brand">
@@ -313,11 +454,8 @@ function layout(title, content, activeNav = '') {
         <span class="brand-tagline">ADAS Calibration Documentation Platform</span>
       </div>
       <nav class="main-nav">
-        ${nav('/', 'list', 'Jobs')}
-        ${nav('/new', 'new', 'New Job')}
-        ${nav('/reference', 'reference', 'ADAS Reference')}
-        ${nav('/dashboard/flags', 'flags', 'Open Flags')}
-        ${nav('/admin', 'admin', 'Admin')}
+        ${navLinks}
+        ${userDisplay}
       </nav>
     </div>
   </header>
@@ -335,58 +473,252 @@ function layout(title, content, activeNav = '') {
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-// GET / — Jobs list
-app.get('/', (req, res) => {
-  const search = (req.query.search || '').trim();
-  let jobs;
+// GET /login
+app.get('/login', (req, res) => {
+  if (req.session.user) return res.redirect('/');
+  const error = req.query.error || '';
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Login — CollisionIQ</title>
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    .login-wrap { display:flex; justify-content:center; align-items:center; min-height:80vh; }
+    .login-card { background:#fff; border:1px solid #e0e0e0; border-radius:8px; padding:2.5rem 2rem; width:100%; max-width:380px; box-shadow:0 2px 12px rgba(0,0,0,.07); }
+    .login-logo  { font-size:1.5rem; font-weight:700; color:#1a1a2e; margin-bottom:0.25rem; }
+    .login-sub   { font-size:0.85rem; color:#666; margin-bottom:2rem; }
+    .login-error { background:#fef2f2; border:1px solid #fca5a5; color:#b91c1c; border-radius:4px; padding:0.6rem 0.8rem; margin-bottom:1rem; font-size:0.875rem; }
+    .login-card .form-group { margin-bottom:1rem; }
+    .login-card label { display:block; font-size:0.85rem; font-weight:600; margin-bottom:0.3rem; color:#444; }
+    .login-card input[type=text],
+    .login-card input[type=password] { width:100%; box-sizing:border-box; padding:0.55rem 0.75rem; border:1px solid #ccc; border-radius:4px; font-size:0.95rem; }
+    .login-btn { width:100%; padding:0.65rem; background:#1a1a2e; color:#fff; border:none; border-radius:4px; font-size:1rem; font-weight:600; cursor:pointer; margin-top:0.5rem; }
+    .login-btn:hover { background:#2d2d4e; }
+    .login-footer-note { text-align:center; font-size:0.75rem; color:#999; margin-top:1.5rem; }
+  </style>
+</head>
+<body>
+  <div class="login-wrap">
+    <div class="login-card">
+      <div class="login-logo">CollisionIQ</div>
+      <div class="login-sub">ADAS Calibration Documentation Platform</div>
+      ${error ? `<div class="login-error">${escapeHtml(error)}</div>` : ''}
+      <form method="POST" action="/login">
+        <div class="form-group">
+          <label for="username">Username</label>
+          <input type="text" id="username" name="username" autocomplete="username" required autofocus>
+        </div>
+        <div class="form-group">
+          <label for="password">Password</label>
+          <input type="password" id="password" name="password" autocomplete="current-password" required>
+        </div>
+        <button type="submit" class="login-btn">Sign In</button>
+      </form>
+      <div class="login-footer-note">&copy; 2026 Cueljuris LLC</div>
+    </div>
+  </div>
+</body>
+</html>`);
+});
 
+// POST /login
+app.post('/login', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.redirect('/login?error=' + encodeURIComponent('Username and password are required.'));
+  }
+  const user = db.prepare('SELECT * FROM users WHERE username = ? AND active = 1').get(username);
+  if (!user) {
+    return res.redirect('/login?error=' + encodeURIComponent('Invalid username or password.'));
+  }
+  const match = await bcrypt.compare(password, user.password_hash);
+  if (!match) {
+    return res.redirect('/login?error=' + encodeURIComponent('Invalid username or password.'));
+  }
+  req.session.user = {
+    id: user.id,
+    username: user.username,
+    full_name: user.full_name,
+    role: user.role,
+    shop_id: user.shop_id,
+  };
+  res.redirect('/');
+});
+
+// GET /logout
+app.get('/logout', (req, res) => {
+  req.session.destroy(() => res.redirect('/login'));
+});
+
+// GET / — Jobs list
+app.get('/', requireAuth, shopScope, (req, res) => {
+  const search = (req.query.search || '').trim();
+  const user = req.session.user;
+  const isTech = user.role === 'technician';
+
+  // ── Sort preference (session-persisted) ──────────────────────────────────
+  const sortMap = {
+    id: 'id', ronumber: 'ro', make: 'make', track: 'track',
+    status: 'status', last_changed: 'last_changed', created_at: 'createdAt'
+  };
+  if (req.query.sort && sortMap[req.query.sort]) {
+    req.session.jobSort = { sort: req.query.sort, dir: req.query.dir === 'asc' ? 'asc' : 'desc' };
+  }
+  const sortKey = (req.query.sort && sortMap[req.query.sort])
+    ? req.query.sort
+    : (req.session.jobSort && sortMap[req.session.jobSort.sort] ? req.session.jobSort.sort : 'last_changed');
+  const sortDir = (req.query.sort
+    ? (req.query.dir === 'asc' ? 'asc' : 'desc')
+    : (req.session.jobSort ? req.session.jobSort.dir : 'desc'));
+  const orderCol = sortMap[sortKey];
+  const orderDir = sortDir === 'asc' ? 'ASC' : 'DESC';
+
+  // ── Query ────────────────────────────────────────────────────────────────
+  let jobs;
   if (search) {
     const q = `%${search}%`;
-    jobs = db
-      .prepare(`SELECT * FROM jobs WHERE ro LIKE ? OR vin LIKE ? OR technicianName LIKE ? ORDER BY createdAt DESC`)
-      .all(q, q, q);
+    if (req.shopId) {
+      if (isTech) {
+        jobs = db.prepare(`SELECT * FROM jobs WHERE shop_id=? AND (assigned_tech=? OR technicianName=?) AND (ro LIKE ? OR vin LIKE ? OR technicianName LIKE ?) ORDER BY ${orderCol} ${orderDir}`)
+          .all(req.shopId, user.full_name, user.full_name, q, q, q);
+      } else {
+        jobs = db.prepare(`SELECT * FROM jobs WHERE shop_id=? AND (ro LIKE ? OR vin LIKE ? OR technicianName LIKE ?) ORDER BY ${orderCol} ${orderDir}`)
+          .all(req.shopId, q, q, q);
+      }
+    } else {
+      jobs = db.prepare(`SELECT * FROM jobs WHERE ro LIKE ? OR vin LIKE ? OR technicianName LIKE ? ORDER BY ${orderCol} ${orderDir}`)
+        .all(q, q, q);
+    }
   } else {
-    jobs = db.prepare(`SELECT * FROM jobs ORDER BY createdAt DESC`).all();
+    if (req.shopId) {
+      if (isTech) {
+        jobs = db.prepare(`SELECT * FROM jobs WHERE shop_id=? AND (assigned_tech=? OR technicianName=?) ORDER BY ${orderCol} ${orderDir}`)
+          .all(req.shopId, user.full_name, user.full_name);
+      } else {
+        jobs = db.prepare(`SELECT * FROM jobs WHERE shop_id=? ORDER BY ${orderCol} ${orderDir}`).all(req.shopId);
+      }
+    } else {
+      jobs = db.prepare(`SELECT * FROM jobs ORDER BY ${orderCol} ${orderDir}`).all();
+    }
   }
 
+  const canCreate = ['platform_admin', 'shop_admin'].includes(user.role);
+
+  // ── Helpers ──────────────────────────────────────────────────────────────
+  function timeAgo(dateStr) {
+    if (!dateStr) return '—';
+    const now = new Date();
+    const then = new Date(dateStr);
+    const seconds = Math.floor((now - then) / 1000);
+    if (seconds < 60)    return 'Just now';
+    if (seconds < 3600)  return `${Math.floor(seconds / 60)}m ago`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+    if (seconds < 604800) return `${Math.floor(seconds / 86400)}d ago`;
+    return then.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  }
+
+  function sortHeader(label, column) {
+    const isActive = sortKey === column;
+    const nextDir = isActive && sortDir === 'asc' ? 'desc' : 'asc';
+    const arrow = isActive ? (sortDir === 'asc' ? ' ▲' : ' ▼') : ' ⇅';
+    const searchParam = search ? `&search=${encodeURIComponent(search)}` : '';
+    return `<a href="/?sort=${column}&dir=${nextDir}${searchParam}" style="text-decoration:none;color:${isActive ? '#1B3A6B' : '#555555'};font-weight:${isActive ? 'bold' : 'normal'};white-space:nowrap;display:inline-flex;align-items:center;gap:4px;">${escapeHtml(label)}<span style="font-size:11px;opacity:0.7">${arrow}</span></a>`;
+  }
+
+  function trackBadge(track) {
+    if (!track) return '<span style="color:#999">—</span>';
+    const isGM = track === 'general-maintenance';
+    return `<span style="display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600;white-space:nowrap;background:${isGM ? '#F0F0F0' : '#E8EEF7'};color:${isGM ? '#555555' : '#1B3A6B'}">${isGM ? 'General Maintenance' : 'Post-Collision'}</span>`;
+  }
+
+  function statusBadge(status) {
+    const styles = {
+      'Created':           { bg: '#F0F0F0', fg: '#555555' },
+      'In Progress':       { bg: '#E8EEF7', fg: '#1B3A6B' },
+      'Pending Insurance': { bg: '#FFF9CC', fg: '#7A6000' },
+      'Complete':          { bg: '#D6F0D6', fg: '#1A6B1A' },
+      'Total Loss':        { bg: '#FFD6D6', fg: '#8B0000' },
+      'Calibration Complete': { bg: '#D6F0D6', fg: '#1A6B1A' },
+      'Closed':            { bg: '#F0F0F0', fg: '#555555' },
+    };
+    const s = styles[status] || { bg: '#E8EEF7', fg: '#1B3A6B' };
+    return `<span style="display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600;white-space:nowrap;background:${s.bg};color:${s.fg}">${escapeHtml(status || '—')}</span>`;
+  }
+
+  // ── Table rows ───────────────────────────────────────────────────────────
   const rows = jobs.map(j => `
     <tr>
-      <td><span class="job-id">${escapeHtml(j.jobId)}</span></td>
+      <td><a href="/jobs/${encodeURIComponent(j.jobId)}" style="font-family:monospace;font-weight:600;color:#1B3A6B;text-decoration:none">${escapeHtml(j.jobId)}</a></td>
       <td>${escapeHtml(j.ro) || '&mdash;'}</td>
-      <td class="mono">${j.vin ? escapeHtml(j.vin.slice(-6)) : '&mdash;'}</td>
-      <td>${escapeHtml(j.year)} ${escapeHtml(j.make)} ${escapeHtml(j.model)}</td>
-      <td>${escapeHtml(j.technicianName) || '&mdash;'}</td>
-      <td><span class="badge badge-${statusClass(j.status)}">${escapeHtml(j.status)}</span></td>
+      <td>${[j.year, j.make, j.model].filter(Boolean).map(escapeHtml).join(' ') || '&mdash;'}</td>
+      <td>${trackBadge(j.track)}</td>
+      <td>${statusBadge(j.status)}</td>
+      <td><span title="${escapeHtml(j.last_changed || '')}">${timeAgo(j.last_changed)}</span></td>
       <td>${formatDate(j.createdAt)}</td>
       <td><a href="/jobs/${encodeURIComponent(j.jobId)}" class="btn btn-sm">View</a></td>
     </tr>`).join('');
 
+  // ── Mobile cards ─────────────────────────────────────────────────────────
+  const cards = jobs.map(j => `
+    <a href="/jobs/${encodeURIComponent(j.jobId)}" class="job-card-link">
+      <div class="job-card">
+        <div class="job-card-badges">${trackBadge(j.track)}&nbsp;${statusBadge(j.status)}</div>
+        <div class="job-card-title">${escapeHtml(j.jobId)}${j.ro ? ` &mdash; RO #${escapeHtml(j.ro)}` : ''}</div>
+        <div class="job-card-vehicle">${[j.year, j.make, j.model].filter(Boolean).map(escapeHtml).join(' ') || '&mdash;'}</div>
+        <div class="job-card-time">Last changed: <span title="${escapeHtml(j.last_changed || '')}">${timeAgo(j.last_changed)}</span></div>
+      </div>
+    </a>`).join('');
+
   const content = `
+    <style>
+      .jobs-table { display: table; width: 100%; }
+      .jobs-cards { display: none; }
+      @media (max-width: 768px) {
+        .jobs-table { display: none; }
+        .jobs-cards { display: block; }
+      }
+      .job-card-link { text-decoration: none; color: inherit; display: block; }
+      .job-card {
+        background: #fff;
+        border: 1px solid #e0e4ea;
+        border-radius: 8px;
+        padding: 14px 16px;
+        margin-bottom: 10px;
+      }
+      .job-card-badges { margin-bottom: 6px; }
+      .job-card-title { font-weight: 700; font-size: 14px; color: #1B3A6B; margin-bottom: 2px; }
+      .job-card-vehicle { font-size: 13px; color: #333; margin-bottom: 4px; }
+      .job-card-time { font-size: 12px; color: #888; }
+    </style>
+
     <div class="page-header">
-      <h1>Jobs <span class="count-badge">${jobs.length}</span></h1>
-      <a href="/new" class="btn btn-primary">+ New Job</a>
+      <h1>${isTech ? 'My Jobs' : 'Jobs'} <span class="count-badge">${jobs.length}</span></h1>
+      ${canCreate ? '<a href="/new" class="btn btn-primary">+ New Job</a>' : ''}
     </div>
 
     <div class="search-bar">
       <form method="GET" action="/">
         <input type="text" name="search" placeholder="Search by RO#, VIN, or Technician name&hellip;"
                value="${escapeHtml(search)}">
+        ${sortKey !== 'last_changed' || sortDir !== 'desc' ? `<input type="hidden" name="sort" value="${escapeHtml(sortKey)}"><input type="hidden" name="dir" value="${escapeHtml(sortDir)}">` : ''}
         <button type="submit" class="btn">Search</button>
-        ${search ? '<a href="/" class="btn btn-ghost">Clear</a>' : ''}
+        ${search ? `<a href="/?sort=${escapeHtml(sortKey)}&dir=${escapeHtml(sortDir)}" class="btn btn-ghost">Clear</a>` : ''}
       </form>
     </div>
 
-    <div class="table-wrap">
+    <div class="table-wrap jobs-table">
       <table class="data-table">
         <thead>
           <tr>
-            <th>Job ID</th>
-            <th>RO #</th>
-            <th>VIN (last 6)</th>
-            <th>Vehicle</th>
-            <th>Technician</th>
-            <th>Status</th>
-            <th>Date</th>
+            <th>${sortHeader('Job ID', 'id')}</th>
+            <th>${sortHeader('RO Number', 'ronumber')}</th>
+            <th>${sortHeader('Vehicle', 'make')}</th>
+            <th>${sortHeader('Track', 'track')}</th>
+            <th>${sortHeader('Status', 'status')}</th>
+            <th>${sortHeader('Last Changed', 'last_changed')}</th>
+            <th>${sortHeader('Date Created', 'created_at')}</th>
             <th></th>
           </tr>
         </thead>
@@ -394,13 +726,17 @@ app.get('/', (req, res) => {
           ${rows.length > 0 ? rows : '<tr><td colspan="8" class="empty">No jobs found.</td></tr>'}
         </tbody>
       </table>
+    </div>
+
+    <div class="jobs-cards">
+      ${cards.length > 0 ? cards : '<p class="empty">No jobs found.</p>'}
     </div>`;
 
-  res.send(layout('Jobs', content, 'list'));
+  res.send(layout('Jobs', content, 'list', user, req.session.shopFilter));
 });
 
 // GET /new — New job form (track selector → GM or Collision)
-app.get('/new', (req, res) => {
+app.get('/new', requireAuth, requireAdmin, (req, res) => {
   const prefill = {
     make:  req.query.make  || '',
     model: req.query.model || '',
@@ -516,9 +852,18 @@ app.get('/new', (req, res) => {
           </div>
           <div class="form-group">
             <label for="gm-vin">VIN</label>
-            <input type="text" id="gm-vin" name="vin" placeholder="17-character VIN" maxlength="17"
-                   style="text-transform:uppercase" autocomplete="off">
+            <div style="display:flex;gap:0.5rem;align-items:flex-start">
+              <div style="flex:1">
+                <input type="text" id="gm-vin" name="vin" placeholder="17-character VIN" maxlength="17"
+                       style="text-transform:uppercase;width:100%;box-sizing:border-box" autocomplete="off">
+              </div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:2px">
+                <button type="button" id="gm-gen-vin" class="btn btn-ghost" style="white-space:nowrap;font-size:0.8rem">Generate Test VIN</button>
+                <span style="font-size:0.7rem;color:#999;text-align:center">For testing only — not a real vehicle record</span>
+              </div>
+            </div>
             <span class="field-hint" id="gm-vin-status"></span>
+            <span class="field-hint" id="gm-vin-test-label" style="color:#999"></span>
           </div>
           <div class="form-group">
             <label for="gm-year">Year</label>
@@ -806,9 +1151,18 @@ app.get('/new', (req, res) => {
             </div>
             <div class="form-group">
               <label for="col-vin">VIN</label>
-              <input type="text" id="col-vin" name="vin" placeholder="17-character VIN" maxlength="17"
-                     style="text-transform:uppercase" autocomplete="off">
+              <div style="display:flex;gap:0.5rem;align-items:flex-start">
+                <div style="flex:1">
+                  <input type="text" id="col-vin" name="vin" placeholder="17-character VIN" maxlength="17"
+                         style="text-transform:uppercase;width:100%;box-sizing:border-box" autocomplete="off">
+                </div>
+                <div style="display:flex;flex-direction:column;align-items:center;gap:2px">
+                  <button type="button" id="col-gen-vin" class="btn btn-ghost" style="white-space:nowrap;font-size:0.8rem">Generate Test VIN</button>
+                  <span style="font-size:0.7rem;color:#999;text-align:center">For testing only — not a real vehicle record</span>
+                </div>
+              </div>
               <span class="field-hint" id="col-vin-status"></span>
+              <span class="field-hint" id="col-vin-test-label" style="color:#999"></span>
             </div>
             <div class="form-group">
               <label for="col-year">Year</label>
@@ -1044,26 +1398,61 @@ app.get('/new', (req, res) => {
     document.getElementById('gm-mileage').addEventListener('input', calcOilReturn);
 
     /* ── Shared VIN decode + flag lookup ────────────────────────────────── */
-    function vinDecode(vinInput, yearId, makeId, modelId, statusId) {
+    function toTitleCase(str) {
+      return String(str || '').toLowerCase().replace(/\b\w/g, function(c) { return c.toUpperCase(); });
+    }
+
+    function vinDecode(vinInput, yearId, makeId, modelId, trimId, statusId, testLabelId) {
       var vin = vinInput.value.trim().toUpperCase();
       vinInput.value = vin;
-      if (vin.length !== 17) return;
       var statusEl = document.getElementById(statusId);
+
+      // Clear previous status
+      statusEl.textContent = '';
+      statusEl.className = 'field-hint';
+
+      // Length validation — do not call API unless exactly 17 chars
+      if (vin.length !== 17) {
+        if (vin.length > 0) {
+          statusEl.textContent = 'VIN must be 17 characters. Current length: ' + vin.length;
+          statusEl.className = 'field-hint hint-err';
+        }
+        document.getElementById(yearId).value  = '';
+        document.getElementById(makeId).value  = '';
+        document.getElementById(modelId).value = '';
+        if (trimId) document.getElementById(trimId).value = '';
+        return;
+      }
+
       statusEl.textContent = 'Decoding VIN\u2026';
       statusEl.className = 'field-hint';
+
       fetch('https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvalues/' + encodeURIComponent(vin) + '?format=json')
         .then(function(r) { return r.json(); })
         .then(function(data) {
           var r = data.Results && data.Results[0];
-          if (r) {
-            if (r.ModelYear) document.getElementById(yearId).value  = r.ModelYear;
-            if (r.Make)      document.getElementById(makeId).value  = r.Make.charAt(0).toUpperCase() + r.Make.slice(1).toLowerCase();
-            if (r.Model)     document.getElementById(modelId).value = r.Model;
+          if (r && r.ModelYear) {
+            var year  = r.ModelYear;
+            var make  = r.Make;
+            var model = r.Model;
+            var trim  = r.Trim || r.Series || r.BodyClass || '';
+
+            document.getElementById(yearId).value  = year;
+            document.getElementById(makeId).value  = toTitleCase(make);
+            document.getElementById(modelId).value = toTitleCase(model);
+            if (trimId) document.getElementById(trimId).value = trim ? toTitleCase(trim) : '';
+
             statusEl.textContent = 'VIN decoded.';
             statusEl.className = 'field-hint hint-ok';
+          } else {
+            statusEl.textContent = 'VIN could not be decoded. Please enter vehicle details manually.';
+            statusEl.className = 'field-hint hint-err';
           }
         })
-        .catch(function() { statusEl.textContent = 'VIN decode failed — check connection.'; statusEl.className = 'field-hint hint-err'; });
+        .catch(function() {
+          statusEl.textContent = 'VIN could not be decoded. Please enter vehicle details manually.';
+          statusEl.className = 'field-hint hint-err';
+        });
 
       fetch('/api/vin/' + encodeURIComponent(vin) + '/flags')
         .then(function(r) { return r.json(); })
@@ -1087,24 +1476,60 @@ app.get('/new', (req, res) => {
       return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     }
 
-    document.getElementById('gm-vin').addEventListener('blur', function() {
-      vinDecode(this, 'gm-year', 'gm-make', 'gm-model', 'gm-vin-status');
-    });
-    document.getElementById('col-vin').addEventListener('blur', function() {
-      vinDecode(this, 'col-year', 'col-make', 'col-model', 'col-vin-status');
-    });
+    var testVINs = [
+      { vin: '1HGCV1F3XLA025410', label: '2020 Honda Accord' },
+      { vin: '2T1BURHE0JC034301', label: '2018 Toyota Corolla' },
+      { vin: '1FTFW1ET5DFC10312', label: '2013 Ford F-150' },
+      { vin: '1G1ZD5ST4JF246849', label: '2018 Chevrolet Malibu' },
+      { vin: '1C4RJFBG8FC198072', label: '2015 Jeep Grand Cherokee' },
+      { vin: '3VWF17AT4FM019976', label: '2015 Volkswagen Jetta' },
+      { vin: '1N4AL3AP7JC231503', label: '2018 Nissan Altima' },
+      { vin: '5NPE24AF8FH089298', label: '2015 Hyundai Sonata' },
+      { vin: '1FADP3F24EL381528', label: '2014 Ford Focus' },
+      { vin: '2C3CDXBG8EH316940', label: '2014 Dodge Charger' },
+      { vin: '1HGCM82633A004352', label: '2003 Honda Accord' },
+      { vin: '4T1BF1FK5CU147227', label: '2012 Toyota Camry' },
+      { vin: 'WBAJB0C51BC613615', label: '2011 BMW 535i' },
+      { vin: 'JM1BL1SF8A1134586', label: '2010 Mazda 3' },
+      { vin: '1GNSKCKC8FR672786', label: '2015 Chevrolet Tahoe' },
+    ];
+
+    function setupVinField(vinId, yearId, makeId, modelId, trimId, statusId, testLabelId, genBtnId) {
+      var vinEl = document.getElementById(vinId);
+      var testLabelEl = document.getElementById(testLabelId);
+
+      vinEl.addEventListener('blur', function() {
+        vinDecode(this, yearId, makeId, modelId, trimId, statusId, testLabelId);
+      });
+
+      // Clear test label if user manually edits the VIN
+      vinEl.addEventListener('input', function() {
+        if (testLabelEl) testLabelEl.textContent = '';
+      });
+
+      document.getElementById(genBtnId).addEventListener('click', function() {
+        var entry = testVINs[Math.floor(Math.random() * testVINs.length)];
+        vinEl.value = entry.vin;
+        if (testLabelEl) testLabelEl.textContent = 'Test VIN loaded: ' + entry.label + ' \u2014 Replace with real VIN before saving';
+        vinDecode(vinEl, yearId, makeId, modelId, trimId, statusId, testLabelId);
+      });
+    }
+
+    setupVinField('gm-vin',  'gm-year',  'gm-make',  'gm-model',  'gm-trim',  'gm-vin-status',  'gm-vin-test-label',  'gm-gen-vin');
+    setupVinField('col-vin', 'col-year', 'col-make', 'col-model', 'col-trim', 'col-vin-status', 'col-vin-test-label', 'col-gen-vin');
     </script>`;
 
-  res.send(layout('New Job', content, 'new'));
+  res.send(layout('New Job', content, 'new', req.session.user, req.session.shopFilter));
 });
 
 // POST /jobs — Create job (handles both tracks)
-app.post('/jobs', (req, res) => {
+app.post('/jobs', requireAuth, requireAdmin, (req, res) => {
   const track = req.body.track || 'post-collision';
   const jobId      = generateJobId();
   const shareToken = crypto.randomBytes(16).toString('hex');
   const shareUrl   = `/share/${shareToken}`;
   const now        = new Date().toISOString();
+  const sessionShopId = req.session.user.shop_id || DEFAULT_SHOP_ID;
 
   if (track === 'general-maintenance') {
     // ── Step 3: General Maintenance ──────────────────────────────────────────
@@ -1120,13 +1545,13 @@ app.post('/jobs', (req, res) => {
       INSERT INTO jobs
         (jobId, ro, vin, year, make, model, trim, technicianName, assigned_tech,
          track, service_date, mileage, return_mileage, return_date,
-         repairsPerformed, status, shareToken, shareUrl, createdAt, updatedAt)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         repairsPerformed, status, shareToken, shareUrl, createdAt, updatedAt, shop_id, created_by, last_changed)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
       jobId, ro || '', (vin || '').toUpperCase(), year || '', make || '', model || '', trim || '',
       assignedTech, assignedTech, 'general-maintenance',
       serviceDate, mileage, returnMileage, returnDate,
-      notes || '', 'Created', shareToken, shareUrl, now, now
+      notes || '', 'Created', shareToken, shareUrl, now, now, sessionShopId, req.session.user.id, now
     );
 
     // ── Step 5: Save service items + grade audit + vin flags ─────────────────
@@ -1134,7 +1559,7 @@ app.post('/jobs', (req, res) => {
 
     // Oil Change — grade is always GREEN when performed
     if (req.body.oil_change_enabled) {
-      applyGradeFlag(vinUpper, DEFAULT_SHOP_ID, jobId, assignedTech,
+      applyGradeFlag(vinUpper, sessionShopId, jobId, assignedTech,
         'Oil Change', null, 'GREEN', null,
         [req.body.oil_type, req.body.oil_viscosity].filter(Boolean).join(' / '),
         req.body.oil_note || null
@@ -1149,7 +1574,7 @@ app.post('/jobs', (req, res) => {
       for (const [label, code] of brakeSubs) {
         const grade = req.body[`brake_${code}_grade`] || '';
         if (grade) {
-          applyGradeFlag(vinUpper, DEFAULT_SHOP_ID, jobId, assignedTech,
+          applyGradeFlag(vinUpper, sessionShopId, jobId, assignedTech,
             'Brakes', label, grade, null,
             req.body[`brake_${code}_measurement`] || null,
             req.body.brake_note || null
@@ -1166,7 +1591,7 @@ app.post('/jobs', (req, res) => {
       for (const [label, code] of tireSubs) {
         const grade = req.body[`tire_${code}_grade`] || '';
         if (grade) {
-          applyGradeFlag(vinUpper, DEFAULT_SHOP_ID, jobId, assignedTech,
+          applyGradeFlag(vinUpper, sessionShopId, jobId, assignedTech,
             'Tires', label, grade, null,
             req.body[`tire_${code}_depth`] || null,
             req.body.tire_note || null
@@ -1183,7 +1608,7 @@ app.post('/jobs', (req, res) => {
       for (const [label, code] of wiperSubs) {
         const grade = req.body[`wiper_${code}_grade`] || '';
         if (grade) {
-          applyGradeFlag(vinUpper, DEFAULT_SHOP_ID, jobId, assignedTech,
+          applyGradeFlag(vinUpper, sessionShopId, jobId, assignedTech,
             'Wipers', label, grade, null, null,
             req.body.wiper_note || null
           );
@@ -1195,7 +1620,7 @@ app.post('/jobs', (req, res) => {
     if (req.body.battery_enabled) {
       const grade = req.body.battery_grade || '';
       if (grade) {
-        applyGradeFlag(vinUpper, DEFAULT_SHOP_ID, jobId, assignedTech,
+        applyGradeFlag(vinUpper, sessionShopId, jobId, assignedTech,
           'Battery', null, grade, null,
           [req.body.battery_voltage ? `${req.body.battery_voltage}V` : '',
            req.body.battery_test_result || ''].filter(Boolean).join(' / '),
@@ -1227,14 +1652,14 @@ app.post('/jobs', (req, res) => {
        repairsPerformed, adasSystems, rationale, liabilityWarning,
        makeSpecificNotes, preScanRequired, postScanRequired, approvedScanTool,
        track, collision_grade,
-       status, shareToken, shareUrl, createdAt, updatedAt)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Created',?,?,?,?)
+       status, shareToken, shareUrl, createdAt, updatedAt, shop_id, created_by, last_changed)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Created',?,?,?,?,?,?,?)
   `).run(
     jobId, ro || '', (vin || '').toUpperCase(), year || '', make || '', model || '', trim || '',
     technicianName || '', repairsStr, adasSystems, rationale, liabilityWarning,
     makeSpecificNotes, preScanRequired, postScanRequired, approvedScanTool,
     'post-collision', collisionGrade,
-    shareToken, shareUrl, now, now
+    shareToken, shareUrl, now, now, sessionShopId, req.session.user.id, now
   );
 
   // Step 11: Create ADAS checkpoints for MODERATE grade jobs
@@ -1251,8 +1676,15 @@ app.post('/jobs', (req, res) => {
 });
 
 // GET /jobs/:jobId — Job view (hard copy)
-app.get('/jobs/:jobId', (req, res) => {
-  const job = db.prepare(`SELECT * FROM jobs WHERE jobId = ?`).get(req.params.jobId);
+app.get('/jobs/:jobId', requireAuth, shopScope, (req, res) => {
+  const user = req.session.user;
+  const isTech = user.role === 'technician';
+  let job;
+  if (req.shopId) {
+    job = db.prepare(`SELECT * FROM jobs WHERE jobId = ? AND shop_id = ?`).get(req.params.jobId, req.shopId);
+  } else {
+    job = db.prepare(`SELECT * FROM jobs WHERE jobId = ?`).get(req.params.jobId);
+  }
 
   if (!job) {
     return res.status(404).send(layout('Not Found', `
@@ -1261,7 +1693,12 @@ app.get('/jobs/:jobId', (req, res) => {
         <h1>Job Not Found</h1>
         <p>No job with ID <strong>${escapeHtml(req.params.jobId)}</strong> exists.</p>
         <a href="/" class="btn btn-primary" style="margin-top:1.5rem">Back to Jobs</a>
-      </div>`));
+      </div>`, '', user));
+  }
+
+  // Tech can only see their own jobs
+  if (isTech && job.assigned_tech !== user.full_name && job.technicianName !== user.full_name) {
+    return res.status(403).send(layout('Access Denied', '<div class="error-page"><h1>Access Denied</h1><p>You do not have permission to view this job.</p></div>', '', user));
   }
 
   const isGM        = job.track === 'general-maintenance';
@@ -1558,12 +1995,14 @@ app.get('/jobs/:jobId', (req, res) => {
       </div>
     </div>`;
 
-  res.send(layout(`Job ${job.jobId}`, content));
+  res.send(layout(`Job ${job.jobId}`, content, '', req.session.user, req.session.shopFilter));
 });
 
 // GET /admin — Admin panel
-app.get('/admin', (req, res) => {
-  const jobs = db.prepare(`SELECT * FROM jobs ORDER BY createdAt DESC`).all();
+app.get('/admin', requireAdmin, shopScope, (req, res) => {
+  const jobs = req.shopId
+    ? db.prepare(`SELECT * FROM jobs WHERE shop_id=? ORDER BY createdAt DESC`).all(req.shopId)
+    : db.prepare(`SELECT * FROM jobs ORDER BY createdAt DESC`).all();
 
   const statusOptions = ['Created', 'In Progress', 'Calibration Complete', 'Closed'];
 
@@ -1620,11 +2059,11 @@ app.get('/admin', (req, res) => {
       </table>
     </div>`;
 
-  res.send(layout('Admin', content, 'admin'));
+  res.send(layout('Admin', content, 'admin', req.session.user, req.session.shopFilter));
 });
 
 // POST /jobs/:jobId/status — Update status
-app.post('/jobs/:jobId/status', (req, res) => {
+app.post('/jobs/:jobId/status', requireAdmin, (req, res) => {
   const validStatuses = ['Created', 'In Progress', 'Calibration Complete', 'Closed'];
   const { status } = req.body;
 
@@ -1633,32 +2072,32 @@ app.post('/jobs/:jobId/status', (req, res) => {
   }
 
   const now = new Date().toISOString();
-  db.prepare(`UPDATE jobs SET status = ?, updatedAt = ? WHERE jobId = ?`)
-    .run(status, now, req.params.jobId);
+  db.prepare(`UPDATE jobs SET status = ?, updatedAt = ?, last_changed = ? WHERE jobId = ?`)
+    .run(status, now, now, req.params.jobId);
 
   res.redirect('/admin');
 });
 
 // ─── Step 4: VIN Flag API ─────────────────────────────────────────────────────
 
-app.get('/api/vin/:vin/flags', (req, res) => {
+app.get('/api/vin/:vin/flags', requireAuth, shopScope, (req, res) => {
   const vin = (req.params.vin || '').toUpperCase();
+  const shopId = req.shopId || DEFAULT_SHOP_ID;
   const flags = db.prepare(`
     SELECT * FROM vin_flags
     WHERE vin=? AND shop_id=? AND status IN ('OPEN','ESCALATED')
     ORDER BY date_flagged ASC
-  `).all(vin, DEFAULT_SHOP_ID);
+  `).all(vin, shopId);
   res.json(flags);
 });
 
 // ─── Step 6: GM Flag Dashboard ────────────────────────────────────────────────
 
-app.get('/dashboard/flags', (req, res) => {
-  const flags = db.prepare(`
-    SELECT * FROM vin_flags
-    WHERE shop_id=? AND status IN ('OPEN','ESCALATED')
-    ORDER BY date_flagged ASC
-  `).all(DEFAULT_SHOP_ID);
+app.get('/dashboard/flags', requireAuth, requireQC, shopScope, (req, res) => {
+  const shopId = req.shopId || DEFAULT_SHOP_ID;
+  const flags = req.shopId
+    ? db.prepare(`SELECT * FROM vin_flags WHERE shop_id=? AND status IN ('OPEN','ESCALATED') ORDER BY date_flagged ASC`).all(shopId)
+    : db.prepare(`SELECT * FROM vin_flags WHERE status IN ('OPEN','ESCALATED') ORDER BY date_flagged ASC`).all();
 
   const gradeClass = g => g === 'YELLOW' || g === 'ESCALATED' ? 'yellow' : 'red';
 
@@ -1690,18 +2129,29 @@ app.get('/dashboard/flags', (req, res) => {
       </table>
     </div>`;
 
-  res.send(layout('Open Vehicle Flags', content, 'flags'));
+  res.send(layout('Open Vehicle Flags', content, 'flags', req.session.user, req.session.shopFilter));
 });
 
 // ─── Step 7: Tech Job View ────────────────────────────────────────────────────
 
-app.get('/jobs/:jobId/tech', (req, res) => {
-  const job = db.prepare(`SELECT * FROM jobs WHERE jobId = ?`).get(req.params.jobId);
-  if (!job) return res.status(404).send(layout('Not Found', '<p>Job not found.</p>'));
+app.get('/jobs/:jobId/tech', requireAuth, shopScope, (req, res) => {
+  const user = req.session.user;
+  const isTech = user.role === 'technician';
+  let job;
+  if (req.shopId) {
+    job = db.prepare(`SELECT * FROM jobs WHERE jobId = ? AND shop_id = ?`).get(req.params.jobId, req.shopId);
+  } else {
+    job = db.prepare(`SELECT * FROM jobs WHERE jobId = ?`).get(req.params.jobId);
+  }
+  if (!job) return res.status(404).send(layout('Not Found', '<p>Job not found.</p>', '', user));
+  if (isTech && job.assigned_tech !== user.full_name && job.technicianName !== user.full_name) {
+    return res.status(403).send(layout('Access Denied', '<div class="error-page"><h1>Access Denied</h1></div>', '', user));
+  }
 
   // Open flag warning
+  const shopId = req.shopId || DEFAULT_SHOP_ID;
   const openFlags = job.vin
-    ? db.prepare(`SELECT * FROM vin_flags WHERE vin=? AND shop_id=? AND status IN ('OPEN','ESCALATED') ORDER BY date_flagged`).all(job.vin, DEFAULT_SHOP_ID)
+    ? db.prepare(`SELECT * FROM vin_flags WHERE vin=? AND shop_id=? AND status IN ('OPEN','ESCALATED') ORDER BY date_flagged`).all(job.vin, shopId)
     : [];
 
   const flagPanel = openFlags.length > 0
@@ -1752,7 +2202,7 @@ app.get('/jobs/:jobId/tech', (req, res) => {
     <div class="job-doc" style="padding:1.5rem">
       <div class="info-grid" style="margin-bottom:1rem">
         <div class="info-row"><span class="info-label">VIN</span><span class="info-val mono">${escapeHtml(job.vin) || '—'}</span></div>
-        <div class="info-row"><span class="info-label">Vehicle</span><span class="info-val">${escapeHtml(job.year)} ${escapeHtml(job.make)} ${escapeHtml(job.model)} ${escapeHtml(job.trim || '')}</span></div>
+        <div class="info-row"><span class="info-label">Vehicle</span><span class="info-val">${escapeHtml(job.year)} ${escapeHtml(job.make)} ${escapeHtml(job.model)}${job.trim ? ' ' + escapeHtml(job.trim) : ''}</span></div>
         <div class="info-row"><span class="info-label">RO</span><span class="info-val">${escapeHtml(job.ro) || '—'}</span></div>
         <div class="info-row"><span class="info-label">Service Date</span><span class="info-val">${escapeHtml(job.service_date || formatDate(job.createdAt))}</span></div>
       </div>
@@ -1775,10 +2225,10 @@ app.get('/jobs/:jobId/tech', (req, res) => {
         : ''}
     </div>`;
 
-  res.send(layout(`Tech View — ${job.jobId}`, content));
+  res.send(layout(`Tech View — ${job.jobId}`, content, '', req.session.user, req.session.shopFilter));
 });
 
-app.post('/jobs/:jobId/tech/update', (req, res) => {
+app.post('/jobs/:jobId/tech/update', requireAuth, (req, res) => {
   const job = db.prepare(`SELECT * FROM jobs WHERE jobId = ?`).get(req.params.jobId);
   if (!job) return res.status(404).send('Job not found.');
 
@@ -1834,12 +2284,14 @@ app.post('/jobs/:jobId/tech/update', (req, res) => {
     }
   }
 
+  db.prepare(`UPDATE jobs SET last_changed = ? WHERE jobId = ?`).run(now, job.jobId);
+
   res.redirect(`/jobs/${encodeURIComponent(job.jobId)}/tech`);
 });
 
 // ─── Step 8: Tech PDF Export (server-side PII scrub) ─────────────────────────
 
-app.get('/jobs/:jobId/export/tech-pdf', (req, res) => {
+app.get('/jobs/:jobId/export/tech-pdf', requireAuth, (req, res) => {
   const job = db.prepare(`SELECT * FROM jobs WHERE jobId = ?`).get(req.params.jobId);
   if (!job) return res.status(404).send('Job not found.');
 
@@ -1884,7 +2336,7 @@ app.get('/jobs/:jobId/export/tech-pdf', (req, res) => {
         <h2 class="doc-section-title">Vehicle</h2>
         <div class="info-grid">
           <div class="info-row"><span class="info-label">VIN</span><span class="info-val mono">${escapeHtml(job.vin) || '—'}</span></div>
-          <div class="info-row"><span class="info-label">Vehicle</span><span class="info-val">${escapeHtml(job.year)} ${escapeHtml(job.make)} ${escapeHtml(job.model)} ${escapeHtml(job.trim || '')}</span></div>
+          <div class="info-row"><span class="info-label">Vehicle</span><span class="info-val">${escapeHtml(job.year)} ${escapeHtml(job.make)} ${escapeHtml(job.model)}${job.trim ? ' ' + escapeHtml(job.trim) : ''}</span></div>
           <div class="info-row"><span class="info-label">Mileage</span><span class="info-val">${escapeHtml(job.mileage || '—')}</span></div>
           <div class="info-row"><span class="info-label">Service Date</span><span class="info-val">${escapeHtml(job.service_date || formatDate(job.createdAt))}</span></div>
           <div class="info-row"><span class="info-label">Technician</span><span class="info-val">${escapeHtml(job.technicianName || job.assigned_tech || '—')}</span></div>
@@ -1913,12 +2365,12 @@ app.get('/jobs/:jobId/export/tech-pdf', (req, res) => {
       </div>
     </div>`;
 
-  res.send(layout(`Work Record — ${job.jobId}`, content));
+  res.send(layout(`Work Record — ${job.jobId}`, content, '', req.session.user, req.session.shopFilter));
 });
 
 // ─── Step 10: Photo Upload ────────────────────────────────────────────────────
 
-app.post('/jobs/:jobId/photos', upload.single('photo'), (req, res) => {
+app.post('/jobs/:jobId/photos', requireAuth, upload.single('photo'), (req, res) => {
   const job = db.prepare(`SELECT jobId FROM jobs WHERE jobId = ?`).get(req.params.jobId);
   if (!job || !req.file) return res.redirect(`/jobs/${encodeURIComponent(req.params.jobId)}`);
 
@@ -1945,7 +2397,7 @@ app.post('/jobs/:jobId/photos', upload.single('photo'), (req, res) => {
 
 // ─── Step 11: Checkpoint Sign-Off ────────────────────────────────────────────
 
-app.post('/jobs/:jobId/checkpoints/:idx/complete', (req, res) => {
+app.post('/jobs/:jobId/checkpoints/:idx/complete', requireAuth, requireQC, (req, res) => {
   const job = db.prepare(`SELECT jobId FROM jobs WHERE jobId = ?`).get(req.params.jobId);
   if (!job) return res.status(404).send('Job not found.');
 
@@ -1963,7 +2415,7 @@ app.post('/jobs/:jobId/checkpoints/:idx/complete', (req, res) => {
 
 // ─── Step 12: Shareable Insurer Link ─────────────────────────────────────────
 
-app.post('/jobs/:jobId/share', (req, res) => {
+app.post('/jobs/:jobId/share', requireAuth, (req, res) => {
   const job = db.prepare(`SELECT jobId FROM jobs WHERE jobId = ?`).get(req.params.jobId);
   if (!job) return res.status(404).send('Job not found.');
 
@@ -1974,7 +2426,7 @@ app.post('/jobs/:jobId/share', (req, res) => {
   res.redirect(`/jobs/${encodeURIComponent(job.jobId)}`);
 });
 
-app.post('/jobs/:jobId/share/revoke', (req, res) => {
+app.post('/jobs/:jobId/share/revoke', requireAuth, (req, res) => {
   const job = db.prepare(`SELECT jobId FROM jobs WHERE jobId = ?`).get(req.params.jobId);
   if (!job) return res.status(404).send('Job not found.');
 
@@ -2068,7 +2520,7 @@ app.get('/share/:token', (req, res) => {
       </div>
     </div>`;
 
-  res.send(layout(`Insurer View — ${job.jobId}`, content));
+  res.send(layout(`Insurer View — ${job.jobId}`, content, '', req.session.user, req.session.shopFilter));
 });
 
 // ─── ADAS Reference ───────────────────────────────────────────────────────────
@@ -2105,7 +2557,7 @@ function getOEMPortal(make) {
 }
 
 // GET /reference — ADAS Reference lookup page
-app.get('/reference', (req, res) => {
+app.get('/reference', requireAuth, (req, res) => {
   const makes = [
     'Toyota', 'Lexus', 'Scion',
     'Ford', 'Lincoln',
@@ -2168,11 +2620,11 @@ app.get('/reference', (req, res) => {
       Always verify model-specific procedures in OEM service information.
     </div>`;
 
-  res.send(layout('ADAS Reference', content, 'reference'));
+  res.send(layout('ADAS Reference', content, 'reference', req.session.user, req.session.shopFilter));
 });
 
 // GET /reference/lookup — Reference results
-app.get('/reference/lookup', (req, res) => {
+app.get('/reference/lookup', requireAuth, (req, res) => {
   const make  = (req.query.make  || '').trim();
   const model = (req.query.model || '').trim();
   const year  = (req.query.year  || '').trim();
@@ -2362,11 +2814,296 @@ app.get('/reference/lookup', (req, res) => {
       Always verify model-specific procedures in OEM service information.
     </div>`;
 
-  res.send(layout(`ADAS Reference \u2014 ${make}`, content, 'reference'));
+  res.send(layout(`ADAS Reference \u2014 ${make}`, content, 'reference', req.session.user, req.session.shopFilter));
 });
+
+// ─── User Management (Shop Admin) ────────────────────────────────────────────
+
+app.get('/admin/users', requireAdmin, shopScope, (req, res) => {
+  const users = req.shopId
+    ? db.prepare(`SELECT id, full_name, username, role, active, created_at FROM users WHERE shop_id=? ORDER BY created_at DESC`).all(req.shopId)
+    : db.prepare(`SELECT id, full_name, username, role, active, created_at FROM users ORDER BY created_at DESC`).all();
+
+  const roleOptions = ['shop_admin', 'qc_manager', 'technician', 'service_writer'];
+  const roleSelect = roleOptions.map(r => `<option value="${r}">${r}</option>`).join('');
+
+  const rows = users.map(u => `
+    <tr>
+      <td>${escapeHtml(u.full_name || '—')}</td>
+      <td class="mono">${escapeHtml(u.username)}</td>
+      <td><span class="badge badge-blue">${escapeHtml(u.role)}</span></td>
+      <td><span class="badge badge-${u.active ? 'green' : 'gray'}">${u.active ? 'Active' : 'Inactive'}</span></td>
+      <td>
+        <form method="POST" action="/admin/users/${u.id}/role" class="inline-form" style="display:inline">
+          <select name="role" onchange="this.form.submit()" class="status-select">
+            ${roleOptions.map(r => `<option value="${r}"${u.role === r ? ' selected' : ''}>${r}</option>`).join('')}
+          </select>
+        </form>
+        ${u.active
+          ? `<form method="POST" action="/admin/users/${u.id}/deactivate" class="inline-form" style="display:inline;margin-left:0.5rem">
+               <button type="submit" class="btn btn-sm btn-ghost" onclick="return confirm('Deactivate ${escapeHtml(u.username)}?')">Deactivate</button>
+             </form>`
+          : ''}
+      </td>
+    </tr>`).join('');
+
+  const content = `
+    <div class="page-header">
+      <h1>User Management <span class="count-badge">${users.length}</span></h1>
+    </div>
+
+    <div class="doc-section" style="margin-bottom:2rem">
+      <h2 class="doc-section-title">Add New User</h2>
+      <form method="POST" action="/admin/users/create" style="display:grid;gap:1rem;max-width:520px">
+        <div class="form-group">
+          <label>Full Name</label>
+          <input type="text" name="full_name" placeholder="Jane Smith" required>
+        </div>
+        <div class="form-group">
+          <label>Username</label>
+          <input type="text" name="username" placeholder="jsmith" required autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label>Temporary Password</label>
+          <input type="password" name="password" placeholder="Temporary password" required autocomplete="new-password">
+        </div>
+        <div class="form-group">
+          <label>Role</label>
+          <select name="role">${roleSelect}</select>
+        </div>
+        <button type="submit" class="btn btn-primary">Create User</button>
+      </form>
+    </div>
+
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr><th>Full Name</th><th>Username</th><th>Role</th><th>Status</th><th>Actions</th></tr>
+        </thead>
+        <tbody>${rows.length > 0 ? rows : '<tr><td colspan="5" class="empty">No users found.</td></tr>'}</tbody>
+      </table>
+    </div>`;
+
+  res.send(layout('User Management', content, 'users', req.session.user, req.session.shopFilter));
+});
+
+app.post('/admin/users/create', requireAdmin, async (req, res) => {
+  const { full_name, username, password, role } = req.body;
+  const allowedRoles = ['shop_admin', 'qc_manager', 'technician', 'service_writer'];
+  if (!allowedRoles.includes(role)) return res.status(400).send('Invalid role.');
+  try {
+    const hash = await bcrypt.hash(password, 10);
+    db.prepare(`INSERT INTO users (shop_id, username, password_hash, role, full_name) VALUES (?,?,?,?,?)`)
+      .run(req.session.user.shop_id, username, hash, role, full_name || '');
+  } catch (e) {
+    return res.redirect('/admin/users?error=Username+already+exists.');
+  }
+  res.redirect('/admin/users');
+});
+
+app.post('/admin/users/:id/role', requireAdmin, (req, res) => {
+  const allowedRoles = ['shop_admin', 'qc_manager', 'technician', 'service_writer'];
+  const { role } = req.body;
+  if (!allowedRoles.includes(role)) return res.status(400).send('Invalid role.');
+  db.prepare(`UPDATE users SET role=? WHERE id=?`).run(role, req.params.id);
+  res.redirect('/admin/users');
+});
+
+app.post('/admin/users/:id/deactivate', requireAdmin, (req, res) => {
+  db.prepare(`UPDATE users SET active=0 WHERE id=?`).run(req.params.id);
+  res.redirect('/admin/users');
+});
+
+// ─── Platform Admin — Shop Management ────────────────────────────────────────
+
+app.get('/platform/shops', requirePlatformAdmin, (req, res) => {
+  const shops = db.prepare(`SELECT * FROM shops ORDER BY created_at DESC`).all();
+  const rows = shops.map(s => {
+    const userCount = db.prepare(`SELECT COUNT(*) as c FROM users WHERE shop_id=?`).get(s.id);
+    const jobCount  = db.prepare(`SELECT COUNT(*) as c FROM jobs WHERE shop_id=?`).get(s.id);
+    return `
+      <tr>
+        <td>${escapeHtml(s.name)}</td>
+        <td>${escapeHtml(s.address || '—')}</td>
+        <td>${escapeHtml(s.phone || '—')}</td>
+        <td>${userCount.c}</td>
+        <td>${jobCount.c}</td>
+        <td>${formatDate(s.created_at)}</td>
+      </tr>`;
+  }).join('');
+
+  const content = `
+    <div class="page-header"><h1>Shops <span class="count-badge">${shops.length}</span></h1></div>
+
+    <div class="doc-section" style="margin-bottom:2rem">
+      <h2 class="doc-section-title">Onboard New Shop</h2>
+      <form method="POST" action="/platform/shops/create" style="display:grid;gap:1rem;max-width:520px">
+        <div class="form-group">
+          <label>Shop Name <span class="req">*</span></label>
+          <input type="text" name="shop_name" placeholder="Acme Collision Center" required>
+        </div>
+        <div class="form-group">
+          <label>Address</label>
+          <input type="text" name="address" placeholder="123 Main St, City, ST 00000">
+        </div>
+        <div class="form-group">
+          <label>Phone</label>
+          <input type="text" name="phone" placeholder="555-555-5555">
+        </div>
+        <hr>
+        <h3 style="margin:0;font-size:0.95rem">Shop Admin Account</h3>
+        <div class="form-group">
+          <label>Admin Full Name <span class="req">*</span></label>
+          <input type="text" name="admin_full_name" placeholder="John Doe" required>
+        </div>
+        <div class="form-group">
+          <label>Admin Username <span class="req">*</span></label>
+          <input type="text" name="admin_username" placeholder="jdoe" required autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label>Temporary Password <span class="req">*</span></label>
+          <input type="password" name="admin_password" placeholder="Temporary password" required autocomplete="new-password">
+        </div>
+        <button type="submit" class="btn btn-primary">Create Shop &amp; Admin Account</button>
+      </form>
+    </div>
+
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr><th>Shop Name</th><th>Address</th><th>Phone</th><th>Users</th><th>Jobs</th><th>Created</th></tr>
+        </thead>
+        <tbody>${rows.length > 0 ? rows : '<tr><td colspan="6" class="empty">No shops yet.</td></tr>'}</tbody>
+      </table>
+    </div>`;
+
+  res.send(layout('Shops', content, 'shops', req.session.user, req.session.shopFilter));
+});
+
+app.post('/platform/shops/create', requirePlatformAdmin, async (req, res) => {
+  const { shop_name, address, phone, admin_full_name, admin_username, admin_password } = req.body;
+  if (!shop_name || !admin_username || !admin_password) {
+    return res.status(400).send('Shop name, admin username, and password are required.');
+  }
+  const hash = await bcrypt.hash(admin_password, 10);
+  const shopId = db.prepare(`INSERT INTO shops (name, address, phone) VALUES (?,?,?)`)
+    .run(shop_name, address || '', phone || '').lastInsertRowid;
+  db.prepare(`INSERT INTO users (shop_id, username, password_hash, role, full_name) VALUES (?,?,?,?,?)`)
+    .run(shopId, admin_username, hash, 'shop_admin', admin_full_name || '');
+  res.redirect('/platform/shops');
+});
+
+// POST /platform/shop-filter — Set shop switcher for platform_admin
+app.post('/platform/shop-filter', requirePlatformAdmin, (req, res) => {
+  const shopId = req.body.shop_id ? parseInt(req.body.shop_id) : null;
+  req.session.shopFilter = shopId || null;
+  res.redirect('back');
+});
+
+// GET /platform/demo-credentials — Platform admin only
+app.get('/platform/demo-credentials', requirePlatformAdmin, (req, res) => {
+  const shops = db.prepare('SELECT * FROM shops ORDER BY name').all();
+
+  const shopBlocks = shops.map(shop => {
+    const users = db.prepare(
+      `SELECT username, role, full_name FROM users WHERE shop_id=? AND role != 'platform_admin' ORDER BY role, username`
+    ).all(shop.id);
+    const userRows = users.map(u =>
+      `<tr><td class="mono">${escapeHtml(u.username)}</td><td><span class="badge badge-blue">${escapeHtml(u.role)}</span></td><td>${escapeHtml(u.full_name || '—')}</td></tr>`
+    ).join('');
+    return `
+      <div class="doc-section" style="margin-bottom:1.5rem">
+        <h2 class="doc-section-title">${escapeHtml(shop.name)}</h2>
+        <table class="data-table" style="max-width:600px">
+          <thead><tr><th>Username</th><th>Role</th><th>Full Name</th></tr></thead>
+          <tbody>${userRows}</tbody>
+        </table>
+      </div>`;
+  }).join('');
+
+  const content = `
+    <div class="page-header">
+      <h1>Demo Credentials</h1>
+    </div>
+
+    <div class="doc-section" style="background:#fffbea;border:1px solid #f0c040;border-radius:6px;padding:1rem 1.25rem;margin-bottom:2rem;max-width:600px">
+      <p style="margin:0 0 0.5rem"><strong>All demo account password:</strong> <code>demo1234</code></p>
+      <p style="margin:0 0 0.5rem"><strong>Platform admin password:</strong> <code>changeme123</code> &mdash; change this</p>
+      <p style="margin:0;font-size:0.85rem;color:#666">These accounts are for development and testing only. Remove or deactivate before any production deployment.</p>
+    </div>
+
+    <form method="POST" action="/platform/reset-demo" style="margin-bottom:2rem"
+          onsubmit="return confirm('Reset all demo jobs? This cannot be undone.')">
+      <button type="submit" class="btn btn-ghost">&#8635; Reset Demo Jobs</button>
+      <span style="font-size:0.8rem;color:#888;margin-left:0.75rem">Deletes demo jobs (RO-M, RO-N, RO-P, RO-S, RO-G) and re-seeds fresh ones</span>
+    </form>
+
+    ${shopBlocks}`;
+
+  res.send(layout('Demo Credentials', content, 'demo', req.session.user, req.session.shopFilter));
+});
+
+// POST /platform/reset-demo — Delete and re-seed demo jobs
+app.post('/platform/reset-demo', requirePlatformAdmin, async (req, res) => {
+  // Delete demo jobs by RO prefix pattern
+  db.prepare(`DELETE FROM jobs WHERE ro LIKE 'RO-M%' OR ro LIKE 'RO-N%' OR ro LIKE 'RO-P%' OR ro LIKE 'RO-S%' OR ro LIKE 'RO-G%'`).run();
+
+  // Re-run the job seed inline
+  const { DatabaseSync } = require('node:sqlite');
+  const seedDb = new DatabaseSync('./collisioniq.db');
+  const crypto = require('crypto');
+  const now = new Date().toISOString();
+  const today = now.slice(0, 10);
+
+  const demoJobs = [
+    { shop: 'Metro Collision Center',   techUsername: 'metro_tech1',    track: 'general-maintenance', collision_grade: null,       ro: 'RO-M001', vin: '1HGCV1F3XLA025410', year: '2020', make: 'Honda',     model: 'Accord',        trim: 'Sport',   mileage: '45200', status: 'In Progress',         repairsPerformed: 'Customer reports rough idle. Oil change due.' },
+    { shop: 'Metro Collision Center',   techUsername: 'metro_tech2',    track: 'general-maintenance', collision_grade: null,       ro: 'RO-M002', vin: '2T1BURHE0JC034301', year: '2018', make: 'Toyota',    model: 'Corolla',       trim: 'LE',      mileage: '62000', status: 'Calibration Complete', repairsPerformed: 'Full inspection. Rear brakes yellow.' },
+    { shop: 'Metro Collision Center',   techUsername: 'metro_tech1',    track: 'post-collision',      collision_grade: 'MODERATE', ro: 'RO-M003', vin: '1G1ZD5ST4JF246849', year: '2018', make: 'Chevrolet', model: 'Malibu',        trim: 'LT',      mileage: '38900', status: 'In Progress',         repairsPerformed: 'Windshield' },
+    { shop: 'Northside Auto Repair',    techUsername: 'north_tech1',    track: 'post-collision',      collision_grade: 'MINOR',    ro: 'RO-N001', vin: '1N4AL3AP7JC231503', year: '2018', make: 'Nissan',    model: 'Altima',        trim: 'S',       mileage: '51000', status: 'Created',             repairsPerformed: 'Rear Bumper' },
+    { shop: 'Northside Auto Repair',    techUsername: 'north_tech1',    track: 'general-maintenance', collision_grade: null,       ro: 'RO-N002', vin: '1FTFW1ET5DFC10312', year: '2013', make: 'Ford',      model: 'F-150',         trim: 'XLT',     mileage: '97500', status: 'Calibration Complete', repairsPerformed: 'Oil change and tire rotation complete.' },
+    { shop: 'Premier ADAS & Collision', techUsername: 'premier_tech1',  track: 'post-collision',      collision_grade: 'MAJOR',    ro: 'RO-P001', vin: '1C4RJFBG8FC198072', year: '2015', make: 'Jeep',      model: 'Grand Cherokee', trim: 'Limited', mileage: '89000', status: 'In Progress',         repairsPerformed: 'Structural Body Repair, Airbag / SRS Deployment' },
+    { shop: 'Premier ADAS & Collision', techUsername: 'premier_tech2',  track: 'post-collision',      collision_grade: 'MODERATE', ro: 'RO-P002', vin: 'WBAJB0C51BC613615', year: '2011', make: 'BMW',       model: '535i',          trim: 'Base',    mileage: '74000', status: 'Created',             repairsPerformed: 'Front Bumper, Front Camera Area' },
+    { shop: 'Southbelt Body Works',     techUsername: 'south_tech1',    track: 'general-maintenance', collision_grade: null,       ro: 'RO-S001', vin: '4T1BF1FK5CU147227', year: '2012', make: 'Toyota',    model: 'Camry',         trim: 'XLE',     mileage: '112000',status: 'Calibration Complete', repairsPerformed: 'Tire rotation. Battery test. All green.' },
+    { shop: 'Southbelt Body Works',     techUsername: 'south_tech1',    track: 'post-collision',      collision_grade: 'MINOR',    ro: 'RO-S002', vin: '1FADP3F24EL381528', year: '2014', make: 'Ford',      model: 'Focus',         trim: 'SE',      mileage: '66000', status: 'In Progress',         repairsPerformed: 'Door / Mirror Repair' },
+    { shop: 'Gulf Coast Auto Service',  techUsername: 'gulf_tech1',     track: 'post-collision',      collision_grade: 'MAJOR',    ro: 'RO-G001', vin: '5NPE24AF8FH089298', year: '2015', make: 'Hyundai',   model: 'Sonata',        trim: 'SE',      mileage: '94000', status: 'Closed',             repairsPerformed: 'Structural Body Repair, Airbag / SRS Deployment' },
+    { shop: 'Gulf Coast Auto Service',  techUsername: 'gulf_tech1',     track: 'general-maintenance', collision_grade: null,       ro: 'RO-G002', vin: '1GNSKCKC8FR672786', year: '2015', make: 'Chevrolet', model: 'Tahoe',         trim: 'LT',      mileage: '58000', status: 'Created',             repairsPerformed: 'Oil change due. AC check requested.' },
+  ];
+
+  const validStatuses = ['Created', 'In Progress', 'Calibration Complete', 'Closed'];
+  let seeded = 0;
+  for (const job of demoJobs) {
+    const shop = seedDb.prepare('SELECT id FROM shops WHERE name=?').get(job.shop);
+    const tech = seedDb.prepare('SELECT id, full_name FROM users WHERE username=?').get(job.techUsername);
+    if (!shop || !tech) continue;
+    const jobId      = `CIQ-${today.replace(/-/g,'')}-${Math.floor(1000+Math.random()*9000)}`;
+    const shareToken = crypto.randomBytes(16).toString('hex');
+    const status     = validStatuses.includes(job.status) ? job.status : 'Created';
+    seedDb.prepare(`INSERT INTO jobs (jobId,ro,vin,year,make,model,trim,technicianName,assigned_tech,track,collision_grade,mileage,service_date,repairsPerformed,status,shareToken,shareUrl,createdAt,updatedAt,shop_id,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(jobId,job.ro,job.vin,job.year,job.make,job.model,job.trim||'',tech.full_name,tech.full_name,job.track,job.collision_grade||null,job.mileage||'',today,job.repairsPerformed||'',status,shareToken,`/share/${shareToken}`,now,now,shop.id,tech.id);
+    seeded++;
+  }
+
+  console.log(`Demo reset: seeded ${seeded} jobs`);
+  res.redirect('/platform/demo-credentials');
+});
+
+// ─── Seed Platform Admin ──────────────────────────────────────────────────────
+
+async function seedPlatformAdmin() {
+  const existing = db.prepare(`SELECT id FROM users WHERE role='platform_admin'`).get();
+  if (!existing) {
+    const hash = await bcrypt.hash('changeme123', 10);
+    db.prepare(`INSERT INTO users (shop_id, username, password_hash, role, full_name) VALUES (NULL,'platform_admin',?,'platform_admin','Cueljuris LLC')`)
+      .run(hash);
+    console.log('Platform admin created. Username: platform_admin / Password: changeme123');
+    console.log('CHANGE THIS PASSWORD IMMEDIATELY AFTER FIRST LOGIN.');
+  }
+}
 
 // ─── Start Server ─────────────────────────────────────────────────────────────
 
-app.listen(PORT, () => {
-  console.log(`CollisionIQ running on http://localhost:${PORT}`);
+seedPlatformAdmin().then(() => {
+  app.listen(PORT, () => {
+    console.log(`CollisionIQ running on http://localhost:${PORT}`);
+  });
 });

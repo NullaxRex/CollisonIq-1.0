@@ -97,6 +97,38 @@ a:hover {
   color: #ffffff;
 }
 
+.nav-user {
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 0.8rem;
+  margin-left: 0.75rem;
+  padding: 0.25rem 0.6rem;
+  border-left: 1px solid rgba(255,255,255,0.25);
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.nav-role {
+  font-size: 0.7rem;
+  color: rgba(255, 255, 255, 0.55);
+  font-style: italic;
+}
+
+.shop-switcher-select {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+  border: 1px solid rgba(255,255,255,0.3);
+  border-radius: 4px;
+  padding: 0.3rem 0.5rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.shop-switcher-select option {
+  background: #1a3a5c;
+  color: #fff;
+}
+
 /* ─── Main Content ───────────────────────────────────────────────────────── */
 
 .main-content {
