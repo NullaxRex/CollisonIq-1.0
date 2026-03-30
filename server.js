@@ -1,11 +1,17 @@
 'use strict';
 
+require('dotenv').config();
+
 const express = require('express');
 const { DatabaseSync: Database } = require('node:sqlite');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const { runADASEngine } = require('./adasEngine');
+const { generatePhotoLabels, ZONE_DISPLAY } = require('./utils/photoLabels');
+const { updateJobPhotoStatus } = require('./utils/photoStatus');
+const { requireActiveSubscription } = require('./middleware/billing');
+const { webhook: billingWebhook, router: billingRouter } = require('./routes/billing');
 const multer = require('multer');
 const bcrypt = require('bcrypt');
 const session = require('express-session');
@@ -16,12 +22,7 @@ const PORT = process.env.PORT || 3000;
 
 // ─── Database Setup ───────────────────────────────────────────────────────────
 
-const dbPath = process.env.DB_PATH || path.join(__dirname, 'collisioniq.db');
-const dbDir = path.dirname(dbPath);
-if (!fs.existsSync(dbDir)) {
-  fs.mkdirSync(dbDir, { recursive: true });
-}
-const db = new Database(dbPath);
+const db = require('./db');
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS jobs (
@@ -158,7 +159,46 @@ for (const col of ['shop_id', 'created_by']) {
   try { db.exec(`ALTER TABLE jobs ADD COLUMN ${col} INTEGER`); } catch (e) {}
 }
 
+// Photo label system
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS job_photos (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id         TEXT    NOT NULL,
+      shop_id        INTEGER NOT NULL,
+      layer          INTEGER NOT NULL,
+      zone           TEXT,
+      label_key      TEXT    NOT NULL,
+      label_display  TEXT    NOT NULL,
+      is_recommended INTEGER DEFAULT 0,
+      is_adas        INTEGER DEFAULT 0,
+      file_path      TEXT,
+      mime_type      TEXT,
+      file_size_kb   INTEGER,
+      tech_name      TEXT,
+      uploaded_at    TEXT    DEFAULT (datetime('now')),
+      notes          TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_job_photos_job  ON job_photos(job_id);
+    CREATE INDEX IF NOT EXISTS idx_job_photos_zone ON job_photos(job_id, zone);
+  `);
+} catch (e) {}
+try { db.exec(`ALTER TABLE jobs ADD COLUMN impact_areas TEXT`); } catch (e) {}
+
+// ─── Stripe Billing Schema ────────────────────────────────────────────────────
+require('./db/migrations/002_stripe_billing').runMigration(db);
+require('./db/migrations/003_photo_softlock_edit_assign').runMigration(db);
+
+// Additional columns required by registration flow
+for (const col of ['city TEXT', 'state TEXT']) {
+  try { db.exec(`ALTER TABLE shops ADD COLUMN ${col}`); } catch (e) {}
+}
+try { db.exec(`ALTER TABLE users ADD COLUMN email TEXT`); } catch (e) {}
+
 // ─── Middleware ───────────────────────────────────────────────────────────────
+
+// Stripe webhook — raw body required, must be BEFORE express.json()
+app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), billingWebhook);
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
@@ -171,6 +211,10 @@ app.use(session({
   saveUninitialized: false,
   cookie: { maxAge: 8 * 60 * 60 * 1000 }
 }));
+
+// Billing + registration routes (public — no auth required)
+app.use('/', require('./routes/register'));
+app.use('/', billingRouter);
 
 // Uploads directory (photo storage)
 const uploadsDir = path.join(__dirname, 'uploads');
@@ -220,6 +264,18 @@ function shopScope(req, res, next) {
   }
   next();
 }
+
+// Allows service_writer, shop_admin, and platform_admin to edit job fields
+function requireEdit(req, res, next) {
+  if (!req.session.user) return res.redirect('/login');
+  const role = req.session.user.role;
+  if (['platform_admin', 'shop_admin', 'service_writer'].includes(role)) return next();
+  return res.status(403).send('Access denied.');
+}
+
+// Session flash helpers
+function setFlash(req, type, msg) { req.session.flash = { type, msg }; }
+function consumeFlash(req) { const f = req.session.flash || null; delete req.session.flash; return f; }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -554,6 +610,7 @@ app.get('/logout', (req, res) => {
 
 // GET / — Jobs list
 app.get('/', requireAuth, shopScope, (req, res) => {
+  const flash  = consumeFlash(req);
   const search = (req.query.search || '').trim();
   const user = req.session.user;
   const isTech = user.role === 'technician';
@@ -606,6 +663,24 @@ app.get('/', requireAuth, shopScope, (req, res) => {
 
   const canCreate = ['platform_admin', 'shop_admin'].includes(user.role);
 
+  // ── Batch assignment query ────────────────────────────────────────────────
+  const jobIds = jobs.map(j => j.jobId);
+  const assignmentMap = {};
+  if (jobIds.length > 0) {
+    const placeholders = jobIds.map(() => '?').join(',');
+    const assignRows = db.prepare(`
+      SELECT ja.job_id, u.full_name
+      FROM job_assignments ja
+      JOIN users u ON u.id = ja.user_id
+      WHERE ja.job_id IN (${placeholders})
+      ORDER BY ja.assigned_at
+    `).all(...jobIds);
+    for (const row of assignRows) {
+      if (!assignmentMap[row.job_id]) assignmentMap[row.job_id] = [];
+      assignmentMap[row.job_id].push(row.full_name);
+    }
+  }
+
   // ── Helpers ──────────────────────────────────────────────────────────────
   function timeAgo(dateStr) {
     if (!dateStr) return '—';
@@ -647,6 +722,26 @@ app.get('/', requireAuth, shopScope, (req, res) => {
     return `<span style="display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600;white-space:nowrap;background:${s.bg};color:${s.fg}">${escapeHtml(status || '—')}</span>`;
   }
 
+  function photoStatusBadge(ps, isCollision) {
+    if (!isCollision) return '<span style="color:#999">—</span>';
+    const cfg = { green: ['#D6F0D6','#1A6B1A'], yellow: ['#FFF9CC','#7A6000'], red: ['#FFD6D6','#8B0000'] };
+    const [bg, fg] = cfg[ps] || cfg.red;
+    return `<span style="display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:700;white-space:nowrap;background:${bg};color:${fg}">${(ps||'red').toUpperCase()}</span>`;
+  }
+
+  function initialsStack(names) {
+    if (!names || names.length === 0) return '<span style="color:#999">—</span>';
+    const shown    = names.slice(0, 3);
+    const overflow = names.length - 3;
+    let html = shown.map(n => {
+      const parts    = (n || '').trim().split(/\s+/);
+      const initials = parts.length >= 2 ? parts[0][0] + parts[parts.length - 1][0] : (parts[0] || '?')[0];
+      return `<span style="display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;background:#1B3A6B;color:#fff;font-size:10px;font-weight:700;margin-right:2px" title="${escapeHtml(n)}">${escapeHtml(initials.toUpperCase())}</span>`;
+    }).join('');
+    if (overflow > 0) html += `<span style="display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;background:#888;color:#fff;font-size:10px;font-weight:700">+${overflow}</span>`;
+    return html;
+  }
+
   // ── Table rows ───────────────────────────────────────────────────────────
   const rows = jobs.map(j => `
     <tr>
@@ -655,6 +750,8 @@ app.get('/', requireAuth, shopScope, (req, res) => {
       <td>${[j.year, j.make, j.model].filter(Boolean).map(escapeHtml).join(' ') || '&mdash;'}</td>
       <td>${trackBadge(j.track)}</td>
       <td>${statusBadge(j.status)}</td>
+      <td>${photoStatusBadge(j.photo_status, j.track !== 'general-maintenance')}</td>
+      <td>${initialsStack(assignmentMap[j.jobId])}</td>
       <td><span title="${escapeHtml(j.last_changed || '')}">${timeAgo(j.last_changed)}</span></td>
       <td>${formatDate(j.createdAt)}</td>
       <td><a href="/jobs/${encodeURIComponent(j.jobId)}" class="btn btn-sm">View</a></td>
@@ -693,6 +790,8 @@ app.get('/', requireAuth, shopScope, (req, res) => {
       .job-card-time { font-size: 12px; color: #888; }
     </style>
 
+    ${flash ? `<div style="background:${flash.type === 'success' ? '#D6F0D6' : '#FFD6D6'};color:${flash.type === 'success' ? '#1A6B1A' : '#8B0000'};padding:.65rem 1rem;border-radius:6px;margin-bottom:1rem;font-size:.9rem">${escapeHtml(flash.msg)}</div>` : ''}
+
     <div class="page-header">
       <h1>${isTech ? 'My Jobs' : 'Jobs'} <span class="count-badge">${jobs.length}</span></h1>
       ${canCreate ? '<a href="/new" class="btn btn-primary">+ New Job</a>' : ''}
@@ -717,13 +816,15 @@ app.get('/', requireAuth, shopScope, (req, res) => {
             <th>${sortHeader('Vehicle', 'make')}</th>
             <th>${sortHeader('Track', 'track')}</th>
             <th>${sortHeader('Status', 'status')}</th>
+            <th>Photos</th>
+            <th>Team</th>
             <th>${sortHeader('Last Changed', 'last_changed')}</th>
             <th>${sortHeader('Date Created', 'created_at')}</th>
             <th></th>
           </tr>
         </thead>
         <tbody>
-          ${rows.length > 0 ? rows : '<tr><td colspan="8" class="empty">No jobs found.</td></tr>'}
+          ${rows.length > 0 ? rows : '<tr><td colspan="10" class="empty">No jobs found.</td></tr>'}
         </tbody>
       </table>
     </div>
@@ -763,6 +864,20 @@ app.get('/new', requireAuth, requireAdmin, (req, res) => {
     <label class="checkbox-label">
       <input type="checkbox" name="repairs" value="${escapeHtml(r)}">
       <span>${escapeHtml(r)}</span>
+    </label>`).join('');
+
+  const impactAreaOptions = [
+    ['front_end',      'Front End'],
+    ['rear_end',       'Rear End'],
+    ['driver_side',    'Driver Side'],
+    ['passenger_side', 'Passenger Side'],
+    ['roof',           'Roof / Rollover'],
+    ['undercarriage',  'Undercarriage'],
+  ];
+  const impactAreaCheckboxes = impactAreaOptions.map(([val, label]) => `
+    <label class="checkbox-label">
+      <input type="checkbox" name="impact_areas" value="${val}">
+      <span>${escapeHtml(label)}</span>
     </label>`).join('');
 
   const today = new Date().toISOString().slice(0, 10);
@@ -1199,6 +1314,12 @@ app.get('/new', requireAuth, requireAdmin, (req, res) => {
             <input type="text" id="col-other-repairs" name="otherRepairs"
                    placeholder="Describe any additional repairs performed&hellip;">
           </div>
+        </div>
+
+        <div class="form-section">
+          <h2 class="section-heading">Impact Areas <span class="req">*</span></h2>
+          <p class="section-hint">Select all vehicle zones with collision damage. These drive photo documentation requirements.</p>
+          <div class="checkbox-grid">${impactAreaCheckboxes}</div>
         </div>
 
         <!-- ── Photo Documentation Placeholder (renders after grade selected) ── -->
@@ -1641,6 +1762,10 @@ app.post('/jobs', requireAuth, requireAdmin, (req, res) => {
   if (otherRepairs && otherRepairs.trim()) repairs.push(otherRepairs.trim());
   const repairsStr = repairs.join(', ');
 
+  let impactAreas = req.body.impact_areas || [];
+  if (!Array.isArray(impactAreas)) impactAreas = [impactAreas];
+  const impactAreasJson = JSON.stringify(impactAreas);
+
   const {
     adasSystems, rationale, liabilityWarning, makeSpecificNotes,
     preScanRequired, postScanRequired, approvedScanTool,
@@ -1651,16 +1776,28 @@ app.post('/jobs', requireAuth, requireAdmin, (req, res) => {
       (jobId, ro, vin, year, make, model, trim, technicianName,
        repairsPerformed, adasSystems, rationale, liabilityWarning,
        makeSpecificNotes, preScanRequired, postScanRequired, approvedScanTool,
-       track, collision_grade,
+       track, collision_grade, impact_areas,
        status, shareToken, shareUrl, createdAt, updatedAt, shop_id, created_by, last_changed)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Created',?,?,?,?,?,?,?)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Created',?,?,?,?,?,?,?)
   `).run(
     jobId, ro || '', (vin || '').toUpperCase(), year || '', make || '', model || '', trim || '',
     technicianName || '', repairsStr, adasSystems, rationale, liabilityWarning,
     makeSpecificNotes, preScanRequired, postScanRequired, approvedScanTool,
-    'post-collision', collisionGrade,
+    'post-collision', collisionGrade, impactAreasJson,
     shareToken, shareUrl, now, now, sessionShopId, req.session.user.id, now
   );
+
+  // Seed photo label rows
+  const adasRequired = !!(adasSystems && adasSystems.trim());
+  const photoLabels = generatePhotoLabels({ impact_areas: impactAreas, adas_required: adasRequired });
+  const insertLabel = db.prepare(`
+    INSERT INTO job_photos (job_id, shop_id, layer, zone, label_key, label_display, is_recommended, is_adas, tech_name)
+    VALUES (?,?,?,?,?,?,?,?,?)
+  `);
+  for (const l of photoLabels) {
+    insertLabel.run(jobId, sessionShopId, l.layer, l.zone || null, l.key, l.display,
+      l.is_recommended ? 1 : 0, l.is_adas ? 1 : 0, '');
+  }
 
   // Step 11: Create ADAS checkpoints for MODERATE grade jobs
   if (collisionGrade === 'MODERATE') {
@@ -1677,7 +1814,8 @@ app.post('/jobs', requireAuth, requireAdmin, (req, res) => {
 
 // GET /jobs/:jobId — Job view (hard copy)
 app.get('/jobs/:jobId', requireAuth, shopScope, (req, res) => {
-  const user = req.session.user;
+  const flash  = consumeFlash(req);
+  const user   = req.session.user;
   const isTech = user.role === 'technician';
   let job;
   if (req.shopId) {
@@ -1766,76 +1904,229 @@ app.get('/jobs/:jobId', requireAuth, shopScope, (req, res) => {
     }
   }
 
-  // ── Photos section ────────────────────────────────────────────────────────
+  // ── Photos section (labeled slots) ───────────────────────────────────────
   let photosSection = '';
   if (isCollision) {
-    const photos = db.prepare(`SELECT * FROM photos WHERE job_id = ? ORDER BY layer, uploaded_at`).all(job.jobId);
-    const layer1Photos = photos.filter(p => p.layer === 1);
-    const layer2Photos = photos.filter(p => p.layer === 2);
-    const layer1Done   = layer1Photos.length > 0;
+    const jobPhotoRows = db.prepare(
+      `SELECT * FROM job_photos WHERE job_id=? ORDER BY layer, id`
+    ).all(job.jobId);
 
-    const photoGrid = (ps) => ps.length === 0
-      ? '<p class="empty" style="margin:.5rem 0">No photos uploaded yet.</p>'
-      : `<div class="photo-grid">${ps.map(p => `
-          <div class="photo-thumb">
-            <img src="/uploads/${encodeURIComponent(p.filename)}" alt="${escapeHtml(p.category)}" loading="lazy">
-            <div class="photo-caption">${escapeHtml(p.category)}${p.damage_grade ? ' — ' + escapeHtml(p.damage_grade) : ''}</div>
-          </div>`).join('')}</div>`;
+    if (jobPhotoRows.length > 0) {
+      // Layer 1 gate
+      const l1Required = jobPhotoRows.filter(r => r.layer === 1 && !r.is_recommended);
+      const l1Done     = l1Required.filter(r => r.file_path).length;
+      const l1Total    = l1Required.length;
+      const layer1Locked = l1Done < l1Total;
 
-    photosSection = `
-      <section class="doc-section no-print">
+      // Build slot card HTML
+      function slotCard(slot) {
+        const filled = !!slot.file_path;
+        const rec    = !!slot.is_recommended;
+        const border = filled ? '2px solid #22863a' : (rec ? '2px dashed #b8860b' : '2px dashed #cccccc');
+        const bg     = filled ? '#f0fff4'           : (rec ? '#fffbea'            : '#fafafa');
+
+        let html = '<div class="photo-slot" style="border:' + border + ';background:' + bg + '"';
+        if (!filled) html += ' onclick="triggerUpload(' + slot.id + ')" tabindex="0"';
+        html += ' data-slot-id="' + slot.id + '">';
+
+        html += '<input type="file" id="slot-input-' + slot.id + '" '
+              + 'accept="image/jpeg,image/png,image/heic,image/webp" class="no-print" '
+              + 'style="display:none" onchange="uploadSlot(' + slot.id + ',this)">';
+
+        if (filled) {
+          html += '<img src="/uploads/' + encodeURIComponent(slot.file_path) + '" '
+                + 'alt="' + escapeHtml(slot.label_display) + '" class="slot-thumb-img" loading="lazy">';
+        } else {
+          html += '<div class="slot-empty-icon no-print">&#128247;</div>';
+          html += '<div class="print-only" style="font-size:10px;color:#999;font-style:italic">'
+                + (rec ? '' : '[ Not Uploaded ]') + '</div>';
+        }
+
+        html += '<div class="slot-label">' + escapeHtml(slot.label_display)
+              + (rec ? ' <span class="rec-star">&#11088;</span>' : '') + '</div>';
+
+        if (filled) {
+          html += '<div class="slot-meta no-print">' + escapeHtml(slot.tech_name || '') + ' &middot; '
+                + escapeHtml(slot.uploaded_at ? slot.uploaded_at.slice(0,10) : '') + '</div>';
+          html += '<div class="slot-meta print-only" style="font-size:9px;color:#888">'
+                + escapeHtml(slot.tech_name || '') + ' &bull; '
+                + escapeHtml(slot.uploaded_at ? slot.uploaded_at.slice(0,10) : '') + '</div>';
+          html += '<button class="slot-remove-btn no-print" data-photo-id="' + slot.id + '" '
+                + 'onclick="removeSlot(event,' + slot.id + ')" title="Remove">&#10005;</button>';
+        } else {
+          html += '<div class="slot-tap-hint no-print">' + (rec ? 'Tap to add (optional)' : 'Tap to upload') + '</div>';
+        }
+
+        if (slot.label_key === 'MIRROR_SIDE_UNDAMAGED' && !filled) {
+          html += '<div class="mirror-callout no-print">&#11088; Recommended: undamaged opposite side '
+                + 'helps adjusters establish pre-loss condition.</div>';
+        }
+
+        html += '</div>';
+        return html;
+      }
+
+      function slotGroup(title, slots, locked) {
+        let html = '<div class="photo-label-group' + (locked ? ' group-locked' : '') + '">';
+        html += '<h3 class="photo-group-title">' + escapeHtml(title);
+        if (locked) html += ' <span style="font-size:.7rem;background:#FFF9CC;color:#7A6000;padding:1px 7px;border-radius:10px;font-weight:600">LOCKED</span>';
+        html += '</h3>';
+        if (locked) {
+          html += '<p class="photo-locked-msg">Complete all required Layer 1 photos to unlock Layer 2.</p>';
+        } else {
+          html += '<div class="photo-slot-grid">' + slots.map(slotCard).join('') + '</div>';
+        }
+        html += '</div>';
+        return html;
+      }
+
+      // Layer 1 groups
+      const l1Overview = jobPhotoRows.filter(r => r.layer === 1 && !r.zone);
+      const l1Zones    = [...new Set(jobPhotoRows.filter(r => r.layer === 1 && r.zone).map(r => r.zone))];
+
+      let layer1Html = slotGroup(
+        'Vehicle Overview (' + l1Done + '/' + l1Total + ' required)',
+        l1Overview, false
+      );
+      for (const z of l1Zones) {
+        const zSlots = jobPhotoRows.filter(r => r.layer === 1 && r.zone === z);
+        layer1Html += slotGroup((ZONE_DISPLAY[z] || z) + ' \u2014 Zone View', zSlots, false);
+      }
+
+      // Layer 2 groups
+      const l2ZoneOrder = [...new Set(jobPhotoRows.filter(r => r.layer === 2).map(r => r.zone || 'other'))];
+      let layer2Html = '';
+      for (const z of l2ZoneOrder) {
+        const slots = jobPhotoRows.filter(r => r.layer === 2 && (r.zone || 'other') === z);
+        const title = z === 'adas_setup'
+          ? 'ADAS Documentation'
+          : (ZONE_DISPLAY[z] || z) + ' \u2014 Damage Documentation';
+        layer2Html += slotGroup(title, slots, layer1Locked);
+      }
+
+      const techNameJs = escapeHtml((job.technicianName || job.assigned_tech || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'"));
+      const jobIdJs    = encodeURIComponent(job.jobId);
+
+      photosSection = `
+      <style>
+        .photo-slot-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:10px}
+        .photo-slot{border-radius:8px;padding:10px;min-height:130px;display:flex;flex-direction:column;
+                    align-items:center;justify-content:center;gap:5px;position:relative;cursor:pointer}
+        .photo-slot.slot-filled-cursor{cursor:default}
+        .photo-slot:not([onclick]):hover{box-shadow:none}
+        .photo-slot[onclick]:hover{box-shadow:0 2px 8px rgba(0,0,0,.14)}
+        .slot-thumb-img{width:100%;max-height:100px;object-fit:cover;border-radius:4px}
+        .slot-empty-icon{font-size:28px;opacity:.3}
+        .slot-label{font-size:11px;font-weight:600;text-align:center;color:#333;line-height:1.3}
+        .slot-tap-hint{font-size:10px;color:#999}
+        .slot-meta{font-size:10px;color:#555;text-align:center}
+        .slot-remove-btn{position:absolute;top:4px;right:4px;background:none;border:none;color:#c0392b;
+                         cursor:pointer;font-size:11px;padding:2px 4px;border-radius:3px;line-height:1}
+        .slot-remove-btn:hover{background:#ffe0e0}
+        .mirror-callout{font-size:10px;color:#7a6000;background:#fffbea;border:1px solid #f0d060;
+                        border-radius:4px;padding:4px 6px;text-align:center;margin-top:2px}
+        .photo-label-group{margin-bottom:22px}
+        .photo-group-title{font-size:13px;font-weight:700;color:#1B3A6B;border-bottom:1px solid #e0e4ea;
+                           padding-bottom:5px;margin:0 0 6px 0}
+        .group-locked{opacity:.45;pointer-events:none}
+        .photo-locked-msg{font-size:12px;color:#7a6000;margin:4px 0}
+        .photo-layer-title-sub{font-size:14px;font-weight:700;color:#333;margin:0 0 12px 0}
+        .rec-star{font-size:10px}
+        @media print{
+          .photo-slot-grid{grid-template-columns:1fr 1fr;gap:6px}
+          .photo-slot{min-height:auto;page-break-inside:avoid}
+          .slot-thumb-img{max-height:130px}
+        }
+      </style>
+
+      <section class="doc-section" id="photo-doc-section">
         <h2 class="doc-section-title">Photo Documentation</h2>
 
-        <div class="photo-layer-block">
-          <h3 class="photo-layer-title">Layer 1 — General Area
-            ${layer1Done ? '<span class="badge badge-green" style="font-size:.7rem;margin-left:.5rem">COMPLETE</span>' : '<span class="badge badge-amber" style="font-size:.7rem;margin-left:.5rem">PENDING</span>'}
-          </h3>
-          ${photoGrid(layer1Photos)}
-          <form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/photos"
-                enctype="multipart/form-data" class="photo-upload-form">
-            <input type="hidden" name="layer" value="1">
-            <select name="category" required>
-              <option value="">— Select Category —</option>
-              <option value="Full vehicle (all sides)">Full vehicle (all sides)</option>
-              <option value="Full impact zone">Full impact zone</option>
-              <option value="Adjacent panels">Adjacent panels</option>
-            </select>
-            <input type="file" name="photo" accept="image/*" required>
-            <input type="text" name="tech_name" placeholder="Tech name">
-            <button type="submit" class="btn btn-primary btn-sm">Upload</button>
-          </form>
+        <div class="photo-layer-section" style="margin-bottom:20px">
+          <p class="photo-layer-title-sub">Layer 1 &mdash; Vehicle Overview &amp; Zone Establishment</p>
+          ${layer1Html}
         </div>
 
-        <div class="photo-layer-block ${!layer1Done ? 'layer-locked' : ''}">
-          <h3 class="photo-layer-title">Layer 2 — In-Process &amp; Documentation
-            ${!layer1Done ? '<span class="badge badge-amber" style="font-size:.7rem;margin-left:.5rem">REQUIRES LAYER 1 COMPLETE</span>' : ''}
-          </h3>
-          ${!layer1Done
-            ? '<p class="photo-locked-msg">Complete Layer 1 (upload at least one photo) before accessing Layer 2.</p>'
-            : `${photoGrid(layer2Photos)}
-               <form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/photos"
-                     enctype="multipart/form-data" class="photo-upload-form">
-                 <input type="hidden" name="layer" value="2">
-                 <select name="category" required>
-                   <option value="">— Select Category —</option>
-                   <option value="Close damage detail">Close damage detail</option>
-                   <option value="In-process repair">In-process repair</option>
-                   <option value="ADAS setup documentation">ADAS setup documentation</option>
-                   <option value="Finished state">Finished state</option>
-                 </select>
-                 <select name="damage_grade">
-                   <option value="">— Damage Grade (optional) —</option>
-                   <option value="MINOR">MINOR</option>
-                   <option value="MODERATE">MODERATE</option>
-                   <option value="MAJOR">MAJOR</option>
-                 </select>
-                 <input type="file" name="photo" accept="image/*" required>
-                 <input type="text" name="tech_name" placeholder="Tech name">
-                 <button type="submit" class="btn btn-primary btn-sm">Upload</button>
-               </form>`}
-        </div>
-      </section>`;
+        ${layer2Html ? '<div class="photo-layer-section"><p class="photo-layer-title-sub">Layer 2 &mdash; Damage Documentation'
+          + (layer1Locked ? ' <span style="font-size:.7rem;background:#FFF9CC;color:#7A6000;padding:1px 7px;border-radius:10px;font-weight:600">REQUIRES LAYER 1 COMPLETE</span>' : '')
+          + '</p>' + layer2Html + '</div>' : ''}
+      </section>
+
+      <script>
+        function triggerUpload(id){var i=document.getElementById('slot-input-'+id);if(i)i.click();}
+        function uploadSlot(id,input){
+          if(!input.files[0])return;
+          var fd=new FormData();
+          fd.append('photo',input.files[0]);
+          fd.append('tech_name','${techNameJs}');
+          fetch('/api/jobs/${jobIdJs}/photos/'+id,{method:'POST',body:fd})
+            .then(function(r){return r.json();})
+            .then(function(d){if(d.success)location.reload();else alert(d.error||'Upload failed');})
+            .catch(function(){alert('Upload failed — check connection');});
+        }
+        function removeSlot(e,id){
+          e.stopPropagation();
+          if(!confirm('Remove this photo?'))return;
+          fetch('/api/jobs/${jobIdJs}/photos/'+id+'/file',{method:'DELETE'})
+            .then(function(r){return r.json();})
+            .then(function(d){if(d.success)location.reload();else alert(d.error||'Remove failed');})
+            .catch(function(){alert('Remove failed');});
+        }
+      </script>`;
+    }
   }
+
+  // ── Assigned Team section ─────────────────────────────────────────────────
+  const assignedRows = db.prepare(`
+    SELECT u.id, u.full_name, u.role
+    FROM job_assignments ja
+    JOIN users u ON u.id = ja.user_id
+    WHERE ja.job_id=?
+    ORDER BY ja.assigned_at
+  `).all(job.jobId);
+
+  const canAssign = ['platform_admin', 'shop_admin', 'qc_manager'].includes(user.role);
+  let shopUsersForAssign = [];
+  if (canAssign) {
+    shopUsersForAssign = req.shopId
+      ? db.prepare(`SELECT id, full_name, role FROM users WHERE shop_id=? AND active=1 ORDER BY full_name`).all(req.shopId)
+      : db.prepare(`SELECT id, full_name, role FROM users WHERE active=1 ORDER BY full_name`).all();
+  }
+
+  const assignedSection = `
+      <section class="doc-section no-print">
+        <h2 class="doc-section-title">Assigned Team</h2>
+        ${assignedRows.length > 0
+          ? `<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:1rem">
+               ${assignedRows.map(u => {
+                 const parts    = (u.full_name || '').trim().split(/\s+/);
+                 const initials = parts.length >= 2
+                   ? parts[0][0] + parts[parts.length - 1][0]
+                   : (parts[0] || '?')[0];
+                 return `<div style="display:flex;align-items:center;gap:6px;background:#f4f6f9;border-radius:20px;padding:4px 12px 4px 6px">
+                   <span style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:50%;background:#1B3A6B;color:#fff;font-size:11px;font-weight:700">${escapeHtml(initials.toUpperCase())}</span>
+                   <span style="font-size:.85rem;color:#333">${escapeHtml(u.full_name)}</span>
+                   <span style="font-size:.75rem;color:#888">[${escapeHtml(u.role)}]</span>
+                 </div>`;
+               }).join('')}
+             </div>`
+          : `<p style="color:#888;font-size:.85rem;margin-bottom:1rem">No team members assigned.</p>`
+        }
+        ${canAssign ? `
+        <details>
+          <summary style="cursor:pointer;display:inline-block;padding:.35rem .75rem;background:#f4f6f9;border:1px solid #dde2ea;border-radius:5px;font-size:.85rem;font-weight:600;color:#1B3A6B;list-style:none;user-select:none">&#128101; Manage Assignment</summary>
+          <form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/assign" style="margin-top:.75rem">
+            <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.5rem;margin-bottom:.75rem">
+              ${shopUsersForAssign.map(u => `
+                <label style="display:flex;align-items:center;gap:.5rem;font-size:.85rem;cursor:pointer">
+                  <input type="checkbox" name="user_ids" value="${u.id}"${assignedRows.some(a => a.id === u.id) ? ' checked' : ''}>
+                  <span>${escapeHtml(u.full_name)} <span style="color:#888">[${escapeHtml(u.role)}]</span></span>
+                </label>`).join('')}
+            </div>
+            <button type="submit" class="btn btn-primary btn-sm">Save Assignment</button>
+          </form>
+        </details>` : ''}
+      </section>`;
 
   // ── Share link section ─────────────────────────────────────────────────────
   const activeToken = db.prepare(
@@ -1913,6 +2204,18 @@ app.get('/jobs/:jobId', requireAuth, shopScope, (req, res) => {
         </div>
         <div class="doc-actions no-print">
           <button onclick="window.print()" class="btn btn-white">&#128438; Print / Save PDF</button>
+          ${['platform_admin','shop_admin','service_writer'].includes(user.role) && job.status !== 'Closed'
+            ? `<a href="/jobs/${encodeURIComponent(job.jobId)}/edit" class="btn btn-white">&#9998; Edit Job</a>`
+            : ''}
+          ${['platform_admin','shop_admin','qc_manager'].includes(user.role) && job.status !== 'Closed'
+            ? `<form id="closeDirectForm" method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/close" style="display:inline">
+                 <button type="${(job.photo_status||'red') === 'red' ? 'button' : 'submit'}"
+                         class="btn btn-white" style="border-color:#c0392b;color:#c0392b"
+                         ${(job.photo_status||'red') === 'red' ? `onclick="document.getElementById('closeJobModal').style.display='flex'"` : ''}>
+                   Close Job
+                 </button>
+               </form>`
+            : ''}
           <a href="/" class="btn btn-ghost-white">Back to Jobs</a>
         </div>
       </div>
@@ -1987,15 +2290,274 @@ app.get('/jobs/:jobId', requireAuth, shopScope, (req, res) => {
 
       ${checkpointsSection}
       ${photosSection}
+      ${assignedSection}
       ${shareSection}
       ${techViewLink}
 
       <div class="doc-footer">
         <p>Generated by CollisionIQ &mdash; Job ID: ${escapeHtml(job.jobId)} &mdash; &copy; 2026 Cueljuris LLC</p>
       </div>
-    </div>`;
+    </div>
+
+    ${flash ? `<div style="position:fixed;top:1rem;right:1rem;z-index:999;background:${flash.type==='success'?'#D6F0D6':'#FFD6D6'};color:${flash.type==='success'?'#1A6B1A':'#8B0000'};padding:.65rem 1.25rem;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.15);font-size:.9rem;max-width:340px">${escapeHtml(flash.msg)}</div>` : ''}
+
+    ${['platform_admin','shop_admin','qc_manager'].includes(user.role) && job.status !== 'Closed' && (job.photo_status||'red') === 'red' ? `
+    <div id="closeJobModal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.45);z-index:1000;align-items:center;justify-content:center">
+      <div style="background:#fff;border-radius:10px;padding:2rem;max-width:480px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,.2)">
+        <h3 style="color:#8B0000;margin-bottom:.75rem">&#9888; Photo Documentation Incomplete</h3>
+        <p style="color:#555;font-size:.9rem;margin-bottom:1rem">Photo status is <strong>RED</strong>. Required photos have not been fully uploaded. Provide a reason to close this job anyway.</p>
+        <form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/close">
+          <textarea name="override_reason" required placeholder="Reason for overriding photo requirement&hellip;"
+                    style="width:100%;border:1px solid #ccc;border-radius:6px;padding:.6rem;font-size:.9rem;min-height:80px;margin-bottom:1rem;box-sizing:border-box;resize:vertical"></textarea>
+          <div style="display:flex;gap:.5rem">
+            <button type="submit" class="btn btn-primary" style="flex:1">Confirm &mdash; Close Job</button>
+            <button type="button" class="btn" onclick="document.getElementById('closeJobModal').style.display='none'" style="flex:1">Cancel</button>
+          </div>
+        </form>
+      </div>
+    </div>` : ''}`;
 
   res.send(layout(`Job ${job.jobId}`, content, '', req.session.user, req.session.shopFilter));
+});
+
+// ─── POST /jobs/:jobId/close — Close job with photo-status soft-lock ──────────
+
+app.post('/jobs/:jobId/close', requireAuth, requireQC, shopScope, (req, res) => {
+  const jobId = req.params.jobId;
+  let job;
+  if (req.shopId) {
+    job = db.prepare(`SELECT * FROM jobs WHERE jobId=? AND shop_id=?`).get(jobId, req.shopId);
+  } else {
+    job = db.prepare(`SELECT * FROM jobs WHERE jobId=?`).get(jobId);
+  }
+  if (!job) return res.status(404).send('Job not found.');
+  if (job.status === 'Closed') return res.redirect(`/jobs/${encodeURIComponent(jobId)}`);
+
+  const photoStatus    = job.photo_status || 'red';
+  const overrideReason = (req.body.override_reason || '').trim();
+
+  if (photoStatus === 'red' && !overrideReason) {
+    setFlash(req, 'error', 'Photo documentation is incomplete (RED). Provide an override reason to close anyway.');
+    return res.redirect(`/jobs/${encodeURIComponent(jobId)}`);
+  }
+
+  const now = new Date().toISOString();
+  db.prepare(`
+    UPDATE jobs SET status='Closed', photo_status_override=?, closed_by=?, closed_at=?, last_changed=?, updatedAt=?
+    WHERE jobId=?
+  `).run(photoStatus === 'red' ? 1 : 0, req.session.user.id, now, now, now, jobId);
+
+  setFlash(req, 'success', 'Job closed successfully.');
+  res.redirect(`/jobs/${encodeURIComponent(jobId)}`);
+});
+
+// ─── POST /jobs/:jobId/assign — Replace team assignment ───────────────────────
+
+app.post('/jobs/:jobId/assign', requireAuth, requireQC, shopScope, (req, res) => {
+  const jobId = req.params.jobId;
+  let job;
+  if (req.shopId) {
+    job = db.prepare(`SELECT jobId FROM jobs WHERE jobId=? AND shop_id=?`).get(jobId, req.shopId);
+  } else {
+    job = db.prepare(`SELECT jobId FROM jobs WHERE jobId=?`).get(jobId);
+  }
+  if (!job) return res.status(404).send('Job not found.');
+
+  const userIds = [].concat(req.body.user_ids || []).map(Number).filter(n => n > 0);
+  const now     = new Date().toISOString();
+  const assigner = req.session.user.id;
+
+  db.prepare(`DELETE FROM job_assignments WHERE job_id=?`).run(jobId);
+  const insertAssign = db.prepare(`INSERT OR IGNORE INTO job_assignments (job_id, user_id, assigned_by, assigned_at) VALUES (?,?,?,?)`);
+  for (const uid of userIds) insertAssign.run(jobId, uid, assigner, now);
+
+  setFlash(req, 'success', 'Team assignment updated.');
+  res.redirect(`/jobs/${encodeURIComponent(jobId)}`);
+});
+
+// ─── GET /jobs/:jobId/edit — Edit job form ────────────────────────────────────
+
+app.get('/jobs/:jobId/edit', requireAuth, requireEdit, shopScope, (req, res) => {
+  const user = req.session.user;
+  let job;
+  if (req.shopId) {
+    job = db.prepare(`SELECT * FROM jobs WHERE jobId=? AND shop_id=?`).get(req.params.jobId, req.shopId);
+  } else {
+    job = db.prepare(`SELECT * FROM jobs WHERE jobId=?`).get(req.params.jobId);
+  }
+  if (!job) return res.status(404).send(layout('Not Found', '<p>Job not found.</p>', '', user));
+  if (job.status === 'Closed') {
+    setFlash(req, 'error', 'Closed jobs cannot be edited.');
+    return res.redirect(`/jobs/${encodeURIComponent(job.jobId)}`);
+  }
+
+  const isGM = job.track === 'general-maintenance';
+
+  const repairOptions = [
+    'Windshield','Front Camera Area','Front Bumper','Rear Bumper','Radar',
+    'Structural Body Repair','Airbag / SRS Deployment','Rear Structural',
+    'Wheel Alignment','Suspension','Door / Mirror Repair','EV / Hybrid Vehicle','Other',
+  ];
+  const impactAreaOptions = [
+    ['front_end','Front End'],['rear_end','Rear End'],['driver_side','Driver Side'],
+    ['passenger_side','Passenger Side'],['roof','Roof / Rollover'],['undercarriage','Undercarriage'],
+  ];
+
+  const existingRepairs = (job.repairsPerformed || '').split(',').map(s => s.trim()).filter(Boolean);
+  let existingImpact = [];
+  try { existingImpact = JSON.parse(job.impact_areas || '[]'); } catch (e) { existingImpact = []; }
+
+  const repairCheckboxes = repairOptions.map(r => `
+    <label class="checkbox-label">
+      <input type="checkbox" name="repairs" value="${escapeHtml(r)}"${existingRepairs.includes(r) ? ' checked' : ''}>
+      <span>${escapeHtml(r)}</span>
+    </label>`).join('');
+
+  const impactCheckboxes = impactAreaOptions.map(([val, label]) => `
+    <label class="checkbox-label">
+      <input type="checkbox" name="impact_areas" value="${val}"${existingImpact.includes(val) ? ' checked' : ''}>
+      <span>${escapeHtml(label)}</span>
+    </label>`).join('');
+
+  const content = `
+    <div style="max-width:720px;margin:0 auto">
+      <div class="page-header">
+        <h1>Edit Job &mdash; <span style="font-family:monospace">${escapeHtml(job.jobId)}</span></h1>
+        <a href="/jobs/${encodeURIComponent(job.jobId)}" class="btn">Cancel</a>
+      </div>
+      <div class="card" style="padding:1.5rem">
+        <form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/edit">
+          <div class="form-section">
+            <h3 class="form-section-title">Vehicle Information</h3>
+            <div class="form-row-2">
+              <div class="form-group">
+                <label for="ro">RO Number</label>
+                <input type="text" id="ro" name="ro" value="${escapeHtml(job.ro||'')}" placeholder="RO-1234">
+              </div>
+              <div class="form-group">
+                <label for="vin">VIN</label>
+                <input type="text" id="vin" name="vin" value="${escapeHtml(job.vin||'')}" maxlength="17" placeholder="17-char VIN">
+              </div>
+            </div>
+            <div class="form-row-4">
+              <div class="form-group">
+                <label for="year">Year</label>
+                <input type="text" id="year" name="year" value="${escapeHtml(job.year||'')}" placeholder="2022">
+              </div>
+              <div class="form-group">
+                <label for="make">Make</label>
+                <input type="text" id="make" name="make" value="${escapeHtml(job.make||'')}" placeholder="Toyota">
+              </div>
+              <div class="form-group">
+                <label for="model">Model</label>
+                <input type="text" id="model" name="model" value="${escapeHtml(job.model||'')}" placeholder="Camry">
+              </div>
+              <div class="form-group">
+                <label for="trim">Trim</label>
+                <input type="text" id="trim" name="trim" value="${escapeHtml(job.trim||'')}" placeholder="XSE">
+              </div>
+            </div>
+            <div class="form-row-2">
+              <div class="form-group">
+                <label for="technicianName">Technician Name</label>
+                <input type="text" id="technicianName" name="technicianName" value="${escapeHtml(job.technicianName||'')}" placeholder="Jane Smith">
+              </div>
+              ${isGM ? `
+              <div class="form-group">
+                <label for="mileage">Mileage</label>
+                <input type="text" id="mileage" name="mileage" value="${escapeHtml(job.mileage||'')}" placeholder="45000">
+              </div>` : ''}
+              ${isGM ? `
+              <div class="form-group">
+                <label for="service_date">Service Date</label>
+                <input type="date" id="service_date" name="service_date" value="${escapeHtml(job.service_date||'')}">
+              </div>` : ''}
+            </div>
+          </div>
+          ${!isGM ? `
+          <div class="form-section">
+            <h3 class="form-section-title">Repairs Performed <span style="font-size:.8rem;color:#888;font-weight:400">(used to recalculate ADAS requirements)</span></h3>
+            <div class="checkbox-grid">${repairCheckboxes}</div>
+          </div>
+          <div class="form-section">
+            <h3 class="form-section-title">Impact Areas</h3>
+            <div class="checkbox-grid">${impactCheckboxes}</div>
+          </div>
+          <div class="form-section">
+            <h3 class="form-section-title">Damage Grade</h3>
+            <select name="collision_grade" class="form-control" style="max-width:200px">
+              <option value="">— Select —</option>
+              ${['MINOR','MODERATE','MAJOR'].map(g => `<option value="${g}"${job.collision_grade===g?' selected':''}>${g}</option>`).join('')}
+            </select>
+          </div>` : ''}
+          <div style="margin-top:1.5rem;display:flex;gap:.75rem">
+            <button type="submit" class="btn btn-primary">&#10003; Save Changes</button>
+            <a href="/jobs/${encodeURIComponent(job.jobId)}" class="btn">Cancel</a>
+          </div>
+        </form>
+      </div>
+    </div>`;
+
+  res.send(layout(`Edit Job ${job.jobId}`, content, '', user, req.session.shopFilter));
+});
+
+// ─── POST /jobs/:jobId/edit — Save edited job ─────────────────────────────────
+
+app.post('/jobs/:jobId/edit', requireAuth, requireEdit, shopScope, async (req, res) => {
+  const user = req.session.user;
+  let job;
+  if (req.shopId) {
+    job = db.prepare(`SELECT * FROM jobs WHERE jobId=? AND shop_id=?`).get(req.params.jobId, req.shopId);
+  } else {
+    job = db.prepare(`SELECT * FROM jobs WHERE jobId=?`).get(req.params.jobId);
+  }
+  if (!job) return res.status(404).send('Job not found.');
+  if (job.status === 'Closed') {
+    setFlash(req, 'error', 'Closed jobs cannot be edited.');
+    return res.redirect(`/jobs/${encodeURIComponent(job.jobId)}`);
+  }
+
+  const isGM  = job.track === 'general-maintenance';
+  const { ro, vin, year, make, model, trim, technicianName, mileage, service_date, collision_grade } = req.body;
+  const now   = new Date().toISOString();
+
+  if (isGM) {
+    db.prepare(`
+      UPDATE jobs SET ro=?, vin=?, year=?, make=?, model=?, trim=?, technicianName=?,
+        mileage=?, service_date=?, last_edited_by=?, last_edited_at=?, last_changed=?, updatedAt=?
+      WHERE jobId=?
+    `).run(ro||'', (vin||'').toUpperCase(), year||'', make||'', model||'', trim||'', technicianName||'',
+           mileage||'', service_date||'', user.id, now, now, now, job.jobId);
+  } else {
+    let repairs = req.body.repairs || [];
+    if (!Array.isArray(repairs)) repairs = [repairs];
+    const repairsStr = repairs.join(', ');
+
+    let impactAreas = req.body.impact_areas || [];
+    if (!Array.isArray(impactAreas)) impactAreas = [impactAreas];
+    const impactAreasJson = JSON.stringify(impactAreas);
+
+    const {
+      adasSystems, rationale, liabilityWarning, makeSpecificNotes,
+      preScanRequired, postScanRequired, approvedScanTool,
+    } = runADASEngine(make || job.make, model || job.model, year || job.year, repairs);
+
+    db.prepare(`
+      UPDATE jobs SET ro=?, vin=?, year=?, make=?, model=?, trim=?, technicianName=?,
+        repairsPerformed=?, collision_grade=?, impact_areas=?,
+        adasSystems=?, rationale=?, liabilityWarning=?, makeSpecificNotes=?,
+        preScanRequired=?, postScanRequired=?, approvedScanTool=?,
+        last_edited_by=?, last_edited_at=?, last_changed=?, updatedAt=?
+      WHERE jobId=?
+    `).run(ro||'', (vin||'').toUpperCase(), year||'', make||'', model||'', trim||'', technicianName||'',
+           repairsStr, collision_grade||'', impactAreasJson,
+           adasSystems, rationale, liabilityWarning, makeSpecificNotes,
+           preScanRequired, postScanRequired, approvedScanTool,
+           user.id, now, now, now, job.jobId);
+  }
+
+  setFlash(req, 'success', 'Job updated successfully.');
+  res.redirect(`/jobs/${encodeURIComponent(job.jobId)}`);
 });
 
 // GET /admin — Admin panel
@@ -2393,6 +2955,122 @@ app.post('/jobs/:jobId/photos', requireAuth, upload.single('photo'), (req, res) 
   `).run(job.jobId, layer, category, req.file.filename, techName, damageGrade);
 
   res.redirect(`/jobs/${encodeURIComponent(job.jobId)}`);
+});
+
+// ─── Photo Label API ─────────────────────────────────────────────────────────
+
+const ALLOWED_PHOTO_MIME = ['image/jpeg', 'image/png', 'image/heic', 'image/webp'];
+
+// GET /api/jobs/:jobId/photos — labeled slot manifest
+app.get('/api/jobs/:jobId/photos', requireAuth, shopScope, (req, res) => {
+  let job;
+  if (req.shopId) {
+    job = db.prepare(`SELECT * FROM jobs WHERE jobId=? AND shop_id=?`).get(req.params.jobId, req.shopId);
+  } else {
+    job = db.prepare(`SELECT * FROM jobs WHERE jobId=?`).get(req.params.jobId);
+  }
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+
+  const rows  = db.prepare(`SELECT * FROM job_photos WHERE job_id=? ORDER BY layer, id`).all(job.jobId);
+  const layer1 = rows.filter(r => r.layer === 1);
+  const layer2 = {};
+  for (const r of rows.filter(r => r.layer === 2)) {
+    const z = r.zone || 'other';
+    if (!layer2[z]) layer2[z] = [];
+    layer2[z].push(r);
+  }
+  res.json({ layer1, layer2 });
+});
+
+// POST /api/jobs/:jobId/photos/:photoId — upload file to labeled slot
+app.post('/api/jobs/:jobId/photos/:photoId', requireAuth, shopScope, upload.single('photo'), (req, res) => {
+  let job;
+  if (req.shopId) {
+    job = db.prepare(`SELECT * FROM jobs WHERE jobId=? AND shop_id=?`).get(req.params.jobId, req.shopId);
+  } else {
+    job = db.prepare(`SELECT * FROM jobs WHERE jobId=?`).get(req.params.jobId);
+  }
+  if (!job) {
+    if (req.file) fs.unlinkSync(req.file.path);
+    return res.status(404).json({ error: 'Job not found' });
+  }
+
+  // Tech scope check
+  const user = req.session.user;
+  if (user.role === 'technician' &&
+      job.assigned_tech !== user.full_name && job.technicianName !== user.full_name) {
+    if (req.file) fs.unlinkSync(req.file.path);
+    return res.status(403).json({ error: 'Access denied' });
+  }
+
+  const photoRow = db.prepare(`SELECT * FROM job_photos WHERE id=? AND job_id=?`)
+    .get(req.params.photoId, job.jobId);
+  if (!photoRow) {
+    if (req.file) fs.unlinkSync(req.file.path);
+    return res.status(404).json({ error: 'Photo slot not found' });
+  }
+
+  if (!req.file) return res.status(400).json({ error: 'No file provided' });
+
+  if (!ALLOWED_PHOTO_MIME.includes(req.file.mimetype)) {
+    fs.unlinkSync(req.file.path);
+    return res.status(400).json({ error: 'File type not allowed. Use JPEG, PNG, HEIC, or WebP.' });
+  }
+
+  // Layer 2 gate
+  if (photoRow.layer === 2) {
+    const pending = db.prepare(
+      `SELECT COUNT(*) as c FROM job_photos WHERE job_id=? AND layer=1 AND is_recommended=0 AND file_path IS NULL`
+    ).get(job.jobId);
+    if (pending.c > 0) {
+      fs.unlinkSync(req.file.path);
+      return res.status(403).json({ error: 'Complete all required Layer 1 photos before uploading Layer 2.' });
+    }
+  }
+
+  // Delete existing file if replacing
+  if (photoRow.file_path) {
+    const oldPath = path.join(uploadsDir, photoRow.file_path);
+    if (fs.existsSync(oldPath)) try { fs.unlinkSync(oldPath); } catch (e) {}
+  }
+
+  const techName   = req.body.tech_name || user.full_name || '';
+  const fileSizeKb = Math.ceil(req.file.size / 1024);
+  const now        = new Date().toISOString();
+
+  db.prepare(`UPDATE job_photos SET file_path=?, mime_type=?, file_size_kb=?, tech_name=?, uploaded_at=?, notes=? WHERE id=?`)
+    .run(req.file.filename, req.file.mimetype, fileSizeKb, techName, now, req.body.notes || null, photoRow.id);
+
+  db.prepare(`UPDATE jobs SET last_changed=? WHERE jobId=?`).run(now, job.jobId);
+  updateJobPhotoStatus(db, job.jobId);
+
+  res.json({ success: true, file_path: req.file.filename, uploaded_at: now });
+});
+
+// DELETE /api/jobs/:jobId/photos/:photoId/file — clear file from slot
+app.delete('/api/jobs/:jobId/photos/:photoId/file', requireAuth, requireQC, shopScope, (req, res) => {
+  let job;
+  if (req.shopId) {
+    job = db.prepare(`SELECT * FROM jobs WHERE jobId=? AND shop_id=?`).get(req.params.jobId, req.shopId);
+  } else {
+    job = db.prepare(`SELECT * FROM jobs WHERE jobId=?`).get(req.params.jobId);
+  }
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+
+  const photoRow = db.prepare(`SELECT * FROM job_photos WHERE id=? AND job_id=?`)
+    .get(req.params.photoId, job.jobId);
+  if (!photoRow) return res.status(404).json({ error: 'Photo slot not found' });
+
+  if (photoRow.file_path) {
+    const filePath = path.join(uploadsDir, photoRow.file_path);
+    if (fs.existsSync(filePath)) try { fs.unlinkSync(filePath); } catch (e) {}
+  }
+
+  db.prepare(`UPDATE job_photos SET file_path=NULL, mime_type=NULL, file_size_kb=NULL, tech_name='', uploaded_at=NULL, notes=NULL WHERE id=?`)
+    .run(photoRow.id);
+  updateJobPhotoStatus(db, job.jobId);
+
+  res.json({ success: true });
 });
 
 // ─── Step 11: Checkpoint Sign-Off ────────────────────────────────────────────
