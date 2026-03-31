@@ -454,6 +454,7 @@ function layout(title, content, activeNav = '', user = null, shopFilter = null) 
         ${nav('/reference', 'reference', 'ADAS Reference')}
         ${nav('/admin', 'admin', 'Admin')}
         ${nav('/platform/shops', 'shops', 'Shops')}
+        ${nav('/platform/billing', 'billing', 'Billing')}
         ${nav('/dashboard/flags', 'flags', 'Flag Dashboard')}
         ${nav('/platform/demo-credentials', 'demo', 'Demo Credentials')}
         ${shopSwitcher}
@@ -572,6 +573,9 @@ app.get('/login', (req, res) => {
         </div>
         <button type="submit" class="login-btn">Sign In</button>
       </form>
+      <div style="text-align:center;margin-top:1.25rem;font-size:.85rem;color:#666">
+        New shop? <a href="/register" style="color:#1B3A6B;font-weight:600">Create an account</a>
+      </div>
       <div class="login-footer-note">&copy; 2026 Cueljuris LLC</div>
     </div>
   </div>
@@ -3669,6 +3673,106 @@ app.post('/platform/shops/create', requirePlatformAdmin, async (req, res) => {
   db.prepare(`INSERT INTO users (shop_id, username, password_hash, role, full_name) VALUES (?,?,?,?,?)`)
     .run(shopId, admin_username, hash, 'shop_admin', admin_full_name || '');
   res.redirect('/platform/shops');
+});
+
+// GET /platform/billing — Billing overview for platform admin
+app.get('/platform/billing', requirePlatformAdmin, (req, res) => {
+  const shops = db.prepare(`
+    SELECT id, name, city, state,
+           subscription_status, stripe_customer_id, stripe_subscription_id,
+           subscription_current_period_end, grace_period_end, trial_end, created_at
+    FROM shops ORDER BY name ASC
+  `).all();
+
+  const now = Math.floor(Date.now() / 1000);
+
+  function statusBadgeB(s) {
+    const cfg = {
+      active:   ['#D6F0D6','#1A6B1A'],
+      past_due: ['#FFF9CC','#7A6000'],
+      grace:    ['#FFE8CC','#7A4000'],
+      trial:    ['#E8EEF7','#1B3A6B'],
+      inactive: ['#F0F0F0','#555555'],
+    };
+    const [bg, fg] = cfg[s] || cfg.inactive;
+    return `<span style="display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600;background:${bg};color:${fg}">${escapeHtml(s || 'inactive').toUpperCase()}</span>`;
+  }
+
+  function fmtUnix(ts) {
+    if (!ts) return '—';
+    return new Date(Number(ts) * 1000).toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' });
+  }
+
+  function maskId(id) {
+    if (!id) return '—';
+    return id.slice(0, 8) + '…' + id.slice(-4);
+  }
+
+  // Summary counts
+  const counts = { active: 0, past_due: 0, grace: 0, inactive: 0, trial: 0 };
+  for (const s of shops) {
+    const st = s.subscription_status || 'inactive';
+    counts[st] = (counts[st] || 0) + 1;
+  }
+  const atRisk = (counts.past_due || 0) + (counts.grace || 0);
+
+  const summaryCards = `
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:1rem;margin-bottom:2rem">
+      ${[
+        ['Total Shops',  shops.length,          '#1B3A6B', '#fff'],
+        ['Active',       counts.active || 0,     '#1A6B1A', '#D6F0D6'],
+        ['At Risk',      atRisk,                 '#7A4000', '#FFE8CC'],
+        ['Inactive',     counts.inactive || 0,   '#555555', '#F0F0F0'],
+        ['Trial',        counts.trial || 0,      '#1B3A6B', '#E8EEF7'],
+      ].map(([label, val, fg, bg]) => `
+        <div style="background:${bg};border-radius:8px;padding:1rem;text-align:center">
+          <div style="font-size:1.75rem;font-weight:700;color:${fg}">${val}</div>
+          <div style="font-size:.8rem;color:${fg};opacity:.8;font-weight:600;margin-top:.25rem">${label}</div>
+        </div>`).join('')}
+    </div>`;
+
+  const rows = shops.map(s => {
+    const st      = s.subscription_status || 'inactive';
+    const expired = s.subscription_current_period_end && Number(s.subscription_current_period_end) < now;
+    const graceExpired = s.grace_period_end && Number(s.grace_period_end) < now;
+    return `
+      <tr>
+        <td><strong>${escapeHtml(s.name)}</strong>${s.city ? `<br><span style="font-size:.8rem;color:#888">${escapeHtml(s.city)}${s.state ? ', '+escapeHtml(s.state) : ''}</span>` : ''}</td>
+        <td>${statusBadgeB(st)}</td>
+        <td style="font-family:monospace;font-size:.8rem">${maskId(s.stripe_customer_id)}</td>
+        <td style="${expired ? 'color:#8B0000;font-weight:600' : ''}">${fmtUnix(s.subscription_current_period_end)}</td>
+        <td style="${graceExpired ? 'color:#8B0000;font-weight:600' : s.grace_period_end ? 'color:#7A4000' : ''}">${fmtUnix(s.grace_period_end)}</td>
+        <td>${formatDate(s.created_at)}</td>
+      </tr>`;
+  }).join('');
+
+  const content = `
+    <div class="page-header">
+      <h1>Billing Overview <span class="count-badge">${shops.length}</span></h1>
+      <a href="/register" class="btn btn-primary">+ New Shop Signup</a>
+    </div>
+
+    ${summaryCards}
+
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Shop</th>
+            <th>Status</th>
+            <th>Stripe Customer</th>
+            <th>Period Ends</th>
+            <th>Grace Ends</th>
+            <th>Joined</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.length > 0 ? rows : '<tr><td colspan="6" class="empty">No shops yet.</td></tr>'}
+        </tbody>
+      </table>
+    </div>`;
+
+  res.send(layout('Billing Overview', content, 'billing', req.session.user, req.session.shopFilter));
 });
 
 // POST /platform/shop-filter — Set shop switcher for platform_admin
