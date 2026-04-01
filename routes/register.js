@@ -75,7 +75,17 @@ function registerPage(cancelled, error) {
 // ── GET /register ──────────────────────────────────────────────────────────
 router.get('/register', (req, res) => {
   const cancelled = req.query.cancelled === '1';
-  res.send(registerPage(cancelled, null));
+
+  const errorMap = {
+    fields:    'All fields are required.',
+    passwords: 'Passwords do not match.',
+    short:     'Password must be at least 8 characters.',
+    exists:    'An account with that email already exists.',
+    payment:   'Payment setup failed. Please try again.',
+  };
+  const error = errorMap[req.query.error] || null;
+
+  res.send(registerPage(cancelled, error));
 });
 
 // ── POST /register ─────────────────────────────────────────────────────────
@@ -83,19 +93,19 @@ router.post('/register', async (req, res) => {
   const { shop_name, owner_name, email, password, password_confirm, city, state } = req.body;
 
   if (!shop_name || !owner_name || !email || !password || !city || !state) {
-    return res.send(registerPage(false, 'All fields are required.'));
+    return res.redirect('/register?error=fields');
   }
   if (password !== password_confirm) {
-    return res.send(registerPage(false, 'Passwords do not match.'));
+    return res.redirect('/register?error=passwords');
   }
   if (password.length < 8) {
-    return res.send(registerPage(false, 'Password must be at least 8 characters.'));
+    return res.redirect('/register?error=short');
   }
 
   // Check for existing account (email stored in username column)
   const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(email);
   if (existing) {
-    return res.send(registerPage(false, 'An account with that email already exists.'));
+    return res.redirect('/register?error=exists');
   }
 
   try {
@@ -123,7 +133,7 @@ router.post('/register', async (req, res) => {
     res.redirect(checkoutSession.url);
   } catch (err) {
     console.error('[register] Stripe error:', err.message);
-    res.send(registerPage(false, 'Payment setup failed. Please try again.'));
+    res.redirect('/register?error=payment');
   }
 });
 
