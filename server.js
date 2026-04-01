@@ -202,6 +202,12 @@ app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), bill
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+// Service worker must be served with no-cache headers (before static middleware)
+app.get('/sw.js', (req, res) => {
+  res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.sendFile(path.join(__dirname, 'public', 'sw.js'));
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.use(session({
@@ -501,6 +507,12 @@ function layout(title, content, activeNav = '', user = null, shopFilter = null) 
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${escapeHtml(title)} — CollisionIQ</title>
   <link rel="stylesheet" href="/style.css">
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#1B3A6B">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="CollisionIQ">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
 </head>
 <body>
   ${adminBanner}
@@ -524,6 +536,15 @@ function layout(title, content, activeNav = '', user = null, shopFilter = null) 
   <footer class="site-footer">
     <p>&copy; 2026 Cueljuris LLC &mdash; CollisionIQ Platform</p>
   </footer>
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', function () {
+        navigator.serviceWorker.register('/sw.js')
+          .then(function (reg) { console.log('CollisionIQ SW registered:', reg.scope); })
+          .catch(function (err) { console.log('CollisionIQ SW registration failed:', err); });
+      });
+    }
+  </script>
 </body>
 </html>`;
 }
