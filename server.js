@@ -246,6 +246,13 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+function requireCreate(req, res, next) {
+  if (!req.session.user) return res.redirect('/login');
+  const role = req.session.user.role;
+  if (['platform_admin', 'shop_admin', 'service_writer'].includes(role)) return next();
+  return res.status(403).send('Access denied.');
+}
+
 function requirePlatformAdmin(req, res, next) {
   if (!req.session.user || req.session.user.role !== 'platform_admin') {
     return res.status(403).send('Access denied.');
@@ -686,7 +693,7 @@ app.get('/', requireAuth, shopScope, (req, res) => {
     }
   }
 
-  const canCreate = ['platform_admin', 'shop_admin'].includes(user.role);
+  const canCreate = ['platform_admin', 'shop_admin', 'service_writer'].includes(user.role);
 
   // ── Batch assignment query ────────────────────────────────────────────────
   const jobIds = jobs.map(j => j.jobId);
@@ -862,7 +869,7 @@ app.get('/', requireAuth, shopScope, (req, res) => {
 });
 
 // GET /new — New job form (track selector → GM or Collision)
-app.get('/new', requireAuth, requireAdmin, (req, res) => {
+app.get('/new', requireAuth, requireCreate, (req, res) => {
   const prefill = {
     make:  req.query.make  || '',
     model: req.query.model || '',
@@ -1669,7 +1676,7 @@ app.get('/new', requireAuth, requireAdmin, (req, res) => {
 });
 
 // POST /jobs — Create job (handles both tracks)
-app.post('/jobs', requireAuth, requireAdmin, (req, res) => {
+app.post('/jobs', requireAuth, requireCreate, (req, res) => {
   const track = req.body.track || 'post-collision';
   const jobId      = generateJobId();
   const shareToken = crypto.randomBytes(16).toString('hex');
