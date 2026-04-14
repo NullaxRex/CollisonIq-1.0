@@ -225,8 +225,8 @@ app.use('/', billingRouter);
 // Uploads directory (photo storage)
 const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
-const upload = multer({ dest: uploadsDir, limits: { fileSize: 20 * 1024 * 1024 } });
-app.use('/uploads', express.static(uploadsDir));
+const upload = multer({ dest: uploadsDir, limits: { fileSize: 10 * 1024 * 1024 } });
+// /uploads is no longer publicly served — photos are served via auth-gated route below
 
 const DEFAULT_SHOP_ID = 1; // fallback for contexts without req
 
@@ -1944,6 +1944,12 @@ app.get('/jobs/:jobId', requireAuth, shopScope, (req, res) => {
     ).all(job.jobId);
 
     if (jobPhotoRows.length > 0) {
+      // Role gates for upload and delete
+      const canUpload = ['platform_admin', 'shop_admin', 'qc_manager', 'technician'].includes(user.role) &&
+                        (job.status !== 'Closed' || user.role === 'platform_admin');
+      const canDelete = user.role !== 'service_writer' &&
+                        (job.status !== 'Closed' || user.role === 'platform_admin');
+
       // Layer 1 gate
       const l1Required = jobPhotoRows.filter(r => r.layer === 1 && !r.is_recommended);
       const l1Done     = l1Required.filter(r => r.file_path).length;
@@ -1956,17 +1962,21 @@ app.get('/jobs/:jobId', requireAuth, shopScope, (req, res) => {
         const rec    = !!slot.is_recommended;
         const border = filled ? '2px solid #22863a' : (rec ? '2px dashed #b8860b' : '2px dashed #cccccc');
         const bg     = filled ? '#f0fff4'           : (rec ? '#fffbea'            : '#fafafa');
+        const clickable = !filled && canUpload;
 
         let html = '<div class="photo-slot" style="border:' + border + ';background:' + bg + '"';
-        if (!filled) html += ' onclick="triggerUpload(' + slot.id + ')" tabindex="0"';
+        if (clickable) html += ' onclick="triggerUpload(' + slot.id + ')" tabindex="0"';
         html += ' data-slot-id="' + slot.id + '">';
 
-        html += '<input type="file" id="slot-input-' + slot.id + '" '
-              + 'accept="image/jpeg,image/png,image/heic,image/webp" class="no-print" '
-              + 'style="display:none" onchange="uploadSlot(' + slot.id + ',this)">';
+        if (canUpload) {
+          html += '<input type="file" id="slot-input-' + slot.id + '" '
+                + 'accept="image/jpeg,image/png,image/heic,image/webp" class="no-print" '
+                + 'style="display:none" onchange="uploadSlot(' + slot.id + ',this)">';
+        }
 
         if (filled) {
-          html += '<img src="/uploads/' + encodeURIComponent(slot.file_path) + '" '
+          // Auth-gated serve route — no unauthenticated access
+          html += '<img src="/jobs/' + encodeURIComponent(job.jobId) + '/photos/' + slot.id + '/file" '
                 + 'alt="' + escapeHtml(slot.label_display) + '" class="slot-thumb-img" loading="lazy">';
         } else {
           html += '<div class="slot-empty-icon no-print">&#128247;</div>';
@@ -1983,10 +1993,14 @@ app.get('/jobs/:jobId', requireAuth, shopScope, (req, res) => {
           html += '<div class="slot-meta print-only" style="font-size:9px;color:#888">'
                 + escapeHtml(slot.tech_name || '') + ' &bull; '
                 + escapeHtml(slot.uploaded_at ? slot.uploaded_at.slice(0,10) : '') + '</div>';
-          html += '<button class="slot-remove-btn no-print" data-photo-id="' + slot.id + '" '
-                + 'onclick="removeSlot(event,' + slot.id + ')" title="Remove">&#10005;</button>';
-        } else {
+          if (canDelete) {
+            html += '<button class="slot-remove-btn no-print" data-photo-id="' + slot.id + '" '
+                  + 'onclick="removeSlot(event,' + slot.id + ')" title="Remove">&#10005;</button>';
+          }
+        } else if (canUpload) {
           html += '<div class="slot-tap-hint no-print">' + (rec ? 'Tap to add (optional)' : 'Tap to upload') + '</div>';
+        } else {
+          html += '<div class="slot-tap-hint no-print" style="color:#aaa">No photo</div>';
         }
 
         if (slot.label_key === 'MIRROR_SIDE_UNDAMAGED' && !filled) {
@@ -2072,7 +2086,9 @@ app.get('/jobs/:jobId', requireAuth, shopScope, (req, res) => {
       </style>
 
       <section class="doc-section" id="photo-doc-section">
-        <h2 class="doc-section-title">Photo Documentation</h2>
+        <h2 class="doc-section-title">Photo Documentation
+          <span class="badge badge-${job.photo_status || 'red'}" style="font-size:.65rem;margin-left:.5rem;vertical-align:middle">${(job.photo_status || 'red').toUpperCase()}</span>
+        </h2>
 
         <div class="photo-layer-section" style="margin-bottom:20px">
           <p class="photo-layer-title-sub">Layer 1 &mdash; Vehicle Overview &amp; Zone Establishment</p>
@@ -2993,6 +3009,27 @@ app.post('/jobs/:jobId/photos', requireAuth, upload.single('photo'), (req, res) 
 
 const ALLOWED_PHOTO_MIME = ['image/jpeg', 'image/png', 'image/heic', 'image/webp'];
 
+// GET /jobs/:jobId/photos/:photoId/file — auth-gated photo serve
+// Verifies session + shop scope before serving. Replaces public /uploads static route.
+app.get('/jobs/:jobId/photos/:photoId/file', requireAuth, shopScope, (req, res) => {
+  let job;
+  if (req.shopId) {
+    job = db.prepare(`SELECT * FROM jobs WHERE jobId=? AND shop_id=?`).get(req.params.jobId, req.shopId);
+  } else {
+    job = db.prepare(`SELECT * FROM jobs WHERE jobId=?`).get(req.params.jobId);
+  }
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+
+  const photoRow = db.prepare(`SELECT * FROM job_photos WHERE id=? AND job_id=?`)
+    .get(req.params.photoId, job.jobId);
+  if (!photoRow || !photoRow.file_path) return res.status(404).json({ error: 'Photo not found' });
+
+  const filePath = path.join(uploadsDir, photoRow.file_path);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File not found on disk' });
+
+  res.sendFile(filePath);
+});
+
 // GET /api/jobs/:jobId/photos — labeled slot manifest
 app.get('/api/jobs/:jobId/photos', requireAuth, shopScope, (req, res) => {
   let job;
@@ -3027,8 +3064,21 @@ app.post('/api/jobs/:jobId/photos/:photoId', requireAuth, shopScope, upload.sing
     return res.status(404).json({ error: 'Job not found' });
   }
 
-  // Tech scope check
   const user = req.session.user;
+
+  // service_writer cannot upload photos
+  if (user.role === 'service_writer') {
+    if (req.file) fs.unlinkSync(req.file.path);
+    return res.status(403).json({ error: 'Service writers cannot upload photos.' });
+  }
+
+  // Closed job lock — only platform_admin may upload to a closed job
+  if (job.status === 'Closed' && user.role !== 'platform_admin') {
+    if (req.file) fs.unlinkSync(req.file.path);
+    return res.status(403).json({ error: 'This job is closed. Photos cannot be added.' });
+  }
+
+  // Tech scope check
   if (user.role === 'technician' &&
       job.assigned_tech !== user.full_name && job.technicianName !== user.full_name) {
     if (req.file) fs.unlinkSync(req.file.path);
@@ -3080,7 +3130,14 @@ app.post('/api/jobs/:jobId/photos/:photoId', requireAuth, shopScope, upload.sing
 });
 
 // DELETE /api/jobs/:jobId/photos/:photoId/file — clear file from slot
-app.delete('/api/jobs/:jobId/photos/:photoId/file', requireAuth, requireQC, shopScope, (req, res) => {
+app.delete('/api/jobs/:jobId/photos/:photoId/file', requireAuth, shopScope, (req, res) => {
+  const user = req.session.user;
+
+  // service_writer cannot delete photos
+  if (user.role === 'service_writer') {
+    return res.status(403).json({ error: 'Service writers cannot delete photos.' });
+  }
+
   let job;
   if (req.shopId) {
     job = db.prepare(`SELECT * FROM jobs WHERE jobId=? AND shop_id=?`).get(req.params.jobId, req.shopId);
@@ -3089,9 +3146,27 @@ app.delete('/api/jobs/:jobId/photos/:photoId/file', requireAuth, requireQC, shop
   }
   if (!job) return res.status(404).json({ error: 'Job not found' });
 
+  // Closed job lock — only platform_admin may delete from a closed job
+  if (job.status === 'Closed' && user.role !== 'platform_admin') {
+    return res.status(403).json({ error: 'This job is closed. Photos cannot be removed.' });
+  }
+
   const photoRow = db.prepare(`SELECT * FROM job_photos WHERE id=? AND job_id=?`)
     .get(req.params.photoId, job.jobId);
   if (!photoRow) return res.status(404).json({ error: 'Photo slot not found' });
+
+  // Technician restriction: own photo only, within 24 hours of upload
+  if (user.role === 'technician') {
+    if (photoRow.tech_name !== user.full_name) {
+      return res.status(403).json({ error: 'You can only remove your own photos.' });
+    }
+    if (photoRow.uploaded_at) {
+      const ageMs = Date.now() - new Date(photoRow.uploaded_at).getTime();
+      if (ageMs > 24 * 60 * 60 * 1000) {
+        return res.status(403).json({ error: 'Photos can only be removed within 24 hours of upload.' });
+      }
+    }
+  }
 
   if (photoRow.file_path) {
     const filePath = path.join(uploadsDir, photoRow.file_path);
