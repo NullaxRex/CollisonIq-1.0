@@ -64,7 +64,7 @@ function registerPage(cancelled, error) {
       <input id="password" name="password" type="password" required placeholder="Minimum 8 characters">
       <label for="password_confirm">Confirm Password</label>
       <input id="password_confirm" name="password_confirm" type="password" required placeholder="Repeat password">
-      <button type="submit" class="btn">Continue to Payment &rarr;</button>
+      <button type="submit" class="btn">Create Free Account &rarr;</button>
     </form>
     <p class="login-link">Already have an account? <a href="/login">Sign in</a></p>
   </div>
@@ -81,7 +81,7 @@ router.get('/register', (req, res) => {
     passwords: 'Passwords do not match.',
     short:     'Password must be at least 8 characters.',
     exists:    'An account with that email already exists.',
-    payment:   'Payment setup failed. Please try again.',
+    payment:   'Account creation failed. Please try again.',
   };
   const error = errorMap[req.query.error] || null;
 
@@ -124,10 +124,8 @@ router.post('/register', async (req, res) => {
     const checkoutSession = await stripe.checkout.sessions.create({
       customer: customer.id,
       mode: 'subscription',
-      line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
-      subscription_data: {
-        trial_period_days: 30,
-      },
+      line_items: [{ price: 'price_1TZBLcQx0YVznfDrJelvhtP4', quantity: 1 }],
+      payment_method_collection: 'if_required',
       success_url: `${process.env.APP_BASE_URL}/register/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url:  `${process.env.APP_BASE_URL}/register?cancelled=1`,
       metadata:    { owner_email: email },
