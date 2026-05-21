@@ -125,6 +125,9 @@ router.post('/register', async (req, res) => {
       customer: customer.id,
       mode: 'subscription',
       line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
+      subscription_data: {
+        trial_period_days: 30,
+      },
       success_url: `${process.env.APP_BASE_URL}/register/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url:  `${process.env.APP_BASE_URL}/register?cancelled=1`,
       metadata:    { owner_email: email },
@@ -149,7 +152,8 @@ router.get('/register/success', async (req, res) => {
       expand: ['subscription'],
     });
 
-    if (checkoutSession.payment_status !== 'paid') {
+    const allowed = ['paid', 'no_payment_required'];
+    if (!allowed.includes(checkoutSession.payment_status)) {
       return res.redirect('/register?cancelled=1');
     }
 
