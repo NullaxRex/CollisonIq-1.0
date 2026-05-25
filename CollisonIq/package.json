@@ -2,9 +2,9 @@
   "name": "collisioniq",
   "version": "2.0.0",
   "description": "ADAS Calibration Documentation and Compliance Management Platform",
-  "main": "server.js",
+  "main": "CollisonIq/server.js",
   "scripts": {
-    "start": "node --disable-warning=ExperimentalWarning server.js"
+    "start": "node --disable-warning=ExperimentalWarning CollisonIq/server.js"
   },
   "dependencies": {
     "bcrypt": "^5.1.1",
