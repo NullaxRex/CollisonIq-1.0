@@ -70,7 +70,6 @@ db.exec(`
   );
 `);
 
-// safe column additions
 const addCols = [
   ['jobs','mileage','TEXT'], ['jobs','service_date','TEXT'], ['jobs','assigned_tech','TEXT'],
   ['jobs','impact_areas','TEXT'], ['jobs','photo_status','TEXT'],
@@ -79,7 +78,6 @@ for (const [tbl, col, def] of addCols) {
   try { db.exec(`ALTER TABLE ${tbl} ADD COLUMN ${col} ${def}`); } catch(e) {}
 }
 
-// ─── Stripe billing migration ─────────────────────────────────────────────────
 for (const [col, def] of [
   ['stripe_customer_id','TEXT'], ['stripe_subscription_id','TEXT'],
   ['subscription_status',"TEXT DEFAULT 'inactive'"],
@@ -242,7 +240,6 @@ app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), asyn
     const status = ['active','trialing'].includes(sub.status) ? sub.status : sub.status === 'past_due' ? 'past_due' : 'inactive';
     db.prepare(`UPDATE shops SET subscription_status=?, stripe_subscription_id=?, subscription_current_period_end=? WHERE stripe_customer_id=?`)
       .run(status, sub.id, sub.current_period_end, sub.customer);
-    console.log(`[webhook] subscription ${event.type} for customer ${sub.customer} — status: ${status}`);
   }
 
   if (event.type === 'customer.subscription.deleted') {
@@ -290,7 +287,7 @@ function requireSubscription(req, res, next) {
   next();
 }
 
-// ─── Registration + Stripe Checkout ──────────────────────────────────────────
+// ─── Registration ─────────────────────────────────────────────────────────────
 app.get('/register', (req, res) => {
   const cancelled = req.query.cancelled === '1';
   res.send(layout('Register', `
@@ -347,19 +344,19 @@ app.get('/register/success', async (req, res) => {
 
   try {
     const checkoutSession = await stripe.checkout.sessions.retrieve(session_id, { expand: ['subscription'] });
-
     const allowed = ['paid', 'no_payment_required'];
     if (!allowed.includes(checkoutSession.payment_status)) return res.redirect('/register?cancelled=1');
 
     const sub = checkoutSession.subscription;
     const subStatus = sub && ['active','trialing'].includes(sub.status) ? sub.status : 'trialing';
+    const now = new Date().toISOString();
 
-    const shopResult = db.prepare(`INSERT INTO shops (name, stripe_customer_id, stripe_subscription_id, subscription_status, subscription_current_period_end, created_at) VALUES (?,?,?,?,?,datetime('now'))`)
-      .run(pending.shop_name, pending.stripe_customer_id, sub ? sub.id : null, subStatus, sub ? sub.current_period_end : null);
+    const shopResult = db.prepare(`INSERT INTO shops (name, stripe_customer_id, stripe_subscription_id, subscription_status, subscription_current_period_end, created_at) VALUES (?,?,?,?,?,?)`)
+      .run(pending.shop_name, pending.stripe_customer_id, sub ? sub.id : null, subStatus, sub ? sub.current_period_end : null, now);
     const shopId = shopResult.lastInsertRowid;
 
-    const userResult = db.prepare(`INSERT INTO users (shop_id, username, email, password_hash, role, full_name, created_at) VALUES (?,?,?,?,'shop_admin',?,datetime('now'))`)
-      .run(shopId, pending.username, pending.email, pending.password_hash, pending.owner_name);
+    const userResult = db.prepare(`INSERT INTO users (shop_id, username, email, password_hash, role, full_name, created_at) VALUES (?,?,?,?,'shop_admin',?,?)`)
+      .run(shopId, pending.username, pending.email, pending.password_hash, pending.owner_name, now);
 
     const user = db.prepare('SELECT * FROM users WHERE id=?').get(userResult.lastInsertRowid);
     const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(shopId);
@@ -650,7 +647,7 @@ app.post('/jobs/:jobId/edit', requireAuth, requireSubscription, (req, res) => {
 // ─── Share Link ───────────────────────────────────────────────────────────────
 app.post('/jobs/:jobId/share', requireAuth, (req, res) => {
   const token = crypto.randomUUID();
-  db.prepare('INSERT INTO share_tokens (job_id, token, created_at) VALUES (?,?,datetime("now"))').run(req.params.jobId, token);
+  db.prepare('INSERT INTO share_tokens (job_id, token, created_at) VALUES (?,?,?)').run(req.params.jobId, token, new Date().toISOString());
   res.redirect(`/jobs/${encodeURIComponent(req.params.jobId)}`);
 });
 app.post('/jobs/:jobId/share/revoke', requireAuth, (req, res) => {
@@ -707,7 +704,8 @@ app.post('/admin/users/create', requireAdmin, async (req, res) => {
   if (!allowed.includes(role)) return res.status(400).send('Invalid role');
   try {
     const hash = await bcrypt.hash(password, 10);
-    db.prepare('INSERT INTO users (shop_id,username,email,password_hash,role,full_name) VALUES (?,?,?,?,?,?)').run(req.session.user.shop_id, username, email||null, hash, role, full_name||'');
+    db.prepare('INSERT INTO users (shop_id,username,email,password_hash,role,full_name,created_at) VALUES (?,?,?,?,?,?,?)')
+      .run(req.session.user.shop_id, username, email||null, hash, role, full_name||'', new Date().toISOString());
   } catch(e) { return res.redirect('/admin/users?error=1'); }
   res.redirect('/admin/users');
 });
@@ -742,8 +740,10 @@ app.post('/platform/shops/create', requirePlatformAdmin, async (req, res) => {
   const { shop_name, admin_full_name, admin_username, admin_password } = req.body;
   if (!shop_name || !admin_username || !admin_password) return res.status(400).send('Missing required fields');
   const hash = await bcrypt.hash(admin_password, 10);
-  const shopId = db.prepare('INSERT INTO shops (name) VALUES (?)').run(shop_name).lastInsertRowid;
-  db.prepare('INSERT INTO users (shop_id,username,password_hash,role,full_name) VALUES (?,?,?,?,?)').run(shopId, admin_username, hash, 'shop_admin', admin_full_name||'');
+  const now = new Date().toISOString();
+  const shopId = db.prepare('INSERT INTO shops (name,created_at) VALUES (?,?)').run(shop_name, now).lastInsertRowid;
+  db.prepare('INSERT INTO users (shop_id,username,password_hash,role,full_name,created_at) VALUES (?,?,?,?,?,?)')
+    .run(shopId, admin_username, hash, 'shop_admin', admin_full_name||'', now);
   res.redirect('/platform/shops');
 });
 
@@ -799,7 +799,8 @@ async function seedPlatformAdmin() {
   const existing = db.prepare("SELECT id FROM users WHERE role='platform_admin'").get();
   if (!existing) {
     const hash = await bcrypt.hash('changeme123', 10);
-    db.prepare("INSERT INTO users (shop_id,username,password_hash,role,full_name) VALUES (NULL,'platform_admin',?,'platform_admin','Cueljuris LLC')").run(hash);
+    db.prepare("INSERT INTO users (shop_id,username,password_hash,role,full_name,created_at) VALUES (NULL,'platform_admin',?,'platform_admin','Cueljuris LLC',?)")
+      .run(hash, new Date().toISOString());
     console.log('Platform admin created. Username: platform_admin / Password: changeme123');
     console.log('CHANGE THIS PASSWORD IMMEDIATELY.');
   }
