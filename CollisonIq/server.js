@@ -216,12 +216,17 @@ function layout(title, content, activeNav='', user=null) {
     navLinks = `${nav('/','list','Jobs')}${nav('/new','new','New Job')}${nav('/reference','reference','ADAS Reference')}${nav('/admin','admin','Admin')}${nav('/admin/users','users','Users')}<a href="/logout">Logout</a>`;
   } else if (role === 'technician') {
     navLinks = `${nav('/','list','My Jobs')}${nav('/reference','reference','ADAS Reference')}<a href="/logout">Logout</a>`;
+  } else if (role === 'guest') {
+    // ── Guest: full nav access until restricted later ──
+    navLinks = `${nav('/','list','Jobs')}${nav('/new','new','New Job')}${nav('/reference','reference','ADAS Reference')}<a href="/logout">Logout</a>`;
   } else if (role) {
     navLinks = `${nav('/','list','Jobs')}${nav('/reference','reference','ADAS Reference')}<a href="/logout">Logout</a>`;
   }
   const userDisplay = user ? `<span class="nav-user">${escapeHtml(user.full_name||user.username)} <span class="nav-role">[${escapeHtml(user.role)}]</span></span>` : '';
   const adminBanner = role==='platform_admin' ? `<div style="background:#1B3A6B;color:#fff;text-align:center;padding:6px;font-size:13px">&#9881; PLATFORM ADMIN — CUELJURIS LLC</div>` : '';
-  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>${escapeHtml(title)} — CollisionIQ</title><link rel="stylesheet" href="/style.css"></head><body>${adminBanner}<header class="site-header"><div class="header-inner"><div class="brand"><a href="/" class="brand-logo">CollisionIQ</a><span class="brand-tagline">ADAS Calibration Documentation Platform</span></div><nav class="main-nav">${navLinks}${userDisplay}</nav></div></header><main class="main-content">${content}</main><footer class="site-footer"><p>&copy; 2026 Cueljuris LLC &mdash; CollisionIQ Platform</p></footer></body></html>`;
+  // ── Guest banner — visible reminder of guest mode ──
+  const guestBanner = role==='guest' ? `<div style="background:#92400e;color:#fef3c7;text-align:center;padding:6px;font-size:13px">&#128100; Guest Mode — <a href="/register" style="color:#fef3c7;font-weight:600;text-decoration:underline">Create a free account</a> to save your work</div>` : '';
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>${escapeHtml(title)} — CollisionIQ</title><link rel="stylesheet" href="/style.css"></head><body>${adminBanner}${guestBanner}<header class="site-header"><div class="header-inner"><div class="brand"><a href="/" class="brand-logo">CollisionIQ</a><span class="brand-tagline">ADAS Calibration Documentation Platform</span></div><nav class="main-nav">${navLinks}${userDisplay}</nav></div></header><main class="main-content">${content}</main><footer class="site-footer"><p>&copy; 2026 Cueljuris LLC &mdash; CollisionIQ Platform</p></footer></body></html>`;
 }
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
@@ -281,7 +286,8 @@ function requirePlatformAdmin(req, res, next) {
 }
 function requireSubscription(req, res, next) {
   if (!req.session.user) return res.redirect('/login');
-  if (req.session.user.role === 'platform_admin') return next();
+  // Platform admin and guest bypass subscription check
+  if (['platform_admin', 'guest'].includes(req.session.user.role)) return next();
   const shop = db.prepare('SELECT subscription_status FROM shops WHERE id=?').get(req.session.user.shop_id);
   if (!shop || !['active','trialing'].includes(shop.subscription_status)) return res.redirect('/billing/inactive');
   next();
@@ -434,7 +440,33 @@ app.get('/billing/inactive', (req, res) => {
 app.get('/login', (req, res) => {
   if (req.session.user) return res.redirect('/');
   const error = req.query.error || '';
-  res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Login — CollisionIQ</title><link rel="stylesheet" href="/style.css"><style>.login-wrap{display:flex;justify-content:center;align-items:center;min-height:80vh}.login-card{background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:2.5rem 2rem;width:100%;max-width:380px;box-shadow:0 2px 12px rgba(0,0,0,.07)}.login-logo{font-size:1.5rem;font-weight:700;color:#1a1a2e;margin-bottom:.25rem}.login-sub{font-size:.85rem;color:#666;margin-bottom:2rem}.login-btn{width:100%;padding:.65rem;background:#1a1a2e;color:#fff;border:none;border-radius:4px;font-size:1rem;font-weight:600;cursor:pointer;margin-top:.5rem}.login-btn:hover{background:#2d2d4e}</style></head><body><div class="login-wrap"><div class="login-card"><div class="login-logo">CollisionIQ</div><div class="login-sub">ADAS Calibration Documentation Platform</div>${error?'<div style="background:#fef2f2;border:1px solid #fca5a5;color:#b91c1c;padding:.6rem;border-radius:4px;margin-bottom:1rem;font-size:.875rem">Invalid username or password.</div>':''}<form method="POST" action="/login"><div style="margin-bottom:1rem"><label style="display:block;font-size:.85rem;font-weight:600;margin-bottom:.3rem">Username</label><input type="text" name="username" required autofocus style="width:100%;box-sizing:border-box;padding:.55rem .75rem;border:1px solid #ccc;border-radius:4px;font-size:.95rem"></div><div style="margin-bottom:1rem"><label style="display:block;font-size:.85rem;font-weight:600;margin-bottom:.3rem">Password</label><input type="password" name="password" required style="width:100%;box-sizing:border-box;padding:.55rem .75rem;border:1px solid #ccc;border-radius:4px;font-size:.95rem"></div><button type="submit" class="login-btn">Sign In</button></form><div style="text-align:center;margin-top:1.25rem;font-size:.85rem;color:#666">New shop? <a href="/register" style="color:#1B3A6B;font-weight:600">Create an account</a></div><div style="text-align:center;margin-top:.5rem;font-size:.75rem;color:#999">&copy; 2026 Cueljuris LLC</div></div></div></body></html>`);
+  res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Login — CollisionIQ</title><link rel="stylesheet" href="/style.css"><style>
+    .login-wrap{display:flex;justify-content:center;align-items:center;min-height:80vh}
+    .login-card{background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:2.5rem 2rem;width:100%;max-width:380px;box-shadow:0 2px 12px rgba(0,0,0,.07)}
+    .login-logo{font-size:1.5rem;font-weight:700;color:#1a1a2e;margin-bottom:.25rem}
+    .login-sub{font-size:.85rem;color:#666;margin-bottom:2rem}
+    .login-btn{width:100%;padding:.65rem;background:#1a1a2e;color:#fff;border:none;border-radius:4px;font-size:1rem;font-weight:600;cursor:pointer;margin-top:.5rem}
+    .login-btn:hover{background:#2d2d4e}
+    .guest-btn{display:block;width:100%;padding:.6rem;background:#fff;color:#92400e;border:2px solid #d97706;border-radius:4px;font-size:.95rem;font-weight:600;cursor:pointer;text-align:center;text-decoration:none;margin-top:.75rem;box-sizing:border-box}
+    .guest-btn:hover{background:#fffbeb}
+    .divider{display:flex;align-items:center;gap:.75rem;margin:1.25rem 0;color:#aaa;font-size:.8rem}
+    .divider::before,.divider::after{content:'';flex:1;height:1px;background:#e5e7eb}
+  </style></head><body><div class="login-wrap"><div class="login-card">
+    <div class="login-logo">CollisionIQ</div>
+    <div class="login-sub">ADAS Calibration Documentation Platform</div>
+    ${error?'<div style="background:#fef2f2;border:1px solid #fca5a5;color:#b91c1c;padding:.6rem;border-radius:4px;margin-bottom:1rem;font-size:.875rem">Invalid username or password.</div>':''}
+    <form method="POST" action="/login">
+      <div style="margin-bottom:1rem"><label style="display:block;font-size:.85rem;font-weight:600;margin-bottom:.3rem">Username</label><input type="text" name="username" required autofocus style="width:100%;box-sizing:border-box;padding:.55rem .75rem;border:1px solid #ccc;border-radius:4px;font-size:.95rem"></div>
+      <div style="margin-bottom:1rem"><label style="display:block;font-size:.85rem;font-weight:600;margin-bottom:.3rem">Password</label><input type="password" name="password" required style="width:100%;box-sizing:border-box;padding:.55rem .75rem;border:1px solid #ccc;border-radius:4px;font-size:.95rem"></div>
+      <button type="submit" class="login-btn">Sign In</button>
+    </form>
+    <div class="divider">or</div>
+    <form method="POST" action="/guest-login">
+      <button type="submit" class="guest-btn">&#128100; Continue as Guest</button>
+    </form>
+    <div style="text-align:center;margin-top:1.25rem;font-size:.85rem;color:#666">New shop? <a href="/register" style="color:#1B3A6B;font-weight:600">Create an account</a></div>
+    <div style="text-align:center;margin-top:.5rem;font-size:.75rem;color:#999">&copy; 2026 Cueljuris LLC</div>
+  </div></div></body></html>`);
 });
 
 app.post('/login', async (req, res) => {
@@ -444,6 +476,20 @@ app.post('/login', async (req, res) => {
   const match = await bcrypt.compare(password, user.password_hash);
   if (!match) return res.redirect('/login?error=1');
   req.session.user = { id: user.id, username: user.username, full_name: user.full_name, role: user.role, shop_id: user.shop_id };
+  res.redirect('/');
+});
+
+// ─── Guest Login ──────────────────────────────────────────────────────────────
+app.post('/guest-login', (req, res) => {
+  const guestUser = db.prepare("SELECT * FROM users WHERE username='guest' AND active=1").get();
+  if (!guestUser) return res.redirect('/login?error=1');
+  req.session.user = {
+    id: guestUser.id,
+    username: guestUser.username,
+    full_name: 'Guest',
+    role: 'guest',
+    shop_id: guestUser.shop_id,
+  };
   res.redirect('/');
 });
 
@@ -806,7 +852,30 @@ async function seedPlatformAdmin() {
   }
 }
 
+// ─── Seed Guest Account ───────────────────────────────────────────────────────
+async function seedGuestAccount() {
+  const existing = db.prepare("SELECT id FROM users WHERE username='guest'").get();
+  if (!existing) {
+    const guestPassword = process.env.GUEST_PASSWORD || 'guest2026';
+    const hash = await bcrypt.hash(guestPassword, 10);
+
+    // Create a guest shop if it doesn't exist
+    let guestShop = db.prepare("SELECT id FROM shops WHERE name='Guest Shop'").get();
+    if (!guestShop) {
+      const result = db.prepare("INSERT INTO shops (name, subscription_status, created_at) VALUES ('Guest Shop', 'active', ?)")
+        .run(new Date().toISOString());
+      guestShop = { id: result.lastInsertRowid };
+    }
+
+    db.prepare("INSERT INTO users (shop_id,username,password_hash,role,full_name,active,created_at) VALUES (?,?,?,'guest','Guest User',1,?)")
+      .run(guestShop.id, 'guest', hash, new Date().toISOString());
+
+    console.log(`Guest account created. Username: guest / Password: ${guestPassword}`);
+    console.log('Set GUEST_PASSWORD env var to change the guest password.');
+  }
+}
+
 // ─── Start ────────────────────────────────────────────────────────────────────
-seedPlatformAdmin().then(() => {
+Promise.all([seedPlatformAdmin(), seedGuestAccount()]).then(() => {
   app.listen(PORT, () => console.log(`CollisionIQ running on http://localhost:${PORT}`));
 });
