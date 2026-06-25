@@ -12,9 +12,14 @@ const multer     = require('multer');
 const SQLiteStore = require('connect-sqlite3')(session);
 const { DatabaseSync } = require('node:sqlite');
 const Stripe     = require('stripe');
+const helmet     = require('helmet');
+const rateLimit  = require('express-rate-limit');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
+
+// ─── Cost factor for password hashing (consistent everywhere) ──────────────────
+const BCRYPT_ROUNDS = 12;
 
 // ─── Stripe ───────────────────────────────────────────────────────────────────
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', { apiVersion: '2024-04-10' });
@@ -217,19 +222,33 @@ function layout(title, content, activeNav='', user=null) {
   } else if (role === 'technician') {
     navLinks = `${nav('/','list','My Jobs')}${nav('/reference','reference','ADAS Reference')}<a href="/logout">Logout</a>`;
   } else if (role === 'guest') {
-    // ── Guest: full nav access until restricted later ──
     navLinks = `${nav('/','list','Jobs')}${nav('/new','new','New Job')}${nav('/reference','reference','ADAS Reference')}<a href="/logout">Logout</a>`;
   } else if (role) {
     navLinks = `${nav('/','list','Jobs')}${nav('/reference','reference','ADAS Reference')}<a href="/logout">Logout</a>`;
   }
   const userDisplay = user ? `<span class="nav-user">${escapeHtml(user.full_name||user.username)} <span class="nav-role">[${escapeHtml(user.role)}]</span></span>` : '';
   const adminBanner = role==='platform_admin' ? `<div style="background:#1B3A6B;color:#fff;text-align:center;padding:6px;font-size:13px">&#9881; PLATFORM ADMIN — CUELJURIS LLC</div>` : '';
-  // ── Guest banner — visible reminder of guest mode ──
   const guestBanner = role==='guest' ? `<div style="background:#92400e;color:#fef3c7;text-align:center;padding:6px;font-size:13px">&#128100; Guest Mode — <a href="/register" style="color:#fef3c7;font-weight:600;text-decoration:underline">Create a free account</a> to save your work</div>` : '';
   return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>${escapeHtml(title)} — CollisionIQ</title><link rel="stylesheet" href="/style.css"></head><body>${adminBanner}${guestBanner}<header class="site-header"><div class="header-inner"><div class="brand"><a href="/" class="brand-logo">CollisionIQ</a><span class="brand-tagline">ADAS Calibration Documentation Platform</span></div><nav class="main-nav">${navLinks}${userDisplay}</nav></div></header><main class="main-content">${content}</main><footer class="site-footer"><p>&copy; 2026 Cueljuris LLC &mdash; CollisionIQ Platform</p></footer></body></html>`;
 }
 
-// ─── Middleware ───────────────────────────────────────────────────────────────
+// ─── Security headers + proxy trust ────────────────────────────────────────────
+// trust proxy is required so secure cookies work behind Railway's TLS terminator.
+app.set('trust proxy', 1);
+// CSP is disabled because the UI relies on inline event handlers (onclick / onchange).
+// Everything else helmet provides (HSTS, X-Frame-Options, nosniff, etc.) still applies.
+app.use(helmet({ contentSecurityPolicy: false }));
+
+// Rate limiter for auth endpoints (brute-force / credential-stuffing protection).
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: 'Too many attempts. Please try again in 15 minutes.',
+});
+
+// ─── Stripe webhook (must be BEFORE the JSON body parser) ──────────────────────
 app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
@@ -258,12 +277,23 @@ app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), asyn
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+
+// ─── Session ───────────────────────────────────────────────────────────────────
+// Refuse to boot in production without a real secret. No public fallback string.
+if (process.env.NODE_ENV === 'production' && !process.env.SESSION_SECRET) {
+  throw new Error('SESSION_SECRET must be set in production');
+}
 app.use(session({
   store: new SQLiteStore({ db: 'sessions.db', dir: './' }),
-  secret: process.env.SESSION_SECRET || 'collisioniq-secret-change-in-prod',
+  secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
   resave: false,
   saveUninitialized: false,
-  cookie: { maxAge: 8 * 60 * 60 * 1000 }
+  cookie: {
+    maxAge: 8 * 60 * 60 * 1000,
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+  },
 }));
 
 const uploadsDir = path.join(__dirname, 'uploads');
@@ -293,6 +323,16 @@ function requireSubscription(req, res, next) {
   next();
 }
 
+// Returns the job ONLY if the current user is allowed to act on it, else null.
+// Platform admins may act on any job; everyone else is scoped to their own shop.
+function ownedJob(req) {
+  const u = req.session.user;
+  if (u.role === 'platform_admin') {
+    return db.prepare('SELECT * FROM jobs WHERE jobId=?').get(req.params.jobId);
+  }
+  return db.prepare('SELECT * FROM jobs WHERE jobId=? AND shop_id=?').get(req.params.jobId, u.shop_id);
+}
+
 // ─── Registration ─────────────────────────────────────────────────────────────
 app.get('/register', (req, res) => {
   const cancelled = req.query.cancelled === '1';
@@ -314,7 +354,7 @@ app.get('/register', (req, res) => {
     </div>`));
 });
 
-app.post('/register', async (req, res) => {
+app.post('/register', authLimiter, async (req, res) => {
   const { shop_name, owner_name, email, username, password, password_confirm } = req.body;
   if (!shop_name || !owner_name || !email || !username || !password) return res.redirect('/register?error=1');
   if (password !== password_confirm) return res.redirect('/register?error=1');
@@ -325,7 +365,7 @@ app.post('/register', async (req, res) => {
 
   try {
     const customer = await stripe.customers.create({ email, name: shop_name, metadata: { owner_name } });
-    const password_hash = await bcrypt.hash(password, 12);
+    const password_hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
     req.session.pending_registration = { shop_name, owner_name, email, username, password_hash, stripe_customer_id: customer.id };
 
     const checkoutSession = await stripe.checkout.sessions.create({
@@ -469,18 +509,19 @@ app.get('/login', (req, res) => {
   </div></div></body></html>`);
 });
 
-app.post('/login', async (req, res) => {
+app.post('/login', authLimiter, async (req, res) => {
   const { username, password } = req.body;
   const user = db.prepare('SELECT * FROM users WHERE username=? AND active=1').get(username);
-  if (!user) return res.redirect('/login?error=1');
-  const match = await bcrypt.compare(password, user.password_hash);
-  if (!match) return res.redirect('/login?error=1');
+  // Always run a compare so response timing doesn't reveal whether the username exists.
+  const hash = user ? user.password_hash : '$2b$12$0000000000000000000000000000000000000000000000000000a';
+  const match = await bcrypt.compare(password, hash);
+  if (!user || !match) return res.redirect('/login?error=1');
   req.session.user = { id: user.id, username: user.username, full_name: user.full_name, role: user.role, shop_id: user.shop_id };
   res.redirect('/');
 });
 
 // ─── Guest Login ──────────────────────────────────────────────────────────────
-app.post('/guest-login', (req, res) => {
+app.post('/guest-login', authLimiter, (req, res) => {
   const guestUser = db.prepare("SELECT * FROM users WHERE username='guest' AND active=1").get();
   if (!guestUser) return res.redirect('/login?error=1');
   req.session.user = {
@@ -572,7 +613,7 @@ app.post('/jobs', requireAuth, requireSubscription, (req, res) => {
       repairs.join(', '), adas.adasSystems, adas.rationale, adas.liabilityWarning, adas.makeSpecificNotes,
       adas.preScanRequired, adas.postScanRequired, adas.approvedScanTool,
       shareToken, `/share/${shareToken}`, now, now, now,
-      req.session.user.shop_id || 1, req.session.user.id);
+      req.session.user.shop_id || null, req.session.user.id);
 
   res.redirect(`/jobs/${jobId}`);
 });
@@ -647,7 +688,7 @@ app.get('/jobs/:jobId', requireAuth, requireSubscription, (req, res) => {
 // ─── Edit Job ─────────────────────────────────────────────────────────────────
 app.get('/jobs/:jobId/edit', requireAuth, requireSubscription, (req, res) => {
   const user = req.session.user;
-  const job = db.prepare('SELECT * FROM jobs WHERE jobId=?').get(req.params.jobId);
+  const job = ownedJob(req);
   if (!job) return res.status(404).send('Not found');
 
   const repairOptions = ['Windshield','Front Camera Area','Front Bumper','Rear Bumper','Radar','Structural Body Repair','Airbag / SRS Deployment','Wheel Alignment','Suspension','Door / Mirror Repair','EV / Hybrid Vehicle','Other'];
@@ -677,6 +718,8 @@ app.get('/jobs/:jobId/edit', requireAuth, requireSubscription, (req, res) => {
 });
 
 app.post('/jobs/:jobId/edit', requireAuth, requireSubscription, (req, res) => {
+  const job = ownedJob(req);
+  if (!job) return res.status(404).send('Not found');
   const { ro, vin, year, make, model, trim, technicianName } = req.body;
   let repairs = req.body.repairs || [];
   if (!Array.isArray(repairs)) repairs = [repairs];
@@ -692,11 +735,15 @@ app.post('/jobs/:jobId/edit', requireAuth, requireSubscription, (req, res) => {
 
 // ─── Share Link ───────────────────────────────────────────────────────────────
 app.post('/jobs/:jobId/share', requireAuth, (req, res) => {
+  const job = ownedJob(req);
+  if (!job) return res.status(404).send('Not found');
   const token = crypto.randomUUID();
   db.prepare('INSERT INTO share_tokens (job_id, token, created_at) VALUES (?,?,?)').run(req.params.jobId, token, new Date().toISOString());
   res.redirect(`/jobs/${encodeURIComponent(req.params.jobId)}`);
 });
 app.post('/jobs/:jobId/share/revoke', requireAuth, (req, res) => {
+  const job = ownedJob(req);
+  if (!job) return res.status(404).send('Not found');
   db.prepare('UPDATE share_tokens SET revoked=1 WHERE job_id=? AND revoked=0').run(req.params.jobId);
   res.redirect(`/jobs/${encodeURIComponent(req.params.jobId)}`);
 });
@@ -726,6 +773,8 @@ app.get('/admin', requireAdmin, (req, res) => {
 app.post('/jobs/:jobId/status', requireAdmin, (req, res) => {
   const valid = ['Created','In Progress','Calibration Complete','Closed'];
   if (!valid.includes(req.body.status)) return res.status(400).send('Invalid status');
+  const job = ownedJob(req);
+  if (!job) return res.status(404).send('Not found');
   db.prepare('UPDATE jobs SET status=?, updatedAt=?, last_changed=? WHERE jobId=?').run(req.body.status, new Date().toISOString(), new Date().toISOString(), req.params.jobId);
   res.redirect('/admin');
 });
@@ -748,8 +797,9 @@ app.post('/admin/users/create', requireAdmin, async (req, res) => {
   const { full_name, username, email, password, role } = req.body;
   const allowed = ['shop_admin','qc_manager','technician','service_writer'];
   if (!allowed.includes(role)) return res.status(400).send('Invalid role');
+  if (!password || password.length < 8) return res.redirect('/admin/users?error=1');
   try {
-    const hash = await bcrypt.hash(password, 10);
+    const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
     db.prepare('INSERT INTO users (shop_id,username,email,password_hash,role,full_name,created_at) VALUES (?,?,?,?,?,?,?)')
       .run(req.session.user.shop_id, username, email||null, hash, role, full_name||'', new Date().toISOString());
   } catch(e) { return res.redirect('/admin/users?error=1'); }
@@ -759,11 +809,21 @@ app.post('/admin/users/create', requireAdmin, async (req, res) => {
 app.post('/admin/users/:id/role', requireAdmin, (req, res) => {
   const allowed = ['shop_admin','qc_manager','technician','service_writer'];
   if (!allowed.includes(req.body.role)) return res.status(400).send('Invalid role');
+  const target = db.prepare('SELECT shop_id, role FROM users WHERE id=?').get(req.params.id);
+  const me = req.session.user;
+  if (!target) return res.status(404).send('Not found');
+  if (target.role === 'platform_admin') return res.status(403).send('Access denied.');
+  if (me.role !== 'platform_admin' && target.shop_id !== me.shop_id) return res.status(403).send('Access denied.');
   db.prepare('UPDATE users SET role=? WHERE id=?').run(req.body.role, req.params.id);
   res.redirect('/admin/users');
 });
 
 app.post('/admin/users/:id/deactivate', requireAdmin, (req, res) => {
+  const target = db.prepare('SELECT shop_id, role FROM users WHERE id=?').get(req.params.id);
+  const me = req.session.user;
+  if (!target) return res.status(404).send('Not found');
+  if (target.role === 'platform_admin') return res.status(403).send('Access denied.');
+  if (me.role !== 'platform_admin' && target.shop_id !== me.shop_id) return res.status(403).send('Access denied.');
   db.prepare('UPDATE users SET active=0 WHERE id=?').run(req.params.id);
   res.redirect('/admin/users');
 });
@@ -785,7 +845,8 @@ app.get('/platform/shops', requirePlatformAdmin, (req, res) => {
 app.post('/platform/shops/create', requirePlatformAdmin, async (req, res) => {
   const { shop_name, admin_full_name, admin_username, admin_password } = req.body;
   if (!shop_name || !admin_username || !admin_password) return res.status(400).send('Missing required fields');
-  const hash = await bcrypt.hash(admin_password, 10);
+  if (admin_password.length < 8) return res.status(400).send('Password must be at least 8 characters');
+  const hash = await bcrypt.hash(admin_password, BCRYPT_ROUNDS);
   const now = new Date().toISOString();
   const shopId = db.prepare('INSERT INTO shops (name,created_at) VALUES (?,?)').run(shop_name, now).lastInsertRowid;
   db.prepare('INSERT INTO users (shop_id,username,password_hash,role,full_name,created_at) VALUES (?,?,?,?,?,?)')
@@ -843,36 +904,50 @@ app.get('/reference/lookup', requireAuth, (req, res) => {
 // ─── Seed Platform Admin ──────────────────────────────────────────────────────
 async function seedPlatformAdmin() {
   const existing = db.prepare("SELECT id FROM users WHERE role='platform_admin'").get();
-  if (!existing) {
-    const hash = await bcrypt.hash('changeme123', 10);
-    db.prepare("INSERT INTO users (shop_id,username,password_hash,role,full_name,created_at) VALUES (NULL,'platform_admin',?,'platform_admin','Cueljuris LLC',?)")
-      .run(hash, new Date().toISOString());
-    console.log('Platform admin created. Username: platform_admin / Password: changeme123');
-    console.log('CHANGE THIS PASSWORD IMMEDIATELY.');
+  if (existing) return;
+
+  let pw = process.env.PLATFORM_ADMIN_PASSWORD;
+  let generated = false;
+  if (!pw) {
+    pw = crypto.randomBytes(12).toString('base64url');
+    generated = true;
+  }
+  const hash = await bcrypt.hash(pw, BCRYPT_ROUNDS);
+  db.prepare("INSERT INTO users (shop_id,username,password_hash,role,full_name,created_at) VALUES (NULL,'platform_admin',?,'platform_admin','Cueljuris LLC',?)")
+    .run(hash, new Date().toISOString());
+
+  if (generated) {
+    console.log('───────────────────────────────────────────────');
+    console.log('Platform admin created (no PLATFORM_ADMIN_PASSWORD set).');
+    console.log(`  Username: platform_admin`);
+    console.log(`  One-time password: ${pw}`);
+    console.log('  Set PLATFORM_ADMIN_PASSWORD and change this after first login.');
+    console.log('───────────────────────────────────────────────');
+  } else {
+    console.log('Platform admin created from PLATFORM_ADMIN_PASSWORD env var.');
   }
 }
 
 // ─── Seed Guest Account ───────────────────────────────────────────────────────
 async function seedGuestAccount() {
   const existing = db.prepare("SELECT id FROM users WHERE username='guest'").get();
-  if (!existing) {
-    const guestPassword = process.env.GUEST_PASSWORD || 'guest2026';
-    const hash = await bcrypt.hash(guestPassword, 10);
+  if (existing) return;
 
-    // Create a guest shop if it doesn't exist
-    let guestShop = db.prepare("SELECT id FROM shops WHERE name='Guest Shop'").get();
-    if (!guestShop) {
-      const result = db.prepare("INSERT INTO shops (name, subscription_status, created_at) VALUES ('Guest Shop', 'active', ?)")
-        .run(new Date().toISOString());
-      guestShop = { id: result.lastInsertRowid };
-    }
+  const guestPassword = process.env.GUEST_PASSWORD || crypto.randomBytes(12).toString('base64url');
+  const hash = await bcrypt.hash(guestPassword, BCRYPT_ROUNDS);
 
-    db.prepare("INSERT INTO users (shop_id,username,password_hash,role,full_name,active,created_at) VALUES (?,?,?,'guest','Guest User',1,?)")
-      .run(guestShop.id, 'guest', hash, new Date().toISOString());
-
-    console.log(`Guest account created. Username: guest / Password: ${guestPassword}`);
-    console.log('Set GUEST_PASSWORD env var to change the guest password.');
+  let guestShop = db.prepare("SELECT id FROM shops WHERE name='Guest Shop'").get();
+  if (!guestShop) {
+    const result = db.prepare("INSERT INTO shops (name, subscription_status, created_at) VALUES ('Guest Shop', 'active', ?)")
+      .run(new Date().toISOString());
+    guestShop = { id: result.lastInsertRowid };
   }
+
+  db.prepare("INSERT INTO users (shop_id,username,password_hash,role,full_name,active,created_at) VALUES (?,?,?,'guest','Guest User',1,?)")
+    .run(guestShop.id, 'guest', hash, new Date().toISOString());
+
+  console.log('Guest account created. The "Continue as Guest" button works without a password.');
+  console.log('Set GUEST_PASSWORD env var if you want form-based guest login.');
 }
 
 // ─── Start ────────────────────────────────────────────────────────────────────
