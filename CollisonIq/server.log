@@ -1,0 +1,5 @@
+[dotenv@17.3.1] injecting env (7) from .env -- tip: ⚙️  load multiple .env files with { path: ['.env.local', '.env'] }
+[migration 002] Stripe billing migration complete.
+(node:21816) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+CollisionIQ running on http://localhost:3000
