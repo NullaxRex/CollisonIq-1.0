@@ -13,7 +13,9 @@ const { DatabaseSync } = require('node:sqlite');
 const Stripe     = require('stripe');
 const helmet     = require('helmet');
 const rateLimit  = require('express-rate-limit');
-const { csrfField, verifyCsrf } = require('./utils/csrf');
+const { csrfField, verifyCsrf, csrfTokenValid } = require('./utils/csrf');
+const { generatePhotoLabels, ZONE_DISPLAY } = require('./utils/photoLabels');
+const { calculatePhotoStatus, updateJobPhotoStatus } = require('./utils/photoStatus');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -72,6 +74,23 @@ db.exec(`
     token TEXT NOT NULL UNIQUE,
     created_at TEXT DEFAULT (datetime('now')),
     revoked INTEGER DEFAULT 0
+  );
+  CREATE TABLE IF NOT EXISTS job_photos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    layer INTEGER NOT NULL,
+    zone TEXT,
+    key TEXT NOT NULL,
+    display TEXT NOT NULL,
+    is_recommended INTEGER DEFAULT 0,
+    is_adas INTEGER DEFAULT 0,
+    file_path TEXT,
+    original_name TEXT,
+    mime_type TEXT,
+    size_bytes INTEGER,
+    uploaded_by INTEGER,
+    uploaded_at TEXT,
+    FOREIGN KEY (job_id) REFERENCES jobs(jobId)
   );
 `);
 
@@ -350,9 +369,29 @@ app.use(session({
 // and after the body parsers above so req.body._csrf is populated.
 app.use(verifyCsrf);
 
-const uploadsDir = path.join(__dirname, 'uploads');
+// UPLOADS_DIR should point at a Railway Volume mount in production (e.g. /data/uploads) —
+// the plain container filesystem is wiped on every redeploy, which would silently lose
+// every job photo. Defaults to a local folder for development only.
+const uploadsDir = process.env.UPLOADS_DIR || path.join(__dirname, 'uploads');
 fs.mkdirSync(uploadsDir, { recursive: true });
-const upload = multer({ dest: uploadsDir, limits: { fileSize: 10 * 1024 * 1024 } });
+
+const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif']);
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, uploadsDir),
+    filename: (req, file, cb) => {
+      const ext = path.extname(file.originalname || '').toLowerCase().slice(0, 10);
+      cb(null, `${crypto.randomUUID()}${ext}`);
+    },
+  }),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (!ALLOWED_IMAGE_TYPES.has(file.mimetype)) {
+      return cb(new Error('Only JPEG, PNG, WEBP, or HEIC/HEIF images are allowed.'));
+    }
+    cb(null, true);
+  },
+});
 
 // ─── Auth Middleware ──────────────────────────────────────────────────────────
 function requireAuth(req, res, next) {
@@ -614,6 +653,7 @@ app.get('/', requireAuth, requireSubscription, (req, res) => {
     <td>${escapeHtml(j.ro)||'—'}</td>
     <td>${[j.year,j.make,j.model].filter(Boolean).map(escapeHtml).join(' ')||'—'}</td>
     <td><span class="badge badge-${statusClass(j.status)}">${escapeHtml(j.status)}</span></td>
+    <td>${photoStatusBadge(j.photo_status || 'red')}</td>
     <td>${formatDate(j.createdAt)}</td>
     <td><a href="/jobs/${encodeURIComponent(j.jobId)}" class="btn btn-sm">View</a></td>
   </tr>`).join('');
@@ -622,7 +662,7 @@ app.get('/', requireAuth, requireSubscription, (req, res) => {
     ${flash?`<div style="background:${flash.type==='success'?'#D6F0D6':'#FFD6D6'};color:${flash.type==='success'?'#1A6B1A':'#8B0000'};padding:.65rem 1rem;border-radius:6px;margin-bottom:1rem">${escapeHtml(flash.msg)}</div>`:''}
     <div class="page-header"><h1>Jobs <span class="count-badge">${jobs.length}</span></h1><a href="/new" class="btn btn-primary">+ New Job</a></div>
     <div class="search-bar"><form method="GET" action="/"><input type="text" name="search" placeholder="Search by RO#, VIN, or Technician…" value="${escapeHtml(search)}"><button type="submit" class="btn">Search</button>${search?'<a href="/" class="btn btn-ghost">Clear</a>':''}</form></div>
-    <div class="table-wrap"><table class="data-table"><thead><tr><th>Job ID</th><th>RO #</th><th>Vehicle</th><th>Status</th><th>Date</th><th></th></tr></thead><tbody>${rows||'<tr><td colspan="6" class="empty">No jobs found.</td></tr>'}</tbody></table></div>`;
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Job ID</th><th>RO #</th><th>Vehicle</th><th>Status</th><th>Photos</th><th>Date</th><th></th></tr></thead><tbody>${rows||'<tr><td colspan="7" class="empty">No jobs found.</td></tr>'}</tbody></table></div>`;
 
   res.send(layout('Jobs', content, 'list', user));
 });
@@ -631,6 +671,9 @@ app.get('/', requireAuth, requireSubscription, (req, res) => {
 app.get('/new', requireAuth, requireSubscription, (req, res) => {
   const repairOptions = ['Windshield','Front Camera Area','Front Bumper','Rear Bumper','Radar','Structural Body Repair','Airbag / SRS Deployment','Wheel Alignment','Suspension','Door / Mirror Repair','EV / Hybrid Vehicle','Other'];
   const checkboxes = repairOptions.map(r => `<label class="checkbox-label"><input type="checkbox" name="repairs" value="${escapeHtml(r)}"><span>${escapeHtml(r)}</span></label>`).join('');
+  const zoneCheckboxes = Object.entries(ZONE_DISPLAY).map(([key, label]) =>
+    `<label class="checkbox-label"><input type="checkbox" name="impact_zones" value="${escapeHtml(key)}"><span>${escapeHtml(label)}</span></label>`
+  ).join('');
   const content = `
     <div class="page-header"><h1>New Job</h1></div>
     <form method="POST" action="/jobs" class="job-form">${csrfField(req)}
@@ -646,6 +689,8 @@ app.get('/new', requireAuth, requireSubscription, (req, res) => {
       <div class="form-section"><h2 class="section-heading">Repairs Performed</h2><div class="checkbox-grid">${checkboxes}</div>
         <div class="form-group" style="margin-top:1rem"><label>Other Repairs</label><input type="text" name="otherRepairs" placeholder="Describe additional repairs…"></div>
       </div>
+      <div class="form-section"><h2 class="section-heading">Impact Zones</h2><p style="color:#666;font-size:.85rem;margin-bottom:.75rem">Select every area with visible damage — this determines which photos are required for documentation.</p><div class="checkbox-grid">${zoneCheckboxes}</div>
+      </div>
       <div class="form-actions"><a href="/" class="btn btn-ghost">Cancel</a><button type="submit" class="btn btn-primary btn-lg">Submit &amp; Generate ADAS Report</button></div>
     </form>`;
   res.send(layout('New Job', content, 'new', req.session.user));
@@ -656,18 +701,31 @@ app.post('/jobs', requireAuth, requireSubscription, (req, res) => {
   let repairs = req.body.repairs || [];
   if (!Array.isArray(repairs)) repairs = [repairs];
   if (otherRepairs && otherRepairs.trim()) repairs.push(otherRepairs.trim());
+  let impactZones = req.body.impact_zones || [];
+  if (!Array.isArray(impactZones)) impactZones = [impactZones];
+  impactZones = impactZones.filter(z => Object.prototype.hasOwnProperty.call(ZONE_DISPLAY, z));
 
   const adas = runADASEngine(make, model, year, repairs);
+  const adasRequired = adas.adasSystems && !adas.adasSystems.startsWith('No ADAS calibration flagged');
   const jobId = generateJobId();
   const shareToken = crypto.randomBytes(16).toString('hex');
   const now = new Date().toISOString();
 
-  db.prepare(`INSERT INTO jobs (jobId,ro,vin,year,make,model,trim,technicianName,repairsPerformed,adasSystems,rationale,liabilityWarning,makeSpecificNotes,preScanRequired,postScanRequired,approvedScanTool,status,shareToken,shareUrl,createdAt,updatedAt,last_changed,shop_id,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Created',?,?,?,?,?,?,?)`)
+  db.prepare(`INSERT INTO jobs (jobId,ro,vin,year,make,model,trim,technicianName,repairsPerformed,adasSystems,rationale,liabilityWarning,makeSpecificNotes,preScanRequired,postScanRequired,approvedScanTool,status,shareToken,shareUrl,createdAt,updatedAt,last_changed,shop_id,created_by,impact_areas) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Created',?,?,?,?,?,?,?,?)`)
     .run(jobId, ro||'', (vin||'').toUpperCase(), year||'', make||'', model||'', trim||'', technicianName||'',
       repairs.join(', '), adas.adasSystems, adas.rationale, adas.liabilityWarning, adas.makeSpecificNotes,
       adas.preScanRequired, adas.postScanRequired, adas.approvedScanTool,
       shareToken, `/share/${shareToken}`, now, now, now,
-      req.session.user.shop_id || null, req.session.user.id);
+      req.session.user.shop_id || null, req.session.user.id, JSON.stringify(impactZones));
+
+  // Generate the required photo-documentation slots for this job and persist
+  // them (unfilled) so the photo checklist knows what's outstanding.
+  const slots = generatePhotoLabels({ impact_areas: impactZones, adas_required: adasRequired });
+  const insertSlot = db.prepare(`INSERT INTO job_photos (job_id, layer, zone, key, display, is_recommended, is_adas) VALUES (?,?,?,?,?,?,?)`);
+  for (const slot of slots) {
+    insertSlot.run(jobId, slot.layer, slot.zone || null, slot.key, slot.display, slot.is_recommended ? 1 : 0, slot.is_adas ? 1 : 0);
+  }
+  updateJobPhotoStatus(db, jobId);
 
   res.redirect(`/jobs/${jobId}`);
 });
@@ -698,9 +756,11 @@ app.get('/jobs/:jobId', requireAuth, requireSubscription, (req, res) => {
           <div><span class="meta-label">Job ID</span> ${escapeHtml(job.jobId)}</div>
           <div><span class="meta-label">Date</span> ${formatDate(job.createdAt)}</div>
           <div><span class="meta-label">Status</span> <span class="badge badge-${statusClass(job.status)}">${escapeHtml(job.status)}</span></div>
+          <div><span class="meta-label">Photos</span> ${photoStatusBadge(job.photo_status || 'red')}</div>
         </div>
         <div class="doc-actions no-print">
           <button onclick="window.print()" class="btn btn-white">&#128438; Print / Save PDF</button>
+          <a href="/jobs/${encodeURIComponent(job.jobId)}/photos" class="btn btn-white">&#128247; Photos</a>
           ${['platform_admin','shop_admin','service_writer'].includes(user.role) ? `<a href="/jobs/${encodeURIComponent(job.jobId)}/edit" class="btn btn-white">&#9998; Edit</a>` : ''}
           <a href="/" class="btn btn-ghost-white">Back</a>
         </div>
@@ -785,6 +845,102 @@ app.post('/jobs/:jobId/edit', requireAuth, requireSubscription, (req, res) => {
       adas.preScanRequired, adas.postScanRequired, adas.approvedScanTool, now, now, req.params.jobId);
   setFlash(req, 'success', 'Job updated.');
   res.redirect(`/jobs/${encodeURIComponent(req.params.jobId)}`);
+});
+
+// ─── Photo Documentation ────────────────────────────────────────────────────
+function photoStatusBadge(status) {
+  const map = { green: 'green', yellow: 'orange', red: 'red' };
+  const label = { green: 'Complete', yellow: 'Layer 1 Complete', red: 'Incomplete' };
+  return `<span class="badge badge-${map[status] || 'gray'}">${label[status] || 'Not Started'}</span>`;
+}
+
+app.get('/jobs/:jobId/photos', requireAuth, requireSubscription, (req, res) => {
+  const job = ownedJob(req);
+  if (!job) return res.status(404).send('Not found');
+
+  const slots = db.prepare('SELECT * FROM job_photos WHERE job_id=? ORDER BY layer, zone, id').all(job.jobId);
+  const status = calculatePhotoStatus(slots);
+
+  const groups = {};
+  for (const s of slots) {
+    const groupKey = `Layer ${s.layer}${s.zone ? ' — ' + (ZONE_DISPLAY[s.zone] || s.zone) : ''}`;
+    (groups[groupKey] = groups[groupKey] || []).push(s);
+  }
+
+  const groupsHtml = Object.entries(groups).map(([groupName, items]) => `
+    <div class="doc-section" style="margin-bottom:1.5rem">
+      <h2 class="doc-section-title">${escapeHtml(groupName)}</h2>
+      <div class="checkbox-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:1rem">
+        ${items.map(s => `
+          <div class="card" style="padding:.75rem">
+            <div style="font-size:.85rem;font-weight:600;margin-bottom:.5rem">${escapeHtml(s.display)}${s.is_recommended ? ' <span style="color:#999;font-weight:400">(recommended)</span>' : ''}</div>
+            ${s.file_path
+              ? `<img src="/jobs/${encodeURIComponent(job.jobId)}/photos/${s.id}/file" style="width:100%;border-radius:4px;margin-bottom:.5rem;display:block" alt="${escapeHtml(s.display)}">
+                 <form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/photos/${s.id}" enctype="multipart/form-data">${csrfField(req)}
+                   <input type="file" name="photo" accept="image/*" required style="font-size:.75rem;margin-bottom:.4rem;width:100%">
+                   <button type="submit" class="btn btn-sm" style="width:100%">Replace</button>
+                 </form>`
+              : `<form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/photos/${s.id}" enctype="multipart/form-data">${csrfField(req)}
+                   <input type="file" name="photo" accept="image/*" required style="font-size:.75rem;margin-bottom:.4rem;width:100%">
+                   <button type="submit" class="btn btn-primary btn-sm" style="width:100%">Upload</button>
+                 </form>`}
+          </div>`).join('')}
+      </div>
+    </div>`).join('');
+
+  const content = `
+    <div class="page-header"><h1>Photo Documentation — <span style="font-family:monospace">${escapeHtml(job.jobId)}</span> ${photoStatusBadge(status)}</h1><a href="/jobs/${encodeURIComponent(job.jobId)}" class="btn">Back to Job</a></div>
+    ${slots.length === 0 ? '<p style="color:#666">No photo requirements were generated for this job (no impact zones were selected at creation).</p>' : groupsHtml}`;
+  res.send(layout(`Photos — ${job.jobId}`, content, '', req.session.user));
+});
+
+app.post('/jobs/:jobId/photos/:photoId', requireAuth, requireSubscription, (req, res, next) => {
+  upload.single('photo')(req, res, (err) => {
+    if (err) return res.status(400).send(escapeHtml(err.message || 'Upload failed.'));
+    next();
+  });
+}, (req, res) => {
+  if (!csrfTokenValid(req)) {
+    if (req.file) fs.unlink(req.file.path, () => {});
+    return res.status(403).send('Invalid or expired form token. Please go back, refresh the page, and try again.');
+  }
+
+  const job = ownedJob(req);
+  if (!job) {
+    if (req.file) fs.unlink(req.file.path, () => {});
+    return res.status(404).send('Not found');
+  }
+  const slot = db.prepare('SELECT * FROM job_photos WHERE id=? AND job_id=?').get(req.params.photoId, job.jobId);
+  if (!slot) {
+    if (req.file) fs.unlink(req.file.path, () => {});
+    return res.status(404).send('Photo slot not found');
+  }
+  if (!req.file) return res.status(400).send('No file uploaded.');
+
+  // Replacing an existing photo — remove the old file from disk.
+  if (slot.file_path) {
+    fs.unlink(path.join(uploadsDir, slot.file_path), () => {});
+  }
+
+  db.prepare(`UPDATE job_photos SET file_path=?, original_name=?, mime_type=?, size_bytes=?, uploaded_by=?, uploaded_at=? WHERE id=?`)
+    .run(req.file.filename, req.file.originalname || '', req.file.mimetype, req.file.size, req.session.user.id, new Date().toISOString(), slot.id);
+
+  updateJobPhotoStatus(db, job.jobId);
+  res.redirect(`/jobs/${encodeURIComponent(job.jobId)}/photos`);
+});
+
+app.get('/jobs/:jobId/photos/:photoId/file', requireAuth, requireSubscription, (req, res) => {
+  const job = ownedJob(req);
+  if (!job) return res.status(404).send('Not found');
+  const slot = db.prepare('SELECT * FROM job_photos WHERE id=? AND job_id=?').get(req.params.photoId, job.jobId);
+  if (!slot || !slot.file_path) return res.status(404).send('Not found');
+
+  const filePath = path.join(uploadsDir, slot.file_path);
+  if (!filePath.startsWith(uploadsDir)) return res.status(400).send('Invalid path'); // defense in depth against path traversal
+  res.type(slot.mime_type || 'application/octet-stream');
+  res.sendFile(filePath, (err) => {
+    if (err && !res.headersSent) res.status(404).send('File not found');
+  });
 });
 
 // ─── Share Link ───────────────────────────────────────────────────────────────
