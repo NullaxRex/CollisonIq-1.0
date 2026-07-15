@@ -9,11 +9,11 @@ const fs         = require('fs');
 const bcrypt     = require('bcrypt');
 const session    = require('express-session');
 const multer     = require('multer');
-const SQLiteStore = require('connect-sqlite3')(session);
 const { DatabaseSync } = require('node:sqlite');
 const Stripe     = require('stripe');
 const helmet     = require('helmet');
 const rateLimit  = require('express-rate-limit');
+const { csrfField, verifyCsrf } = require('./utils/csrf');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -283,8 +283,58 @@ app.use(express.static(path.join(__dirname, 'public')));
 if (process.env.NODE_ENV === 'production' && !process.env.SESSION_SECRET) {
   throw new Error('SESSION_SECRET must be set in production');
 }
+
+// connect-sqlite3's underlying native sqlite3 binding is incompatible with
+// Node 22 (throws "this.db.exec is not a function" on boot). Rather than
+// fight a third-party native dependency, this store uses the same built-in
+// node:sqlite module the rest of the app already relies on successfully.
+class SqliteSessionStore extends session.Store {
+  constructor(database) {
+    super();
+    this.db = database;
+    this.db.exec(`CREATE TABLE IF NOT EXISTS sessions (
+      sid TEXT PRIMARY KEY,
+      sess TEXT NOT NULL,
+      expires INTEGER
+    )`);
+  }
+  get(sid, cb) {
+    try {
+      const row = this.db.prepare('SELECT sess, expires FROM sessions WHERE sid = ?').get(sid);
+      if (!row) return cb(null, null);
+      if (row.expires && row.expires < Date.now()) {
+        this.db.prepare('DELETE FROM sessions WHERE sid = ?').run(sid);
+        return cb(null, null);
+      }
+      cb(null, JSON.parse(row.sess));
+    } catch (err) { cb(err); }
+  }
+  set(sid, sess, cb) {
+    try {
+      const expires = sess.cookie && sess.cookie.expires
+        ? new Date(sess.cookie.expires).getTime()
+        : Date.now() + 8 * 60 * 60 * 1000;
+      this.db.prepare(
+        `INSERT INTO sessions (sid, sess, expires) VALUES (?, ?, ?)
+         ON CONFLICT(sid) DO UPDATE SET sess=excluded.sess, expires=excluded.expires`
+      ).run(sid, JSON.stringify(sess), expires);
+      cb && cb(null);
+    } catch (err) { cb && cb(err); }
+  }
+  destroy(sid, cb) {
+    try {
+      this.db.prepare('DELETE FROM sessions WHERE sid = ?').run(sid);
+      cb && cb(null);
+    } catch (err) { cb && cb(err); }
+  }
+  touch(sid, sess, cb) { this.set(sid, sess, cb); }
+}
+
+const sessionDbPath = process.env.SESSION_DB_PATH || path.join(__dirname, 'sessions.db');
+const sessionDb = new DatabaseSync(sessionDbPath);
+
 app.use(session({
-  store: new SQLiteStore({ db: 'sessions.db', dir: './' }),
+  store: new SqliteSessionStore(sessionDb),
   secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
   resave: false,
   saveUninitialized: false,
@@ -295,6 +345,10 @@ app.use(session({
     sameSite: 'lax',
   },
 }));
+
+// CSRF protection — must come after session() so req.session exists,
+// and after the body parsers above so req.body._csrf is populated.
+app.use(verifyCsrf);
 
 const uploadsDir = path.join(__dirname, 'uploads');
 fs.mkdirSync(uploadsDir, { recursive: true });
@@ -341,7 +395,7 @@ app.get('/register', (req, res) => {
       <h1 style="margin-bottom:.25rem">Create Your Shop Account</h1>
       <p style="color:#666;margin-bottom:1.5rem;font-size:.9rem">CollisionIQ — Free to start. No credit card required.</p>
       ${cancelled ? '<div style="background:#fef2f2;border:1px solid #fca5a5;color:#b91c1c;padding:.6rem;border-radius:4px;margin-bottom:1rem">Registration cancelled. Please try again.</div>' : ''}
-      <form method="POST" action="/register">
+      <form method="POST" action="/register">${csrfField(req)}
         <div style="margin-bottom:1rem"><label style="display:block;font-weight:600;margin-bottom:.3rem">Shop Name</label><input type="text" name="shop_name" required style="width:100%;box-sizing:border-box;padding:.55rem;border:1px solid #ccc;border-radius:4px"></div>
         <div style="margin-bottom:1rem"><label style="display:block;font-weight:600;margin-bottom:.3rem">Your Name</label><input type="text" name="owner_name" required style="width:100%;box-sizing:border-box;padding:.55rem;border:1px solid #ccc;border-radius:4px"></div>
         <div style="margin-bottom:1rem"><label style="display:block;font-weight:600;margin-bottom:.3rem">Email</label><input type="email" name="email" required style="width:100%;box-sizing:border-box;padding:.55rem;border:1px solid #ccc;border-radius:4px"></div>
@@ -428,7 +482,7 @@ app.get('/onboarding', requireAuth, (req, res) => {
       </div>
       <div style="background:#fff;border:1px solid #e0e0e0;border-top:none;border-radius:0 0 8px 8px;padding:2rem">
         <h2 style="font-size:1.1rem;color:#1B3A6B;margin-bottom:1.25rem">Shop Details</h2>
-        <form method="POST" action="/onboarding">
+        <form method="POST" action="/onboarding">${csrfField(req)}
           <div style="margin-bottom:1rem">
             <label style="display:block;font-size:.85rem;font-weight:600;color:#444;margin-bottom:.3rem">Shop Name</label>
             <input type="text" name="shop_name" value="${escapeHtml(shop?shop.name:'')}" required style="width:100%;box-sizing:border-box;padding:.55rem;border:1px solid #ccc;border-radius:4px">
@@ -495,13 +549,13 @@ app.get('/login', (req, res) => {
     <div class="login-logo">CollisionIQ</div>
     <div class="login-sub">ADAS Calibration Documentation Platform</div>
     ${error?'<div style="background:#fef2f2;border:1px solid #fca5a5;color:#b91c1c;padding:.6rem;border-radius:4px;margin-bottom:1rem;font-size:.875rem">Invalid username or password.</div>':''}
-    <form method="POST" action="/login">
+    <form method="POST" action="/login">${csrfField(req)}
       <div style="margin-bottom:1rem"><label style="display:block;font-size:.85rem;font-weight:600;margin-bottom:.3rem">Username</label><input type="text" name="username" required autofocus style="width:100%;box-sizing:border-box;padding:.55rem .75rem;border:1px solid #ccc;border-radius:4px;font-size:.95rem"></div>
       <div style="margin-bottom:1rem"><label style="display:block;font-size:.85rem;font-weight:600;margin-bottom:.3rem">Password</label><input type="password" name="password" required style="width:100%;box-sizing:border-box;padding:.55rem .75rem;border:1px solid #ccc;border-radius:4px;font-size:.95rem"></div>
       <button type="submit" class="login-btn">Sign In</button>
     </form>
     <div class="divider">or</div>
-    <form method="POST" action="/guest-login">
+    <form method="POST" action="/guest-login">${csrfField(req)}
       <button type="submit" class="guest-btn">&#128100; Continue as Guest</button>
     </form>
     <div style="text-align:center;margin-top:1.25rem;font-size:.85rem;color:#666">New shop? <a href="/register" style="color:#1B3A6B;font-weight:600">Create an account</a></div>
@@ -579,7 +633,7 @@ app.get('/new', requireAuth, requireSubscription, (req, res) => {
   const checkboxes = repairOptions.map(r => `<label class="checkbox-label"><input type="checkbox" name="repairs" value="${escapeHtml(r)}"><span>${escapeHtml(r)}</span></label>`).join('');
   const content = `
     <div class="page-header"><h1>New Job</h1></div>
-    <form method="POST" action="/jobs" class="job-form">
+    <form method="POST" action="/jobs" class="job-form">${csrfField(req)}
       <div class="form-section"><h2 class="section-heading">Vehicle Information</h2><div class="form-grid">
         <div class="form-group"><label>RO Number <span class="req">*</span></label><input type="text" name="ro" required placeholder="e.g. RO-12345"></div>
         <div class="form-group"><label>VIN</label><input type="text" name="vin" maxlength="17" placeholder="17-character VIN" style="text-transform:uppercase"></div>
@@ -676,8 +730,8 @@ app.get('/jobs/:jobId', requireAuth, requireSubscription, (req, res) => {
       <section class="doc-section"><h2 class="doc-section-title">Make-Specific Notes</h2><div class="notes-box"><p>${escapeHtml(job.makeSpecificNotes)||'—'}</p></div></section>
       <section class="doc-section no-print"><h2 class="doc-section-title">Insurer Link</h2>
         ${activeToken
-          ? `<div><code id="shareUrl">${escapeHtml(req.protocol+'://'+req.get('host')+'/share/'+activeToken.token)}</code> <button onclick="navigator.clipboard.writeText(document.getElementById('shareUrl').textContent)" class="btn btn-sm">Copy</button> <form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/share/revoke" style="display:inline"><button class="btn btn-sm" style="border-color:#c0392b;color:#c0392b">Revoke</button></form></div>`
-          : `<form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/share"><button class="btn btn-primary btn-sm">Generate Insurer Link</button></form>`}
+          ? `<div><code id="shareUrl">${escapeHtml(req.protocol+'://'+req.get('host')+'/share/'+activeToken.token)}</code> <button onclick="navigator.clipboard.writeText(document.getElementById('shareUrl').textContent)" class="btn btn-sm">Copy</button> <form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/share/revoke" style="display:inline">${csrfField(req)}<button class="btn btn-sm" style="border-color:#c0392b;color:#c0392b">Revoke</button></form></div>`
+          : `<form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/share">${csrfField(req)}<button class="btn btn-primary btn-sm">Generate Insurer Link</button></form>`}
       </section>
       <div class="doc-footer"><p>Generated by CollisionIQ — Job ID: ${escapeHtml(job.jobId)} — &copy; 2026 Cueljuris LLC</p></div>
     </div>`;
@@ -699,7 +753,7 @@ app.get('/jobs/:jobId/edit', requireAuth, requireSubscription, (req, res) => {
     <div style="max-width:720px;margin:0 auto">
       <div class="page-header"><h1>Edit Job — <span style="font-family:monospace">${escapeHtml(job.jobId)}</span></h1><a href="/jobs/${encodeURIComponent(job.jobId)}" class="btn">Cancel</a></div>
       <div class="card" style="padding:1.5rem">
-        <form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/edit">
+        <form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/edit">${csrfField(req)}
           <div class="form-row-2">
             <div class="form-group"><label>RO Number</label><input type="text" name="ro" value="${escapeHtml(job.ro||'')}"></div>
             <div class="form-group"><label>VIN</label><input type="text" name="vin" value="${escapeHtml(job.vin||'')}" maxlength="17"></div>
@@ -765,7 +819,7 @@ app.get('/admin', requireAdmin, (req, res) => {
     ? db.prepare('SELECT * FROM jobs WHERE shop_id=? ORDER BY createdAt DESC').all(shopId)
     : db.prepare('SELECT * FROM jobs ORDER BY createdAt DESC').all();
   const statusOptions = ['Created','In Progress','Calibration Complete','Closed'];
-  const rows = jobs.map(j => `<tr><td><span class="job-id">${escapeHtml(j.jobId)}</span></td><td>${escapeHtml(j.ro)||'—'}</td><td>${escapeHtml(j.year)} ${escapeHtml(j.make)} ${escapeHtml(j.model)}</td><td>${escapeHtml(j.technicianName)||'—'}</td><td><form method="POST" action="/jobs/${encodeURIComponent(j.jobId)}/status" class="inline-form"><select name="status" onchange="this.form.submit()" class="status-select">${statusOptions.map(s=>`<option value="${s}"${j.status===s?' selected':''}>${s}</option>`).join('')}</select></form></td><td>${formatDate(j.createdAt)}</td><td><a href="/jobs/${encodeURIComponent(j.jobId)}" class="btn btn-sm">View</a></td></tr>`).join('');
+  const rows = jobs.map(j => `<tr><td><span class="job-id">${escapeHtml(j.jobId)}</span></td><td>${escapeHtml(j.ro)||'—'}</td><td>${escapeHtml(j.year)} ${escapeHtml(j.make)} ${escapeHtml(j.model)}</td><td>${escapeHtml(j.technicianName)||'—'}</td><td><form method="POST" action="/jobs/${encodeURIComponent(j.jobId)}/status" class="inline-form">${csrfField(req)}<select name="status" onchange="this.form.submit()" class="status-select">${statusOptions.map(s=>`<option value="${s}"${j.status===s?' selected':''}>${s}</option>`).join('')}</select></form></td><td>${formatDate(j.createdAt)}</td><td><a href="/jobs/${encodeURIComponent(j.jobId)}" class="btn btn-sm">View</a></td></tr>`).join('');
   const content = `<div class="page-header"><h1>Admin — Job Management <span class="count-badge">${jobs.length}</span></h1></div><div class="table-wrap"><table class="data-table"><thead><tr><th>Job ID</th><th>RO #</th><th>Vehicle</th><th>Technician</th><th>Status</th><th>Date</th><th></th></tr></thead><tbody>${rows||'<tr><td colspan="7" class="empty">No jobs.</td></tr>'}</tbody></table></div>`;
   res.send(layout('Admin', content, 'admin', user));
 });
@@ -786,9 +840,9 @@ app.get('/admin/users', requireAdmin, (req, res) => {
     ? db.prepare('SELECT id,full_name,username,email,role,active,created_at FROM users ORDER BY created_at DESC').all()
     : db.prepare('SELECT id,full_name,username,email,role,active,created_at FROM users WHERE shop_id=? ORDER BY created_at DESC').all(user.shop_id);
   const roleOptions = ['shop_admin','qc_manager','technician','service_writer'];
-  const rows = users.map(u => `<tr><td>${escapeHtml(u.full_name||'—')}</td><td class="mono">${escapeHtml(u.username)}</td><td>${escapeHtml(u.email||'—')}</td><td><span class="badge badge-blue">${escapeHtml(u.role)}</span></td><td><span class="badge badge-${u.active?'green':'gray'}">${u.active?'Active':'Inactive'}</span></td><td><form method="POST" action="/admin/users/${u.id}/role" style="display:inline"><select name="role" onchange="this.form.submit()">${roleOptions.map(r=>`<option value="${r}"${u.role===r?' selected':''}>${r}</option>`).join('')}</select></form>${u.active?`<form method="POST" action="/admin/users/${u.id}/deactivate" style="display:inline;margin-left:.5rem"><button class="btn btn-sm btn-ghost">Deactivate</button></form>`:''}</td></tr>`).join('');
+  const rows = users.map(u => `<tr><td>${escapeHtml(u.full_name||'—')}</td><td class="mono">${escapeHtml(u.username)}</td><td>${escapeHtml(u.email||'—')}</td><td><span class="badge badge-blue">${escapeHtml(u.role)}</span></td><td><span class="badge badge-${u.active?'green':'gray'}">${u.active?'Active':'Inactive'}</span></td><td><form method="POST" action="/admin/users/${u.id}/role" style="display:inline">${csrfField(req)}<select name="role" onchange="this.form.submit()">${roleOptions.map(r=>`<option value="${r}"${u.role===r?' selected':''}>${r}</option>`).join('')}</select></form>${u.active?`<form method="POST" action="/admin/users/${u.id}/deactivate" style="display:inline;margin-left:.5rem">${csrfField(req)}<button class="btn btn-sm btn-ghost">Deactivate</button></form>`:''}</td></tr>`).join('');
   const content = `<div class="page-header"><h1>Users <span class="count-badge">${users.length}</span></h1></div>
-    <div class="doc-section" style="margin-bottom:2rem"><h2 class="doc-section-title">Add New User</h2><form method="POST" action="/admin/users/create" style="display:grid;gap:1rem;max-width:520px"><div class="form-group"><label>Full Name</label><input type="text" name="full_name" required placeholder="Jane Smith"></div><div class="form-group"><label>Username</label><input type="text" name="username" required autocomplete="off"></div><div class="form-group"><label>Email</label><input type="email" name="email" placeholder="optional"></div><div class="form-group"><label>Temporary Password</label><input type="password" name="password" required autocomplete="new-password"></div><div class="form-group"><label>Role</label><select name="role">${roleOptions.map(r=>`<option value="${r}">${r}</option>`).join('')}</select></div><button type="submit" class="btn btn-primary">Create User</button></form></div>
+    <div class="doc-section" style="margin-bottom:2rem"><h2 class="doc-section-title">Add New User</h2><form method="POST" action="/admin/users/create" style="display:grid;gap:1rem;max-width:520px">${csrfField(req)}<div class="form-group"><label>Full Name</label><input type="text" name="full_name" required placeholder="Jane Smith"></div><div class="form-group"><label>Username</label><input type="text" name="username" required autocomplete="off"></div><div class="form-group"><label>Email</label><input type="email" name="email" placeholder="optional"></div><div class="form-group"><label>Temporary Password</label><input type="password" name="password" required autocomplete="new-password"></div><div class="form-group"><label>Role</label><select name="role">${roleOptions.map(r=>`<option value="${r}">${r}</option>`).join('')}</select></div><button type="submit" class="btn btn-primary">Create User</button></form></div>
     <div class="table-wrap"><table class="data-table"><thead><tr><th>Name</th><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead><tbody>${rows||'<tr><td colspan="6" class="empty">No users.</td></tr>'}</tbody></table></div>`;
   res.send(layout('Users', content, 'users', user));
 });
@@ -837,7 +891,7 @@ app.get('/platform/shops', requirePlatformAdmin, (req, res) => {
     return `<tr><td><strong>${escapeHtml(s.name)}</strong></td><td>${escapeHtml(s.subscription_status||'inactive')}</td><td>${uc.c}</td><td>${jc.c}</td><td>${formatDate(s.created_at)}</td></tr>`;
   }).join('');
   const content = `<div class="page-header"><h1>Shops <span class="count-badge">${shops.length}</span></h1></div>
-    <div class="doc-section" style="margin-bottom:2rem"><h2 class="doc-section-title">Onboard New Shop</h2><form method="POST" action="/platform/shops/create" style="display:grid;gap:1rem;max-width:520px"><div class="form-group"><label>Shop Name</label><input type="text" name="shop_name" required></div><div class="form-group"><label>Admin Full Name</label><input type="text" name="admin_full_name" required></div><div class="form-group"><label>Admin Username</label><input type="text" name="admin_username" required autocomplete="off"></div><div class="form-group"><label>Temporary Password</label><input type="password" name="admin_password" required autocomplete="new-password"></div><button type="submit" class="btn btn-primary">Create Shop</button></form></div>
+    <div class="doc-section" style="margin-bottom:2rem"><h2 class="doc-section-title">Onboard New Shop</h2><form method="POST" action="/platform/shops/create" style="display:grid;gap:1rem;max-width:520px">${csrfField(req)}<div class="form-group"><label>Shop Name</label><input type="text" name="shop_name" required></div><div class="form-group"><label>Admin Full Name</label><input type="text" name="admin_full_name" required></div><div class="form-group"><label>Admin Username</label><input type="text" name="admin_username" required autocomplete="off"></div><div class="form-group"><label>Temporary Password</label><input type="password" name="admin_password" required autocomplete="new-password"></div><button type="submit" class="btn btn-primary">Create Shop</button></form></div>
     <div class="table-wrap"><table class="data-table"><thead><tr><th>Shop</th><th>Status</th><th>Users</th><th>Jobs</th><th>Created</th></tr></thead><tbody>${rows||'<tr><td colspan="5" class="empty">No shops.</td></tr>'}</tbody></table></div>`;
   res.send(layout('Shops', content, 'shops', req.session.user));
 });
