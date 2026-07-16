@@ -102,6 +102,19 @@ for (const [tbl, col, def] of addCols) {
   try { db.exec(`ALTER TABLE ${tbl} ADD COLUMN ${col} ${def}`); } catch(e) {}
 }
 
+// job_photos may already exist from an earlier development pass with a different
+// column set. CREATE TABLE IF NOT EXISTS above is a no-op against an existing
+// table, so reconcile columns the same defensive way as the blocks above —
+// safe no-ops if a column is already present, never touches existing rows.
+for (const [col, def] of [
+  ['layer','INTEGER'], ['zone','TEXT'], ['key','TEXT'], ['display','TEXT'],
+  ['is_recommended','INTEGER DEFAULT 0'], ['is_adas','INTEGER DEFAULT 0'],
+  ['file_path','TEXT'], ['original_name','TEXT'], ['mime_type','TEXT'],
+  ['size_bytes','INTEGER'], ['uploaded_by','INTEGER'], ['uploaded_at','TEXT'],
+]) {
+  try { db.exec(`ALTER TABLE job_photos ADD COLUMN ${col} ${def}`); } catch(e) {}
+}
+
 for (const [col, def] of [
   ['stripe_customer_id','TEXT'], ['stripe_subscription_id','TEXT'],
   ['subscription_status',"TEXT DEFAULT 'inactive'"],
