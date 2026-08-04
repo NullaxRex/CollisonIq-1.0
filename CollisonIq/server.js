@@ -106,11 +106,16 @@ for (const [tbl, col, def] of addCols) {
 // column set. CREATE TABLE IF NOT EXISTS above is a no-op against an existing
 // table, so reconcile columns the same defensive way as the blocks above —
 // safe no-ops if a column is already present, never touches existing rows.
+// NOTE: 'shop_id' is included here because a prior schema version created
+// job_photos with a shop_id column (in some environments as NOT NULL). If it's
+// already present this ALTER is a harmless no-op (caught below); if it's
+// missing, this backfills it as a nullable INTEGER so inserts don't crash.
 for (const [col, def] of [
   ['layer','INTEGER'], ['zone','TEXT'], ['key','TEXT'], ['display','TEXT'],
   ['is_recommended','INTEGER DEFAULT 0'], ['is_adas','INTEGER DEFAULT 0'],
   ['file_path','TEXT'], ['original_name','TEXT'], ['mime_type','TEXT'],
   ['size_bytes','INTEGER'], ['uploaded_by','INTEGER'], ['uploaded_at','TEXT'],
+  ['shop_id','INTEGER'],
 ]) {
   try { db.exec(`ALTER TABLE job_photos ADD COLUMN ${col} ${def}`); } catch(e) {}
 }
@@ -733,10 +738,14 @@ app.post('/jobs', requireAuth, requireSubscription, (req, res) => {
 
   // Generate the required photo-documentation slots for this job and persist
   // them (unfilled) so the photo checklist knows what's outstanding.
+  // shop_id is included here because job_photos carries a shop_id column on
+  // this deployment (a NOT NULL constraint on some environments) — omitting
+  // it caused every insert to fail with "NOT NULL constraint failed:
+  // job_photos.shop_id" and crashed the whole job-creation request with a 500.
   const slots = generatePhotoLabels({ impact_areas: impactZones, adas_required: adasRequired });
-  const insertSlot = db.prepare(`INSERT INTO job_photos (job_id, layer, zone, key, display, is_recommended, is_adas) VALUES (?,?,?,?,?,?,?)`);
+  const insertSlot = db.prepare(`INSERT INTO job_photos (job_id, layer, zone, key, display, is_recommended, is_adas, shop_id) VALUES (?,?,?,?,?,?,?,?)`);
   for (const slot of slots) {
-    insertSlot.run(jobId, slot.layer, slot.zone || null, slot.key, slot.display, slot.is_recommended ? 1 : 0, slot.is_adas ? 1 : 0);
+    insertSlot.run(jobId, slot.layer, slot.zone || null, slot.key, slot.display, slot.is_recommended ? 1 : 0, slot.is_adas ? 1 : 0, req.session.user.shop_id || null);
   }
   updateJobPhotoStatus(db, jobId);
 
