@@ -106,10 +106,6 @@ for (const [tbl, col, def] of addCols) {
 // column set. CREATE TABLE IF NOT EXISTS above is a no-op against an existing
 // table, so reconcile columns the same defensive way as the blocks above —
 // safe no-ops if a column is already present, never touches existing rows.
-// NOTE: 'shop_id' is included here because a prior schema version created
-// job_photos with a shop_id column (in some environments as NOT NULL). If it's
-// already present this ALTER is a harmless no-op (caught below); if it's
-// missing, this backfills it as a nullable INTEGER so inserts don't crash.
 for (const [col, def] of [
   ['layer','INTEGER'], ['zone','TEXT'], ['key','TEXT'], ['display','TEXT'],
   ['is_recommended','INTEGER DEFAULT 0'], ['is_adas','INTEGER DEFAULT 0'],
@@ -119,6 +115,59 @@ for (const [col, def] of [
 ]) {
   try { db.exec(`ALTER TABLE job_photos ADD COLUMN ${col} ${def}`); } catch(e) {}
 }
+
+// One-time repair migration: a prior deployment created job_photos with
+// shop_id defined as NOT NULL. SQLite has no ALTER COLUMN — you cannot relax
+// an existing NOT NULL constraint by adding/altering a column, which is why
+// the earlier fix (just passing shop_id on INSERT) still failed whenever the
+// acting user has no shop_id (platform_admin is legitimately shop-less, and
+// any session predating shop assignment will also have it). The real fix is
+// to rebuild the table with shop_id nullable and copy every row across.
+// Idempotent and safe to run on every boot — it only acts when the NOT NULL
+// constraint is actually still present, and it's wrapped in a transaction
+// so a failure mid-rebuild leaves the original table untouched.
+(function relaxJobPhotosShopIdIfNeeded() {
+  const cols = db.prepare("PRAGMA table_info(job_photos)").all();
+  const shopIdCol = cols.find(c => c.name === 'shop_id');
+  if (!shopIdCol || shopIdCol.notnull !== 1) return; // already nullable, or column absent — nothing to do
+
+  console.log('[migration] job_photos.shop_id is NOT NULL — rebuilding table to make it nullable...');
+  try {
+    db.exec('BEGIN');
+    db.exec('ALTER TABLE job_photos RENAME TO job_photos_old');
+    db.exec(`
+      CREATE TABLE job_photos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id TEXT NOT NULL,
+        layer INTEGER,
+        zone TEXT,
+        key TEXT,
+        display TEXT,
+        is_recommended INTEGER DEFAULT 0,
+        is_adas INTEGER DEFAULT 0,
+        file_path TEXT,
+        original_name TEXT,
+        mime_type TEXT,
+        size_bytes INTEGER,
+        uploaded_by INTEGER,
+        uploaded_at TEXT,
+        shop_id INTEGER,
+        FOREIGN KEY (job_id) REFERENCES jobs(jobId)
+      )
+    `);
+    const oldColNames = db.prepare("PRAGMA table_info(job_photos_old)").all().map(c => c.name);
+    const newColNames = db.prepare("PRAGMA table_info(job_photos)").all().map(c => c.name);
+    const shared = newColNames.filter(c => oldColNames.includes(c)).join(', ');
+    db.exec(`INSERT INTO job_photos (${shared}) SELECT ${shared} FROM job_photos_old`);
+    db.exec('DROP TABLE job_photos_old');
+    db.exec('COMMIT');
+    console.log('[migration] job_photos rebuilt successfully — shop_id is now nullable. Existing rows preserved.');
+  } catch (err) {
+    db.exec('ROLLBACK');
+    console.error('[migration] job_photos rebuild FAILED, rolled back. Original table left in place:', err.message);
+    throw err;
+  }
+})();
 
 for (const [col, def] of [
   ['stripe_customer_id','TEXT'], ['stripe_subscription_id','TEXT'],
@@ -738,10 +787,9 @@ app.post('/jobs', requireAuth, requireSubscription, (req, res) => {
 
   // Generate the required photo-documentation slots for this job and persist
   // them (unfilled) so the photo checklist knows what's outstanding.
-  // shop_id is included here because job_photos carries a shop_id column on
-  // this deployment (a NOT NULL constraint on some environments) — omitting
-  // it caused every insert to fail with "NOT NULL constraint failed:
-  // job_photos.shop_id" and crashed the whole job-creation request with a 500.
+  // shop_id may legitimately be null here (platform_admin, or any session
+  // without a shop) — the boot-time migration above ensures job_photos.shop_id
+  // is nullable, so this is safe.
   const slots = generatePhotoLabels({ impact_areas: impactZones, adas_required: adasRequired });
   const insertSlot = db.prepare(`INSERT INTO job_photos (job_id, layer, zone, key, display, is_recommended, is_adas, shop_id) VALUES (?,?,?,?,?,?,?,?)`);
   for (const slot of slots) {
