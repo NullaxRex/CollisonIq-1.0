@@ -97,6 +97,28 @@ a:hover {
   color: #ffffff;
 }
 
+/* Logout is a POST form; make its button look like the nav links. */
+.nav-logout-form {
+  display: inline;
+  margin: 0;
+}
+.nav-logout {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  color: rgba(255, 255, 255, 0.8);
+  font-size: 0.875rem;
+  font-weight: 500;
+  padding: 0.4rem 0.85rem;
+  border-radius: 5px;
+  transition: background 0.15s, color 0.15s;
+}
+.nav-logout:hover {
+  background: rgba(255, 255, 255, 0.18);
+  color: #ffffff;
+}
+
 .nav-user {
   color: rgba(255, 255, 255, 0.85);
   font-size: 0.8rem;

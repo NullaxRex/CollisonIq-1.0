@@ -5,3 +5,6 @@ collisioniq.db
 *.db-shm
 *.db-wal
 .claude/
+local-data/
+*.log
+uploads/

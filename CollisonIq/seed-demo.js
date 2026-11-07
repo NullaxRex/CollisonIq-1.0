@@ -1,5 +1,12 @@
 'use strict';
 
+// Development only. Demo accounts (shared password demo1234) must never exist in
+// production, so refuse to run anywhere that looks like production or Railway.
+if (process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_ENVIRONMENT_NAME) {
+  console.error('seed-demo.js refuses to run in production (NODE_ENV=production or a Railway environment detected).');
+  process.exit(1);
+}
+
 const { DatabaseSync } = require('node:sqlite');
 const bcrypt = require('bcrypt');
 const crypto = require('crypto');
@@ -225,7 +232,7 @@ async function run() {
 
   console.log('\n--- Seed complete ---');
   console.log('\nAll demo account password: demo1234');
-  console.log('Platform admin password:   changeme123 (change this)');
+  console.log('Platform admin password:   not set by this script (server.js uses PLATFORM_ADMIN_PASSWORD, or prints a one-time password on first boot)');
   console.log('\nShops: Metro, Northside, Southbelt, Premier, Gulf Coast');
   console.log('Run again at any time — duplicate records are skipped.\n');
 }

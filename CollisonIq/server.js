@@ -6,6 +6,7 @@ const express    = require('express');
 const path       = require('path');
 const crypto     = require('crypto');
 const fs         = require('fs');
+const { AsyncLocalStorage } = require('node:async_hooks');
 const bcrypt     = require('bcrypt');
 const session    = require('express-session');
 const multer     = require('multer');
@@ -16,15 +17,41 @@ const rateLimit  = require('express-rate-limit');
 const { csrfField, verifyCsrf, csrfTokenValid } = require('./utils/csrf');
 const { generatePhotoLabels, ZONE_DISPLAY } = require('./utils/photoLabels');
 const { calculatePhotoStatus, updateJobPhotoStatus } = require('./utils/photoStatus');
+const oemRules   = require('./utils/oemCalibrationRules'); // loads ./utils/oemSourceRegister
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
+// Production = NODE_ENV=production, or running on Railway (which sets
+// RAILWAY_ENVIRONMENT / RAILWAY_ENVIRONMENT_NAME) even if NODE_ENV was never set.
+const IS_PROD = process.env.NODE_ENV === 'production'
+  || Boolean(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_ENVIRONMENT_NAME);
+
+// Per-request context so layout() can render the CSRF-protected logout form
+// without every route having to pass req through.
+const requestContext = new AsyncLocalStorage();
 
 // ─── Cost factor for password hashing (consistent everywhere) ──────────────────
 const BCRYPT_ROUNDS = 12;
 
+// ─── Request helpers ──────────────────────────────────────────────────────────
+// The urlencoded parser turns `a[]=1` / `a[b]=1` into arrays/objects. Every field
+// a handler reads goes through str()/strList() so a crafted body can never reach
+// bcrypt or a SQL bind as a non-string (which throws).
+function str(v, max = 500) { return typeof v === 'string' ? v.trim().slice(0, max) : ''; }
+function strList(v, max = 200) {
+  const list = Array.isArray(v) ? v : (v === undefined || v === null ? [] : [v]);
+  return list.filter(x => typeof x === 'string').map(x => x.trim().slice(0, max)).filter(Boolean);
+}
+// Express 4 does not catch rejected promises: without this, any throw inside an
+// async handler is an unhandled rejection, which terminates the Node process.
+const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+// Public base URL for Stripe redirects, never with a trailing slash.
+function baseUrl(req) { return (process.env.APP_BASE_URL || `https://${req.get('host')}`).replace(/\/+$/, ''); }
+
 // ─── Stripe ───────────────────────────────────────────────────────────────────
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', { apiVersion: '2024-04-10' });
+// Subscription price for self-serve signup. Falls back to the original live price.
+const STRIPE_PRICE_ID = process.env.STRIPE_PRICE_ID || 'price_1TZBLcQx0YVznfDrJelvhtP4';
 
 // ─── Database ─────────────────────────────────────────────────────────────────
 const dbPath = process.env.DB_PATH || path.join(__dirname, 'collisioniq.db');
@@ -94,12 +121,24 @@ db.exec(`
   );
 `);
 
-const addCols = [
-  ['jobs','mileage','TEXT'], ['jobs','service_date','TEXT'], ['jobs','assigned_tech','TEXT'],
-  ['jobs','impact_areas','TEXT'], ['jobs','photo_status','TEXT'],
+// Bring an older jobs table (e.g. the v1 schema, which has no shop_id) up to
+// the current column set. ADD COLUMN only, and only for columns PRAGMA
+// table_info says are missing; never rebuilds the table or touches rows.
+const JOBS_COLUMNS = [
+  ['ro','TEXT'], ['vin','TEXT'], ['year','TEXT'], ['make','TEXT'], ['model','TEXT'], ['trim','TEXT'],
+  ['technicianName','TEXT'], ['repairsPerformed','TEXT'], ['adasSystems','TEXT'], ['rationale','TEXT'],
+  ['liabilityWarning','TEXT'], ['makeSpecificNotes','TEXT'], ['preScanRequired','TEXT'],
+  ['postScanRequired','TEXT'], ['approvedScanTool','TEXT'], ['status',"TEXT DEFAULT 'Created'"],
+  ['track',"TEXT DEFAULT 'post-collision'"], ['collision_grade','TEXT'], ['shareToken','TEXT'],
+  ['shareUrl','TEXT'], ['shop_id','INTEGER'], ['created_by','INTEGER'], ['createdAt','TEXT'],
+  ['updatedAt','TEXT'], ['last_changed','TEXT'],
+  ['mileage','TEXT'], ['service_date','TEXT'], ['assigned_tech','TEXT'], ['impact_areas','TEXT'], ['photo_status','TEXT'],
 ];
-for (const [tbl, col, def] of addCols) {
-  try { db.exec(`ALTER TABLE ${tbl} ADD COLUMN ${col} ${def}`); } catch(e) {}
+{
+  const present = new Set(db.prepare('PRAGMA table_info(jobs)').all().map(c => c.name));
+  const missing = JOBS_COLUMNS.filter(([col]) => !present.has(col));
+  for (const [col, def] of missing) db.exec(`ALTER TABLE jobs ADD COLUMN ${col} ${def}`);
+  if (missing.length) console.log(`[migration] jobs: added missing column(s) ${missing.map(([c]) => c).join(', ')}`);
 }
 
 // job_photos may already exist from an earlier development pass with a different
@@ -274,9 +313,16 @@ function escapeHtml(s) {
   if (s === null || s === undefined) return '';
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');
 }
+// CIQ-YYYYMMDD-NNNN. jobId is UNIQUE, so retry on collision instead of letting the
+// INSERT throw; only after repeated collisions widen the random suffix.
 function generateJobId() {
   const d = new Date().toISOString().slice(0,10).replace(/-/g,'');
-  return `CIQ-${d}-${Math.floor(1000+Math.random()*9000)}`;
+  const exists = db.prepare('SELECT 1 FROM jobs WHERE jobId=?');
+  for (let i = 0; i < 20; i++) {
+    const id = `CIQ-${d}-${crypto.randomInt(1000, 10000)}`;
+    if (!exists.get(id)) return id;
+  }
+  return `CIQ-${d}-${crypto.randomInt(100000, 1000000)}`;
 }
 function formatDate(iso) { return iso ? iso.slice(0,10) : '—'; }
 function statusClass(s) {
@@ -300,29 +346,46 @@ function consumeFlash(req) { const f = req.session.flash || null; delete req.ses
 function layout(title, content, activeNav='', user=null) {
   const nav = (href, key, label) => `<a href="${href}" class="${activeNav===key?'active':''}">${label}</a>`;
   const role = user ? user.role : null;
+  const ctxReq = requestContext.getStore();
+  const logout = ctxReq ? `<form method="POST" action="/logout" class="nav-logout-form">${csrfField(ctxReq)}<button type="submit" class="nav-logout">Logout</button></form>` : '';
   let navLinks = '';
   if (role === 'platform_admin') {
-    navLinks = `${nav('/','list','Jobs')}${nav('/new','new','New Job')}${nav('/reference','reference','ADAS Reference')}${nav('/admin','admin','Admin')}${nav('/platform/shops','shops','Shops')}${nav('/platform/billing','billing','Billing')}<a href="/logout">Logout</a>`;
+    navLinks = `${nav('/','list','Jobs')}${nav('/new','new','New Job')}${nav('/reference','reference','ADAS Reference')}${nav('/admin','admin','Admin')}${nav('/platform/shops','shops','Shops')}${nav('/platform/billing','billing','Billing')}${logout}`;
   } else if (role === 'shop_admin') {
-    navLinks = `${nav('/','list','Jobs')}${nav('/new','new','New Job')}${nav('/reference','reference','ADAS Reference')}${nav('/admin','admin','Admin')}${nav('/admin/users','users','Users')}<a href="/logout">Logout</a>`;
+    navLinks = `${nav('/','list','Jobs')}${nav('/new','new','New Job')}${nav('/reference','reference','ADAS Reference')}${nav('/admin','admin','Admin')}${nav('/admin/users','users','Users')}${logout}`;
   } else if (role === 'technician') {
-    navLinks = `${nav('/','list','My Jobs')}${nav('/reference','reference','ADAS Reference')}<a href="/logout">Logout</a>`;
+    navLinks = `${nav('/','list','My Jobs')}${nav('/reference','reference','ADAS Reference')}${logout}`;
   } else if (role) {
-    navLinks = `${nav('/','list','Jobs')}${nav('/reference','reference','ADAS Reference')}<a href="/logout">Logout</a>`;
+    navLinks = `${nav('/','list','Jobs')}${nav('/reference','reference','ADAS Reference')}${logout}`;
   }
   const userDisplay = user ? `<span class="nav-user">${escapeHtml(user.full_name||user.username)} <span class="nav-role">[${escapeHtml(user.role)}]</span></span>` : '';
   const adminBanner = role==='platform_admin' ? `<div style="background:#1B3A6B;color:#fff;text-align:center;padding:6px;font-size:13px">&#9881; PLATFORM ADMIN — CUELJURIS LLC</div>` : '';
-  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>${escapeHtml(title)} — CollisionIQ</title><link rel="stylesheet" href="/style.css"></head><body>${adminBanner}<header class="site-header"><div class="header-inner"><div class="brand"><a href="/" class="brand-logo">CollisionIQ</a><span class="brand-tagline">ADAS Calibration Documentation Platform</span></div><nav class="main-nav">${navLinks}${userDisplay}</nav></div></header><main class="main-content">${content}</main><footer class="site-footer"><p>&copy; 2026 Cueljuris LLC &mdash; CollisionIQ Platform</p></footer></body></html>`;
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>${escapeHtml(title)} — CollisionIQ</title><link rel="stylesheet" href="/style.css"><script src="/js/app.js" defer></script></head><body>${adminBanner}<header class="site-header"><div class="header-inner"><div class="brand"><a href="/" class="brand-logo">CollisionIQ</a><span class="brand-tagline">ADAS Calibration Documentation Platform</span></div><nav class="main-nav">${navLinks}${userDisplay}</nav></div></header><main class="main-content">${content}</main><footer class="site-footer"><p>&copy; 2026 Cueljuris LLC &mdash; CollisionIQ Platform</p></footer></body></html>`;
 }
 
 // ─── Security headers + proxy trust ────────────────────────────────────────────
 // trust proxy is required so secure cookies work behind Railway's TLS terminator.
 app.set('trust proxy', 1);
-// CSP is disabled because the UI relies on inline event handlers (onclick / onchange).
-// Everything else helmet provides (HSTS, X-Frame-Options, nosniff, etc.) still applies.
-app.use(helmet({ contentSecurityPolicy: false }));
+// CSP: no inline scripts or inline event handlers (UI behaviour lives in
+// /js/app.js). Inline style attributes are still used throughout, so styles keep
+// 'unsafe-inline'. /register POSTs then redirects to Stripe Checkout, which
+// form-action must allow. upgrade-insecure-requests only in production so plain
+// http://localhost keeps working.
+app.use(helmet({
+  contentSecurityPolicy: {
+    useDefaults: true,
+    directives: {
+      'script-src': ["'self'"],
+      'script-src-attr': ["'none'"],
+      'style-src': ["'self'", "'unsafe-inline'"],
+      'img-src': ["'self'", 'data:'],
+      'form-action': ["'self'", 'https://checkout.stripe.com'],
+      'upgrade-insecure-requests': IS_PROD ? [] : null,
+    },
+  },
+}));
 
-// Rate limiter for auth endpoints (brute-force / credential-stuffing protection).
+// Rate limiter for registration (brute-force / abuse protection).
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
@@ -331,39 +394,60 @@ const authLimiter = rateLimit({
   message: 'Too many attempts. Please try again in 15 minutes.',
 });
 
+// Login limiters count FAILED attempts only, so a whole shop logging in from
+// one NAT'd IP at shift start isn't locked out. Per-IP caps spraying across
+// accounts; per-username caps guessing against one account from many IPs.
+const loginFailed = (req, res) => !res.locals.loginFailed;
+const loginIpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 30,
+  skipSuccessfulRequests: true, requestWasSuccessful: loginFailed,
+  standardHeaders: true, legacyHeaders: false,
+  message: 'Too many failed sign-in attempts. Please try again in 15 minutes.',
+});
+const loginUserLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 10,
+  skipSuccessfulRequests: true, requestWasSuccessful: loginFailed,
+  keyGenerator: (req) => 'user:' + str(req.body && req.body.username, 100).toLowerCase(),
+  standardHeaders: true, legacyHeaders: false,
+  message: 'Too many failed sign-in attempts for this account. Please try again in 15 minutes.',
+});
+
 // ─── Stripe webhook (must be BEFORE the JSON body parser) ──────────────────────
-app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), asyncRoute(async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET || '');
   } catch (err) {
     console.error('[webhook] signature failed:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+    return res.status(400).send('Webhook signature verification failed.');
   }
 
   if (event.type === 'customer.subscription.created' || event.type === 'customer.subscription.updated') {
     const sub = event.data.object;
     const status = ['active','trialing'].includes(sub.status) ? sub.status : sub.status === 'past_due' ? 'past_due' : 'inactive';
+    // node:sqlite throws when binding undefined. Newer Stripe API versions moved
+    // current_period_end off the subscription object, so default it to null.
     db.prepare(`UPDATE shops SET subscription_status=?, stripe_subscription_id=?, subscription_current_period_end=? WHERE stripe_customer_id=?`)
-      .run(status, sub.id, sub.current_period_end, sub.customer);
+      .run(status, sub.id ?? null, sub.current_period_end ?? null, sub.customer ?? null);
   }
 
   if (event.type === 'customer.subscription.deleted') {
     const sub = event.data.object;
-    db.prepare(`UPDATE shops SET subscription_status='cancelled' WHERE stripe_customer_id=?`).run(sub.customer);
+    db.prepare(`UPDATE shops SET subscription_status='cancelled' WHERE stripe_customer_id=?`).run(sub.customer ?? null);
   }
 
   res.json({ received: true });
-});
+}));
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ─── Session ───────────────────────────────────────────────────────────────────
-// Refuse to boot in production without a real secret. No public fallback string.
-if (process.env.NODE_ENV === 'production' && !process.env.SESSION_SECRET) {
+// Refuse to boot in production (including any Railway environment) without a
+// real secret. No public fallback string.
+if (IS_PROD && !process.env.SESSION_SECRET) {
   throw new Error('SESSION_SECRET must be set in production');
 }
 
@@ -411,23 +495,48 @@ class SqliteSessionStore extends session.Store {
     } catch (err) { cb && cb(err); }
   }
   touch(sid, sess, cb) { this.set(sid, sess, cb); }
+  // Expired rows are otherwise only removed when that exact sid is read again.
+  prune() {
+    try { this.db.prepare('DELETE FROM sessions WHERE expires IS NOT NULL AND expires < ?').run(Date.now()); }
+    catch (err) { console.error('[session] prune failed:', err.message); }
+  }
 }
 
 const sessionDbPath = process.env.SESSION_DB_PATH || path.join(__dirname, 'sessions.db');
 const sessionDb = new DatabaseSync(sessionDbPath);
+const sessionStore = new SqliteSessionStore(sessionDb);
+sessionStore.prune();
+setInterval(() => sessionStore.prune(), 60 * 60 * 1000).unref();
 
 app.use(session({
-  store: new SqliteSessionStore(sessionDb),
+  store: sessionStore,
   secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
   resave: false,
   saveUninitialized: false,
   cookie: {
     maxAge: 8 * 60 * 60 * 1000,
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
+    secure: IS_PROD,
     sameSite: 'lax',
   },
 }));
+
+// Re-read the signed-in user on every request. The session only caches a
+// snapshot from login, so without this a deactivated user keeps working for up
+// to 8 hours and role or shop changes don't apply until they sign in again.
+const loadSessionUser = db.prepare('SELECT id, username, full_name, role, shop_id, active FROM users WHERE id=?');
+app.use((req, res, next) => {
+  const cached = req.session && req.session.user;
+  if (!cached) return next();
+  const u = loadSessionUser.get(cached.id);
+  if (!u || !u.active) {
+    return req.session.destroy(() => res.redirect('/login'));
+  }
+  req.session.user = { id: u.id, username: u.username, full_name: u.full_name, role: u.role, shop_id: u.shop_id };
+  next();
+});
+
+app.use((req, res, next) => requestContext.run(req, next));
 
 // CSRF protection — must come after session() so req.session exists,
 // and after the body parsers above so req.body._csrf is populated.
@@ -439,28 +548,62 @@ app.use(verifyCsrf);
 const uploadsDir = process.env.UPLOADS_DIR || path.join(__dirname, 'uploads');
 fs.mkdirSync(uploadsDir, { recursive: true });
 
-const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif']);
+// Extension comes from the (allow-listed) MIME type, never from the client's
+// filename, so nothing like `.html` or `.svg` can ever land in uploads/.
+const IMAGE_EXT = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/heic': '.heic', 'image/heif': '.heif' };
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => cb(null, uploadsDir),
-    filename: (req, file, cb) => {
-      const ext = path.extname(file.originalname || '').toLowerCase().slice(0, 10);
-      cb(null, `${crypto.randomUUID()}${ext}`);
-    },
+    filename: (req, file, cb) => cb(null, `${crypto.randomUUID()}${IMAGE_EXT[file.mimetype]}`),
   }),
-  limits: { fileSize: 10 * 1024 * 1024 },
+  limits: { fileSize: 10 * 1024 * 1024, files: 1, fields: 10 },
   fileFilter: (req, file, cb) => {
-    if (!ALLOWED_IMAGE_TYPES.has(file.mimetype)) {
+    if (!IMAGE_EXT[file.mimetype]) {
       return cb(new Error('Only JPEG, PNG, WEBP, or HEIC/HEIF images are allowed.'));
     }
     cb(null, true);
   },
 });
 
+// The MIME type above is whatever the browser claimed. Confirm the bytes on disk
+// really are that image format before accepting the upload.
+function imageSignatureMatches(filePath, mimetype) {
+  const buf = Buffer.alloc(12);
+  let fd;
+  try { fd = fs.openSync(filePath, 'r'); fs.readSync(fd, buf, 0, 12, 0); }
+  catch { return false; }
+  finally { if (fd !== undefined) fs.closeSync(fd); }
+  switch (mimetype) {
+    case 'image/jpeg': return buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF;
+    case 'image/png':  return buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]));
+    case 'image/webp': return buf.toString('latin1', 0, 4) === 'RIFF' && buf.toString('latin1', 8, 12) === 'WEBP';
+    case 'image/heic':
+    case 'image/heif': return buf.toString('latin1', 4, 8) === 'ftyp';
+    default: return false;
+  }
+}
+
 // ─── Auth Middleware ──────────────────────────────────────────────────────────
 function requireAuth(req, res, next) {
   if (!req.session.user) return res.redirect('/login');
   next();
+}
+// Role gate. Roles: platform_admin, shop_admin, qc_manager, service_writer, technician.
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!req.session.user) return res.redirect('/login');
+    if (!roles.includes(req.session.user.role)) return res.status(403).send('Access denied.');
+    next();
+  };
+}
+// Who may create and edit jobs (matches the Edit button shown on the job page).
+const JOB_EDITORS = ['platform_admin', 'shop_admin', 'service_writer'];
+const requireJobEditor = requireRole(...JOB_EDITORS);
+// Photo uploads: service writers are read-only, and a Closed job is locked for
+// everyone except platform_admin.
+function canUploadPhotos(user, job) {
+  if (user.role === 'service_writer') return false;
+  return job.status !== 'Closed' || user.role === 'platform_admin';
 }
 function requireAdmin(req, res, next) {
   if (!req.session.user) return res.redirect('/login');
@@ -511,8 +654,11 @@ app.get('/register', (req, res) => {
     </div>`));
 });
 
-app.post('/register', authLimiter, async (req, res) => {
-  const { shop_name, owner_name, email, username, password, password_confirm } = req.body;
+app.post('/register', authLimiter, asyncRoute(async (req, res) => {
+  const shop_name = str(req.body.shop_name, 200), owner_name = str(req.body.owner_name, 200);
+  const email = str(req.body.email, 254), username = str(req.body.username, 100);
+  const password = typeof req.body.password === 'string' ? req.body.password : '';
+  const password_confirm = typeof req.body.password_confirm === 'string' ? req.body.password_confirm : '';
   if (!shop_name || !owner_name || !email || !username || !password) return res.redirect('/register?error=1');
   if (password !== password_confirm) return res.redirect('/register?error=1');
   if (password.length < 8) return res.redirect('/register?error=1');
@@ -528,25 +674,33 @@ app.post('/register', authLimiter, async (req, res) => {
     const checkoutSession = await stripe.checkout.sessions.create({
       customer: customer.id,
       mode: 'subscription',
-      line_items: [{ price: 'price_1TZBLcQx0YVznfDrJelvhtP4', quantity: 1 }],
+      line_items: [{ price: STRIPE_PRICE_ID, quantity: 1 }],
       payment_method_collection: 'if_required',
-      success_url: `${process.env.APP_BASE_URL || 'https://'+req.get('host')}/register/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.APP_BASE_URL || 'https://'+req.get('host')}/register?cancelled=1`,
+      success_url: `${baseUrl(req)}/register/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${baseUrl(req)}/register?cancelled=1`,
     });
     res.redirect(checkoutSession.url);
   } catch (err) {
     console.error('[register] error:', err.message);
     res.redirect('/register?error=1');
   }
-});
+}));
 
-app.get('/register/success', async (req, res) => {
-  const { session_id } = req.query;
+app.get('/register/success', asyncRoute(async (req, res) => {
+  const session_id = str(req.query.session_id, 300);
   const pending = req.session.pending_registration;
   if (!session_id || !pending) return res.redirect('/register');
 
   try {
     const checkoutSession = await stripe.checkout.sessions.retrieve(session_id, { expand: ['subscription'] });
+    // The session_id comes from the URL, so it must belong to the Stripe customer
+    // this browser started registering; otherwise any other paid session id
+    // could be replayed to create an account.
+    const sessionCustomer = typeof checkoutSession.customer === 'string' ? checkoutSession.customer : checkoutSession.customer?.id;
+    if (!sessionCustomer || sessionCustomer !== pending.stripe_customer_id) {
+      console.error('[register/success] checkout session customer does not match pending registration');
+      return res.redirect('/register?cancelled=1');
+    }
     const allowed = ['paid', 'no_payment_required'];
     if (!allowed.includes(checkoutSession.payment_status)) return res.redirect('/register?cancelled=1');
 
@@ -562,19 +716,19 @@ app.get('/register/success', async (req, res) => {
       .run(shopId, pending.username, pending.email, pending.password_hash, pending.owner_name, now);
 
     const user = db.prepare('SELECT * FROM users WHERE id=?').get(userResult.lastInsertRowid);
-    const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(shopId);
+    // New session id on sign-in (prevents session fixation).
+    await new Promise((resolve, reject) => req.session.regenerate(e => e ? reject(e) : resolve()));
     req.session.user = { id: user.id, username: user.username, full_name: user.full_name, role: user.role, shop_id: user.shop_id };
-    req.session.shop = shop;
-    delete req.session.pending_registration;
+    await new Promise((resolve, reject) => req.session.save(e => e ? reject(e) : resolve()));
     res.redirect('/onboarding');
   } catch (err) {
     console.error('[register/success] error:', err.message);
     res.redirect('/register?cancelled=1');
   }
-});
+}));
 
 // ─── Onboarding ───────────────────────────────────────────────────────────────
-app.get('/onboarding', requireAuth, (req, res) => {
+app.get('/onboarding', requireRole('shop_admin'), (req, res) => {
   const user = req.session.user;
   const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(user.shop_id);
   res.send(layout('Welcome to CollisionIQ', `
@@ -617,10 +771,11 @@ app.get('/onboarding', requireAuth, (req, res) => {
     </div>`, '', user));
 });
 
-app.post('/onboarding', requireAuth, (req, res) => {
-  const { shop_name, city, state, phone, address } = req.body;
+app.post('/onboarding', requireRole('shop_admin'), (req, res) => {
+  const shop_name = str(req.body.shop_name, 200);
+  if (!shop_name) return res.redirect('/onboarding');
   db.prepare('UPDATE shops SET name=?, city=?, state=?, phone=?, address=? WHERE id=?')
-    .run(shop_name||'', city||'', state||'', phone||'', address||'', req.session.user.shop_id);
+    .run(shop_name, str(req.body.city, 100), str(req.body.state, 2), str(req.body.phone, 40), str(req.body.address, 200), req.session.user.shop_id);
   res.redirect('/');
 });
 
@@ -658,23 +813,36 @@ app.get('/login', (req, res) => {
   </div></div></body></html>`);
 });
 
-app.post('/login', authLimiter, async (req, res) => {
-  const { username, password } = req.body;
-  const user = db.prepare('SELECT * FROM users WHERE username=? AND active=1').get(username);
+app.post('/login', loginIpLimiter, loginUserLimiter, asyncRoute(async (req, res) => {
+  const username = str(req.body.username, 100);
+  const password = typeof req.body.password === 'string' ? req.body.password.slice(0, 200) : '';
+  const user = username ? db.prepare('SELECT * FROM users WHERE username=? AND active=1').get(username) : null;
   // Always run a compare so response timing doesn't reveal whether the username exists.
   const hash = user ? user.password_hash : '$2b$12$0000000000000000000000000000000000000000000000000000a';
   const match = await bcrypt.compare(password, hash);
-  if (!user || !match) return res.redirect('/login?error=1');
+  if (!user || !match || !password) {
+    res.locals.loginFailed = true;
+    return res.redirect('/login?error=1');
+  }
+  // New session id on sign-in (prevents session fixation).
+  await new Promise((resolve, reject) => req.session.regenerate(e => e ? reject(e) : resolve()));
   req.session.user = { id: user.id, username: user.username, full_name: user.full_name, role: user.role, shop_id: user.shop_id };
+  await new Promise((resolve, reject) => req.session.save(e => e ? reject(e) : resolve()));
   res.redirect('/');
-});
+}));
 
-app.get('/logout', (req, res) => { req.session.destroy(() => res.redirect('/login')); });
+// Logout is a CSRF-protected POST so another site can't sign users out.
+// GET /logout (old bookmarks) shows a one-button confirmation instead.
+app.post('/logout', (req, res) => { req.session.destroy(() => res.redirect('/login')); });
+app.get('/logout', (req, res) => {
+  if (!req.session.user) return res.redirect('/login');
+  res.send(layout('Sign out', `<div style="max-width:420px;margin:3rem auto;text-align:center"><h1>Sign out?</h1><form method="POST" action="/logout" style="margin-top:1rem">${csrfField(req)}<button type="submit" class="btn btn-primary">Sign out</button> <a href="/" class="btn btn-ghost">Cancel</a></form></div>`, '', req.session.user));
+});
 
 // ─── Jobs List ────────────────────────────────────────────────────────────────
 app.get('/', requireAuth, requireSubscription, (req, res) => {
   const flash = consumeFlash(req);
-  const search = (req.query.search || '').trim();
+  const search = str(req.query.search, 100);
   const user = req.session.user;
   const shopId = user.role === 'platform_admin' ? null : user.shop_id;
 
@@ -702,7 +870,7 @@ app.get('/', requireAuth, requireSubscription, (req, res) => {
 
   const content = `
     ${flash?`<div style="background:${flash.type==='success'?'#D6F0D6':'#FFD6D6'};color:${flash.type==='success'?'#1A6B1A':'#8B0000'};padding:.65rem 1rem;border-radius:6px;margin-bottom:1rem">${escapeHtml(flash.msg)}</div>`:''}
-    <div class="page-header"><h1>Jobs <span class="count-badge">${jobs.length}</span></h1><a href="/new" class="btn btn-primary">+ New Job</a></div>
+    <div class="page-header"><h1>Jobs <span class="count-badge">${jobs.length}</span></h1>${JOB_EDITORS.includes(user.role) ? '<a href="/new" class="btn btn-primary">+ New Job</a>' : ''}</div>
     <div class="search-bar"><form method="GET" action="/"><input type="text" name="search" placeholder="Search by RO#, VIN, or Technician…" value="${escapeHtml(search)}"><button type="submit" class="btn">Search</button>${search?'<a href="/" class="btn btn-ghost">Clear</a>':''}</form></div>
     <div class="table-wrap"><table class="data-table"><thead><tr><th>Job ID</th><th>RO #</th><th>Vehicle</th><th>Status</th><th>Photos</th><th>Date</th><th></th></tr></thead><tbody>${rows||'<tr><td colspan="7" class="empty">No jobs found.</td></tr>'}</tbody></table></div>`;
 
@@ -710,7 +878,7 @@ app.get('/', requireAuth, requireSubscription, (req, res) => {
 });
 
 // ─── New Job ──────────────────────────────────────────────────────────────────
-app.get('/new', requireAuth, requireSubscription, (req, res) => {
+app.get('/new', requireJobEditor, requireSubscription, (req, res) => {
   const repairOptions = ['Windshield','Front Camera Area','Front Bumper','Rear Bumper','Radar','Structural Body Repair','Airbag / SRS Deployment','Wheel Alignment','Suspension','Door / Mirror Repair','EV / Hybrid Vehicle','Other'];
   const checkboxes = repairOptions.map(r => `<label class="checkbox-label"><input type="checkbox" name="repairs" value="${escapeHtml(r)}"><span>${escapeHtml(r)}</span></label>`).join('');
   const zoneCheckboxes = Object.entries(ZONE_DISPLAY).map(([key, label]) =>
@@ -738,14 +906,14 @@ app.get('/new', requireAuth, requireSubscription, (req, res) => {
   res.send(layout('New Job', content, 'new', req.session.user));
 });
 
-app.post('/jobs', requireAuth, requireSubscription, (req, res) => {
-  const { ro, vin, year, make, model, trim, technicianName, otherRepairs } = req.body;
-  let repairs = req.body.repairs || [];
-  if (!Array.isArray(repairs)) repairs = [repairs];
-  if (otherRepairs && otherRepairs.trim()) repairs.push(otherRepairs.trim());
-  let impactZones = req.body.impact_zones || [];
-  if (!Array.isArray(impactZones)) impactZones = [impactZones];
-  impactZones = impactZones.filter(z => Object.prototype.hasOwnProperty.call(ZONE_DISPLAY, z));
+app.post('/jobs', requireJobEditor, requireSubscription, (req, res) => {
+  const ro = str(req.body.ro, 50), vin = str(req.body.vin, 17), year = str(req.body.year, 4);
+  const make = str(req.body.make, 50), model = str(req.body.model, 50), trim = str(req.body.trim, 50);
+  const technicianName = str(req.body.technicianName, 100), otherRepairs = str(req.body.otherRepairs, 300);
+  if (!ro) return res.status(400).send('RO number is required.');
+  const repairs = strList(req.body.repairs, 100);
+  if (otherRepairs) repairs.push(otherRepairs);
+  const impactZones = strList(req.body.impact_zones, 50).filter(z => Object.prototype.hasOwnProperty.call(ZONE_DISPLAY, z));
 
   const adas = runADASEngine(make, model, year, repairs);
   const adasRequired = adas.adasSystems && !adas.adasSystems.startsWith('No ADAS calibration flagged');
@@ -754,7 +922,7 @@ app.post('/jobs', requireAuth, requireSubscription, (req, res) => {
   const now = new Date().toISOString();
 
   db.prepare(`INSERT INTO jobs (jobId,ro,vin,year,make,model,trim,technicianName,repairsPerformed,adasSystems,rationale,liabilityWarning,makeSpecificNotes,preScanRequired,postScanRequired,approvedScanTool,status,shareToken,shareUrl,createdAt,updatedAt,last_changed,shop_id,created_by,impact_areas) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Created',?,?,?,?,?,?,?,?)`)
-    .run(jobId, ro||'', (vin||'').toUpperCase(), year||'', make||'', model||'', trim||'', technicianName||'',
+    .run(jobId, ro, vin.toUpperCase(), year, make, model, trim, technicianName,
       repairs.join(', '), adas.adasSystems, adas.rationale, adas.liabilityWarning, adas.makeSpecificNotes,
       adas.preScanRequired, adas.postScanRequired, adas.approvedScanTool,
       shareToken, `/share/${shareToken}`, now, now, now,
@@ -804,7 +972,7 @@ app.get('/jobs/:jobId', requireAuth, requireSubscription, (req, res) => {
           <div><span class="meta-label">Photos</span> ${photoStatusBadge(job.photo_status || 'red')}</div>
         </div>
         <div class="doc-actions no-print">
-          <button onclick="window.print()" class="btn btn-white">&#128438; Print / Save PDF</button>
+          <button type="button" data-action="print" class="btn btn-white">&#128438; Print / Save PDF</button>
           <a href="/jobs/${encodeURIComponent(job.jobId)}/photos" class="btn btn-white">&#128247; Photos</a>
           ${['platform_admin','shop_admin','service_writer'].includes(user.role) ? `<a href="/jobs/${encodeURIComponent(job.jobId)}/edit" class="btn btn-white">&#9998; Edit</a>` : ''}
           <a href="/" class="btn btn-ghost-white">Back</a>
@@ -835,7 +1003,7 @@ app.get('/jobs/:jobId', requireAuth, requireSubscription, (req, res) => {
       <section class="doc-section"><h2 class="doc-section-title">Make-Specific Notes</h2><div class="notes-box"><p>${escapeHtml(job.makeSpecificNotes)||'—'}</p></div></section>
       <section class="doc-section no-print"><h2 class="doc-section-title">Insurer Link</h2>
         ${activeToken
-          ? `<div><code id="shareUrl">${escapeHtml(req.protocol+'://'+req.get('host')+'/share/'+activeToken.token)}</code> <button onclick="navigator.clipboard.writeText(document.getElementById('shareUrl').textContent)" class="btn btn-sm">Copy</button> <form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/share/revoke" style="display:inline">${csrfField(req)}<button class="btn btn-sm" style="border-color:#c0392b;color:#c0392b">Revoke</button></form></div>`
+          ? `<div><code id="shareUrl">${escapeHtml(req.protocol+'://'+req.get('host')+'/share/'+activeToken.token)}</code> <button type="button" data-copy-target="shareUrl" class="btn btn-sm">Copy</button> <form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/share/revoke" style="display:inline">${csrfField(req)}<button class="btn btn-sm" style="border-color:#c0392b;color:#c0392b">Revoke</button></form></div>`
           : `<form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/share">${csrfField(req)}<button class="btn btn-primary btn-sm">Generate Insurer Link</button></form>`}
       </section>
       <div class="doc-footer"><p>Generated by CollisionIQ — Job ID: ${escapeHtml(job.jobId)} — &copy; 2026 Cueljuris LLC</p></div>
@@ -845,7 +1013,7 @@ app.get('/jobs/:jobId', requireAuth, requireSubscription, (req, res) => {
 });
 
 // ─── Edit Job ─────────────────────────────────────────────────────────────────
-app.get('/jobs/:jobId/edit', requireAuth, requireSubscription, (req, res) => {
+app.get('/jobs/:jobId/edit', requireJobEditor, requireSubscription, (req, res) => {
   const user = req.session.user;
   const job = ownedJob(req);
   if (!job) return res.status(404).send('Not found');
@@ -876,20 +1044,21 @@ app.get('/jobs/:jobId/edit', requireAuth, requireSubscription, (req, res) => {
   res.send(layout(`Edit ${job.jobId}`, content, '', user));
 });
 
-app.post('/jobs/:jobId/edit', requireAuth, requireSubscription, (req, res) => {
+app.post('/jobs/:jobId/edit', requireJobEditor, requireSubscription, (req, res) => {
   const job = ownedJob(req);
   if (!job) return res.status(404).send('Not found');
-  const { ro, vin, year, make, model, trim, technicianName } = req.body;
-  let repairs = req.body.repairs || [];
-  if (!Array.isArray(repairs)) repairs = [repairs];
+  const ro = str(req.body.ro, 50), vin = str(req.body.vin, 17), year = str(req.body.year, 4);
+  const make = str(req.body.make, 50), model = str(req.body.model, 50), trim = str(req.body.trim, 50);
+  const technicianName = str(req.body.technicianName, 100);
+  const repairs = strList(req.body.repairs, 100);
   const adas = runADASEngine(make, model, year, repairs);
   const now = new Date().toISOString();
   db.prepare(`UPDATE jobs SET ro=?,vin=?,year=?,make=?,model=?,trim=?,technicianName=?,repairsPerformed=?,adasSystems=?,rationale=?,liabilityWarning=?,makeSpecificNotes=?,preScanRequired=?,postScanRequired=?,approvedScanTool=?,updatedAt=?,last_changed=? WHERE jobId=?`)
-    .run(ro||'', (vin||'').toUpperCase(), year||'', make||'', model||'', trim||'', technicianName||'',
+    .run(ro, vin.toUpperCase(), year, make, model, trim, technicianName,
       repairs.join(', '), adas.adasSystems, adas.rationale, adas.liabilityWarning, adas.makeSpecificNotes,
-      adas.preScanRequired, adas.postScanRequired, adas.approvedScanTool, now, now, req.params.jobId);
+      adas.preScanRequired, adas.postScanRequired, adas.approvedScanTool, now, now, job.jobId);
   setFlash(req, 'success', 'Job updated.');
-  res.redirect(`/jobs/${encodeURIComponent(req.params.jobId)}`);
+  res.redirect(`/jobs/${encodeURIComponent(job.jobId)}`);
 });
 
 // ─── Photo Documentation ────────────────────────────────────────────────────
@@ -905,6 +1074,12 @@ app.get('/jobs/:jobId/photos', requireAuth, requireSubscription, (req, res) => {
 
   const slots = db.prepare('SELECT * FROM job_photos WHERE job_id=? ORDER BY layer, zone, id').all(job.jobId);
   const status = calculatePhotoStatus(slots);
+  const canUpload = canUploadPhotos(req.session.user, job);
+  const uploadForm = (s, label, cls) => !canUpload ? '' :
+    `<form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/photos/${s.id}" enctype="multipart/form-data">${csrfField(req)}
+       <input type="file" name="photo" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" required style="font-size:.75rem;margin-bottom:.4rem;width:100%">
+       <button type="submit" class="${cls}" style="width:100%">${label}</button>
+     </form>`;
 
   const groups = {};
   for (const s of slots) {
@@ -921,14 +1096,8 @@ app.get('/jobs/:jobId/photos', requireAuth, requireSubscription, (req, res) => {
             <div style="font-size:.85rem;font-weight:600;margin-bottom:.5rem">${escapeHtml(s.display)}${s.is_recommended ? ' <span style="color:#999;font-weight:400">(recommended)</span>' : ''}</div>
             ${s.file_path
               ? `<img src="/jobs/${encodeURIComponent(job.jobId)}/photos/${s.id}/file" style="width:100%;border-radius:4px;margin-bottom:.5rem;display:block" alt="${escapeHtml(s.display)}">
-                 <form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/photos/${s.id}" enctype="multipart/form-data">${csrfField(req)}
-                   <input type="file" name="photo" accept="image/*" required style="font-size:.75rem;margin-bottom:.4rem;width:100%">
-                   <button type="submit" class="btn btn-sm" style="width:100%">Replace</button>
-                 </form>`
-              : `<form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/photos/${s.id}" enctype="multipart/form-data">${csrfField(req)}
-                   <input type="file" name="photo" accept="image/*" required style="font-size:.75rem;margin-bottom:.4rem;width:100%">
-                   <button type="submit" class="btn btn-primary btn-sm" style="width:100%">Upload</button>
-                 </form>`}
+                 ${uploadForm(s, 'Replace', 'btn btn-sm')}`
+              : (uploadForm(s, 'Upload', 'btn btn-primary btn-sm') || '<div style="color:#999;font-size:.8rem">Not uploaded</div>')}
           </div>`).join('')}
       </div>
     </div>`).join('');
@@ -950,21 +1119,24 @@ app.post('/jobs/:jobId/photos/:photoId', requireAuth, requireSubscription, (req,
     return res.status(403).send('Invalid or expired form token. Please go back, refresh the page, and try again.');
   }
 
+  const discard = () => { if (req.file) fs.unlink(req.file.path, () => {}); };
   const job = ownedJob(req);
-  if (!job) {
-    if (req.file) fs.unlink(req.file.path, () => {});
-    return res.status(404).send('Not found');
+  if (!job) { discard(); return res.status(404).send('Not found'); }
+  if (!canUploadPhotos(req.session.user, job)) {
+    discard();
+    return res.status(403).send(job.status === 'Closed' ? 'This job is closed. Photos cannot be changed.' : 'Your role cannot upload photos.');
   }
   const slot = db.prepare('SELECT * FROM job_photos WHERE id=? AND job_id=?').get(req.params.photoId, job.jobId);
-  if (!slot) {
-    if (req.file) fs.unlink(req.file.path, () => {});
-    return res.status(404).send('Photo slot not found');
-  }
+  if (!slot) { discard(); return res.status(404).send('Photo slot not found'); }
   if (!req.file) return res.status(400).send('No file uploaded.');
+  if (!imageSignatureMatches(req.file.path, req.file.mimetype)) {
+    discard();
+    return res.status(400).send('The uploaded file is not a valid image.');
+  }
 
   // Replacing an existing photo — remove the old file from disk.
   if (slot.file_path) {
-    fs.unlink(path.join(uploadsDir, slot.file_path), () => {});
+    fs.unlink(path.join(uploadsDir, path.basename(slot.file_path)), () => {});
   }
 
   db.prepare(`UPDATE job_photos SET file_path=?, original_name=?, mime_type=?, size_bytes=?, uploaded_by=?, uploaded_at=? WHERE id=?`)
@@ -980,29 +1152,36 @@ app.get('/jobs/:jobId/photos/:photoId/file', requireAuth, requireSubscription, (
   const slot = db.prepare('SELECT * FROM job_photos WHERE id=? AND job_id=?').get(req.params.photoId, job.jobId);
   if (!slot || !slot.file_path) return res.status(404).send('Not found');
 
-  const filePath = path.join(uploadsDir, slot.file_path);
-  if (!filePath.startsWith(uploadsDir)) return res.status(400).send('Invalid path'); // defense in depth against path traversal
-  res.type(slot.mime_type || 'application/octet-stream');
+  // file_path is always a server-generated name; resolve + prefix check is defense in depth.
+  const root = path.resolve(uploadsDir);
+  const filePath = path.resolve(root, slot.file_path);
+  if (!filePath.startsWith(root + path.sep)) return res.status(400).send('Invalid path');
+  res.type(IMAGE_EXT[slot.mime_type] ? slot.mime_type : 'application/octet-stream');
+  res.set('Cache-Control', 'private, max-age=0');
   res.sendFile(filePath, (err) => {
     if (err && !res.headersSent) res.status(404).send('File not found');
   });
 });
 
 // ─── Share Link ───────────────────────────────────────────────────────────────
-app.post('/jobs/:jobId/share', requireAuth, (req, res) => {
+// Creating a link needs an active subscription; revoking does not, and links
+// that already exist keep working for insurers (see /share/:token).
+app.post('/jobs/:jobId/share', requireAuth, requireSubscription, (req, res) => {
   const job = ownedJob(req);
   if (!job) return res.status(404).send('Not found');
   const token = crypto.randomUUID();
-  db.prepare('INSERT INTO share_tokens (job_id, token, created_at) VALUES (?,?,?)').run(req.params.jobId, token, new Date().toISOString());
-  res.redirect(`/jobs/${encodeURIComponent(req.params.jobId)}`);
+  db.prepare('INSERT INTO share_tokens (job_id, token, created_at) VALUES (?,?,?)').run(job.jobId, token, new Date().toISOString());
+  res.redirect(`/jobs/${encodeURIComponent(job.jobId)}`);
 });
 app.post('/jobs/:jobId/share/revoke', requireAuth, (req, res) => {
   const job = ownedJob(req);
   if (!job) return res.status(404).send('Not found');
-  db.prepare('UPDATE share_tokens SET revoked=1 WHERE job_id=? AND revoked=0').run(req.params.jobId);
-  res.redirect(`/jobs/${encodeURIComponent(req.params.jobId)}`);
+  db.prepare('UPDATE share_tokens SET revoked=1 WHERE job_id=? AND revoked=0').run(job.jobId);
+  res.redirect(`/jobs/${encodeURIComponent(job.jobId)}`);
 });
 app.get('/share/:token', (req, res) => {
+  res.set('Referrer-Policy', 'no-referrer');
+  res.set('X-Robots-Tag', 'noindex');
   const row = db.prepare('SELECT * FROM share_tokens WHERE token=? AND revoked=0').get(req.params.token);
   if (!row) return res.status(404).send(layout('Link Expired', '<div class="error-page"><h1>Link Not Found or Revoked</h1></div>'));
   const job = db.prepare('SELECT * FROM jobs WHERE jobId=?').get(row.job_id);
@@ -1020,66 +1199,76 @@ app.get('/admin', requireAdmin, (req, res) => {
     ? db.prepare('SELECT * FROM jobs WHERE shop_id=? ORDER BY createdAt DESC').all(shopId)
     : db.prepare('SELECT * FROM jobs ORDER BY createdAt DESC').all();
   const statusOptions = ['Created','In Progress','Calibration Complete','Closed'];
-  const rows = jobs.map(j => `<tr><td><span class="job-id">${escapeHtml(j.jobId)}</span></td><td>${escapeHtml(j.ro)||'—'}</td><td>${escapeHtml(j.year)} ${escapeHtml(j.make)} ${escapeHtml(j.model)}</td><td>${escapeHtml(j.technicianName)||'—'}</td><td><form method="POST" action="/jobs/${encodeURIComponent(j.jobId)}/status" class="inline-form">${csrfField(req)}<select name="status" onchange="this.form.submit()" class="status-select">${statusOptions.map(s=>`<option value="${s}"${j.status===s?' selected':''}>${s}</option>`).join('')}</select></form></td><td>${formatDate(j.createdAt)}</td><td><a href="/jobs/${encodeURIComponent(j.jobId)}" class="btn btn-sm">View</a></td></tr>`).join('');
+  const rows = jobs.map(j => `<tr><td><span class="job-id">${escapeHtml(j.jobId)}</span></td><td>${escapeHtml(j.ro)||'—'}</td><td>${escapeHtml(j.year)} ${escapeHtml(j.make)} ${escapeHtml(j.model)}</td><td>${escapeHtml(j.technicianName)||'—'}</td><td><form method="POST" action="/jobs/${encodeURIComponent(j.jobId)}/status" class="inline-form">${csrfField(req)}<select name="status" data-autosubmit class="status-select">${statusOptions.map(s=>`<option value="${s}"${j.status===s?' selected':''}>${s}</option>`).join('')}</select></form></td><td>${formatDate(j.createdAt)}</td><td><a href="/jobs/${encodeURIComponent(j.jobId)}" class="btn btn-sm">View</a></td></tr>`).join('');
   const content = `<div class="page-header"><h1>Admin — Job Management <span class="count-badge">${jobs.length}</span></h1></div><div class="table-wrap"><table class="data-table"><thead><tr><th>Job ID</th><th>RO #</th><th>Vehicle</th><th>Technician</th><th>Status</th><th>Date</th><th></th></tr></thead><tbody>${rows||'<tr><td colspan="7" class="empty">No jobs.</td></tr>'}</tbody></table></div>`;
   res.send(layout('Admin', content, 'admin', user));
 });
 
-app.post('/jobs/:jobId/status', requireAdmin, (req, res) => {
+app.post('/jobs/:jobId/status', requireAdmin, requireSubscription, (req, res) => {
   const valid = ['Created','In Progress','Calibration Complete','Closed'];
   if (!valid.includes(req.body.status)) return res.status(400).send('Invalid status');
   const job = ownedJob(req);
   if (!job) return res.status(404).send('Not found');
-  db.prepare('UPDATE jobs SET status=?, updatedAt=?, last_changed=? WHERE jobId=?').run(req.body.status, new Date().toISOString(), new Date().toISOString(), req.params.jobId);
+  const now = new Date().toISOString();
+  db.prepare('UPDATE jobs SET status=?, updatedAt=?, last_changed=? WHERE jobId=?').run(req.body.status, now, now, job.jobId);
   res.redirect('/admin');
 });
 
 // ─── User Management ──────────────────────────────────────────────────────────
-app.get('/admin/users', requireAdmin, (req, res) => {
+app.get('/admin/users', requireAdmin, requireSubscription, (req, res) => {
   const user = req.session.user;
   const users = user.role === 'platform_admin'
     ? db.prepare('SELECT id,full_name,username,email,role,active,created_at FROM users ORDER BY created_at DESC').all()
     : db.prepare('SELECT id,full_name,username,email,role,active,created_at FROM users WHERE shop_id=? ORDER BY created_at DESC').all(user.shop_id);
   const roleOptions = ['shop_admin','qc_manager','technician','service_writer'];
-  const rows = users.map(u => `<tr><td>${escapeHtml(u.full_name||'—')}</td><td class="mono">${escapeHtml(u.username)}</td><td>${escapeHtml(u.email||'—')}</td><td><span class="badge badge-blue">${escapeHtml(u.role)}</span></td><td><span class="badge badge-${u.active?'green':'gray'}">${u.active?'Active':'Inactive'}</span></td><td><form method="POST" action="/admin/users/${u.id}/role" style="display:inline">${csrfField(req)}<select name="role" onchange="this.form.submit()">${roleOptions.map(r=>`<option value="${r}"${u.role===r?' selected':''}>${r}</option>`).join('')}</select></form>${u.active?`<form method="POST" action="/admin/users/${u.id}/deactivate" style="display:inline;margin-left:.5rem">${csrfField(req)}<button class="btn btn-sm btn-ghost">Deactivate</button></form>`:''}</td></tr>`).join('');
+  const rows = users.map(u => `<tr><td>${escapeHtml(u.full_name||'—')}</td><td class="mono">${escapeHtml(u.username)}</td><td>${escapeHtml(u.email||'—')}</td><td><span class="badge badge-blue">${escapeHtml(u.role)}</span></td><td><span class="badge badge-${u.active?'green':'gray'}">${u.active?'Active':'Inactive'}</span></td><td>${u.id === user.id || u.role === 'platform_admin' ? '<span style="color:#999">—</span>' : `<form method="POST" action="/admin/users/${u.id}/role" style="display:inline">${csrfField(req)}<select name="role" data-autosubmit>${roleOptions.map(r=>`<option value="${r}"${u.role===r?' selected':''}>${r}</option>`).join('')}</select></form>${u.active?`<form method="POST" action="/admin/users/${u.id}/deactivate" style="display:inline;margin-left:.5rem">${csrfField(req)}<button class="btn btn-sm btn-ghost">Deactivate</button></form>`:''}`}</td></tr>`).join('');
   const content = `<div class="page-header"><h1>Users <span class="count-badge">${users.length}</span></h1></div>
     <div class="doc-section" style="margin-bottom:2rem"><h2 class="doc-section-title">Add New User</h2><form method="POST" action="/admin/users/create" style="display:grid;gap:1rem;max-width:520px">${csrfField(req)}<div class="form-group"><label>Full Name</label><input type="text" name="full_name" required placeholder="Jane Smith"></div><div class="form-group"><label>Username</label><input type="text" name="username" required autocomplete="off"></div><div class="form-group"><label>Email</label><input type="email" name="email" placeholder="optional"></div><div class="form-group"><label>Temporary Password</label><input type="password" name="password" required autocomplete="new-password"></div><div class="form-group"><label>Role</label><select name="role">${roleOptions.map(r=>`<option value="${r}">${r}</option>`).join('')}</select></div><button type="submit" class="btn btn-primary">Create User</button></form></div>
     <div class="table-wrap"><table class="data-table"><thead><tr><th>Name</th><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead><tbody>${rows||'<tr><td colspan="6" class="empty">No users.</td></tr>'}</tbody></table></div>`;
   res.send(layout('Users', content, 'users', user));
 });
 
-app.post('/admin/users/create', requireAdmin, async (req, res) => {
-  const { full_name, username, email, password, role } = req.body;
+app.post('/admin/users/create', requireAdmin, requireSubscription, asyncRoute(async (req, res) => {
+  const full_name = str(req.body.full_name, 100), username = str(req.body.username, 100), email = str(req.body.email, 254);
+  const password = typeof req.body.password === 'string' ? req.body.password : '';
+  const role = str(req.body.role, 30);
   const allowed = ['shop_admin','qc_manager','technician','service_writer'];
   if (!allowed.includes(role)) return res.status(400).send('Invalid role');
-  if (!password || password.length < 8) return res.redirect('/admin/users?error=1');
+  if (!username || password.length < 8) return res.redirect('/admin/users?error=1');
   try {
     const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
     db.prepare('INSERT INTO users (shop_id,username,email,password_hash,role,full_name,created_at) VALUES (?,?,?,?,?,?,?)')
-      .run(req.session.user.shop_id, username, email||null, hash, role, full_name||'', new Date().toISOString());
+      .run(req.session.user.shop_id ?? null, username, email || null, hash, role, full_name, new Date().toISOString());
   } catch(e) { return res.redirect('/admin/users?error=1'); }
   res.redirect('/admin/users');
-});
+}));
 
-app.post('/admin/users/:id/role', requireAdmin, (req, res) => {
-  const allowed = ['shop_admin','qc_manager','technician','service_writer'];
-  if (!allowed.includes(req.body.role)) return res.status(400).send('Invalid role');
-  const target = db.prepare('SELECT shop_id, role FROM users WHERE id=?').get(req.params.id);
+// Shared checks for changing another user. Returns an error response or null.
+function guardUserChange(req, res) {
+  const id = Number.parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(404).send('Not found');
+  const target = db.prepare('SELECT id, shop_id, role FROM users WHERE id=?').get(id);
   const me = req.session.user;
   if (!target) return res.status(404).send('Not found');
   if (target.role === 'platform_admin') return res.status(403).send('Access denied.');
   if (me.role !== 'platform_admin' && target.shop_id !== me.shop_id) return res.status(403).send('Access denied.');
-  db.prepare('UPDATE users SET role=? WHERE id=?').run(req.body.role, req.params.id);
+  // An admin demoting or deactivating themselves can lock the shop out of admin.
+  if (target.id === me.id) return res.status(400).send('You cannot change your own account here.');
+  req.targetUserId = target.id;
+  return null;
+}
+
+app.post('/admin/users/:id/role', requireAdmin, requireSubscription, (req, res) => {
+  const allowed = ['shop_admin','qc_manager','technician','service_writer'];
+  if (!allowed.includes(req.body.role)) return res.status(400).send('Invalid role');
+  if (guardUserChange(req, res)) return;
+  db.prepare('UPDATE users SET role=? WHERE id=?').run(req.body.role, req.targetUserId);
   res.redirect('/admin/users');
 });
 
-app.post('/admin/users/:id/deactivate', requireAdmin, (req, res) => {
-  const target = db.prepare('SELECT shop_id, role FROM users WHERE id=?').get(req.params.id);
-  const me = req.session.user;
-  if (!target) return res.status(404).send('Not found');
-  if (target.role === 'platform_admin') return res.status(403).send('Access denied.');
-  if (me.role !== 'platform_admin' && target.shop_id !== me.shop_id) return res.status(403).send('Access denied.');
-  db.prepare('UPDATE users SET active=0 WHERE id=?').run(req.params.id);
+app.post('/admin/users/:id/deactivate', requireAdmin, requireSubscription, (req, res) => {
+  if (guardUserChange(req, res)) return;
+  db.prepare('UPDATE users SET active=0 WHERE id=?').run(req.targetUserId);
   res.redirect('/admin/users');
 });
 
@@ -1097,17 +1286,29 @@ app.get('/platform/shops', requirePlatformAdmin, (req, res) => {
   res.send(layout('Shops', content, 'shops', req.session.user));
 });
 
-app.post('/platform/shops/create', requirePlatformAdmin, async (req, res) => {
-  const { shop_name, admin_full_name, admin_username, admin_password } = req.body;
+app.post('/platform/shops/create', requirePlatformAdmin, asyncRoute(async (req, res) => {
+  const shop_name = str(req.body.shop_name, 200), admin_full_name = str(req.body.admin_full_name, 100);
+  const admin_username = str(req.body.admin_username, 100);
+  const admin_password = typeof req.body.admin_password === 'string' ? req.body.admin_password : '';
   if (!shop_name || !admin_username || !admin_password) return res.status(400).send('Missing required fields');
   if (admin_password.length < 8) return res.status(400).send('Password must be at least 8 characters');
+  if (db.prepare('SELECT 1 FROM users WHERE username=?').get(admin_username)) return res.status(409).send('That username is already taken.');
   const hash = await bcrypt.hash(admin_password, BCRYPT_ROUNDS);
   const now = new Date().toISOString();
-  const shopId = db.prepare('INSERT INTO shops (name,created_at) VALUES (?,?)').run(shop_name, now).lastInsertRowid;
-  db.prepare('INSERT INTO users (shop_id,username,password_hash,role,full_name,created_at) VALUES (?,?,?,?,?,?)')
-    .run(shopId, admin_username, hash, 'shop_admin', admin_full_name||'', now);
+  // Shop + admin user together, so a failed user insert never leaves an orphan shop.
+  db.exec('BEGIN');
+  try {
+    const shopId = db.prepare('INSERT INTO shops (name,created_at) VALUES (?,?)').run(shop_name, now).lastInsertRowid;
+    db.prepare('INSERT INTO users (shop_id,username,password_hash,role,full_name,created_at) VALUES (?,?,?,?,?,?)')
+      .run(shopId, admin_username, hash, 'shop_admin', admin_full_name, now);
+    db.exec('COMMIT');
+  } catch (err) {
+    db.exec('ROLLBACK');
+    console.error('[platform/shops/create]', err.message);
+    return res.status(400).send('Could not create shop.');
+  }
   res.redirect('/platform/shops');
-});
+}));
 
 app.get('/platform/billing', requirePlatformAdmin, (req, res) => {
   const shops = db.prepare('SELECT * FROM shops ORDER BY name ASC').all();
@@ -1117,7 +1318,7 @@ app.get('/platform/billing', requirePlatformAdmin, (req, res) => {
 });
 
 // ─── ADAS Reference ───────────────────────────────────────────────────────────
-app.get('/reference', requireAuth, (req, res) => {
+app.get('/reference', requireAuth, requireSubscription, (req, res) => {
   const makes = ['Toyota','Lexus','Ford','Lincoln','Chevrolet','GMC','Buick','Cadillac','Chrysler','Dodge','Ram','Jeep','Honda','Acura','Nissan','Infiniti','Kia','Hyundai','Genesis','Subaru','Mazda','Mercedes-Benz','Jaguar','Land Rover','Volvo','Tesla'];
   const makeOptions = makes.map(m => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('');
   const years = []; for (let y=2026;y>=2010;y--) years.push(y);
@@ -1132,8 +1333,8 @@ app.get('/reference', requireAuth, (req, res) => {
   res.send(layout('ADAS Reference', content, 'reference', req.session.user));
 });
 
-app.get('/reference/lookup', requireAuth, (req, res) => {
-  const { make, model, year } = req.query;
+app.get('/reference/lookup', requireAuth, requireSubscription, (req, res) => {
+  const make = str(req.query.make, 50), model = str(req.query.model, 50), year = str(req.query.year, 4);
   if (!make) return res.redirect('/reference');
   const allRepairs = ['Windshield','Front Camera Area','Front Bumper','Rear Bumper','Radar','Wheel Alignment','Suspension','Door','Mirror','Airbag','SRS'];
   const full = runADASEngine(make, model, year, allRepairs);
@@ -1141,7 +1342,7 @@ app.get('/reference/lookup', requireAuth, (req, res) => {
   const content = `
     <div class="ref-back-bar no-print"><a href="/reference" class="btn btn-ghost">&larr; New Lookup</a></div>
     <div class="ref-card">
-      <div class="ref-card-header"><div><div class="ref-card-brand">CollisionIQ — ADAS OEM Reference</div><div class="ref-card-vehicle">${escapeHtml([year,make,model].filter(Boolean).join(' '))}</div></div><div class="ref-card-actions no-print"><button onclick="window.print()" class="btn btn-white">&#128438; Print</button></div></div>
+      <div class="ref-card-header"><div><div class="ref-card-brand">CollisionIQ — ADAS OEM Reference</div><div class="ref-card-vehicle">${escapeHtml([year,make,model].filter(Boolean).join(' '))}</div></div><div class="ref-card-actions no-print"><button type="button" data-action="print" class="btn btn-white">&#128438; Print</button></div></div>
       <section class="ref-section"><h2 class="ref-section-title">Scan Requirements</h2>
         <div class="ref-scan-grid">
           <div class="ref-scan-item"><div>Pre-Repair Scan</div><span class="badge scan-badge scan-badge-${scanBadgeClass(full.preScanRequired)}">${escapeHtml(scanBadgeLabel(full.preScanRequired))}</span></div>
@@ -1151,9 +1352,53 @@ app.get('/reference/lookup', requireAuth, (req, res) => {
       </section>
       <section class="ref-section"><h2 class="ref-section-title">Calibration Requirements</h2><ul class="adas-list">${adasList.map(s=>`<li class="adas-item"><span class="adas-flag">&#9888;</span><span>${escapeHtml(s)}</span></li>`).join('')}</ul></section>
       <section class="ref-section"><h2 class="ref-section-title">Liability Notice</h2><div class="warning-box"><span class="warning-icon">&#9888;</span><p>${escapeHtml(full.liabilityWarning)}</p></div></section>
-      <section class="ref-section no-print"><a href="/new?make=${encodeURIComponent(make)}&model=${encodeURIComponent(model||'')}&year=${encodeURIComponent(year||'')}" class="btn btn-primary btn-lg">+ Start New Job — ${escapeHtml(make)}</a></section>
+      ${!JOB_EDITORS.includes(req.session.user.role) ? '' : `<section class="ref-section no-print"><a href="/new?make=${encodeURIComponent(make)}&model=${encodeURIComponent(model||'')}&year=${encodeURIComponent(year||'')}" class="btn btn-primary btn-lg">+ Start New Job — ${escapeHtml(make)}</a></section>`}
     </div>`;
   res.send(layout(`ADAS Reference — ${make}`, content, 'reference', req.session.user));
+});
+
+// ─── OEM Calibration Evaluation API ───────────────────────────────────────────
+// JSON body: { _csrf, make, model, year, lineItems: [eventId...], dtcs: [code...] }
+// lineItems are repair event IDs from oemCalibrationRules.EVENTS (e.g. 'WINDSHIELD_REPLACED').
+// CSRF is enforced by the global verifyCsrf middleware via the _csrf body field.
+const OEM_MAX_ITEMS = 100;
+function oemStringList(value, field) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new Error(`${field} must be an array of strings.`);
+  if (value.length > OEM_MAX_ITEMS) throw new Error(`${field} may contain at most ${OEM_MAX_ITEMS} entries.`);
+  return value.map((v) => {
+    if (typeof v !== 'string' || !v.trim() || v.length > 64) throw new Error(`${field} entries must be non-empty strings (max 64 chars).`);
+    return v.trim();
+  });
+}
+
+app.post('/api/oem/evaluate', requireAuth, requireSubscription, (req, res) => {
+  const { make, model, year } = req.body || {};
+  if (typeof make !== 'string' || !make.trim() || make.length > 64) {
+    return res.status(400).json({ error: 'make is required (string, max 64 chars).' });
+  }
+  if (model !== undefined && model !== null && (typeof model !== 'string' || model.length > 64)) {
+    return res.status(400).json({ error: 'model must be a string (max 64 chars).' });
+  }
+  if (year !== undefined && year !== null && year !== '' && !/^\d{4}$/.test(String(year))) {
+    return res.status(400).json({ error: 'year must be a 4-digit year.' });
+  }
+
+  let events, dtcs;
+  try {
+    events = oemStringList(req.body.lineItems, 'lineItems');
+    dtcs = oemStringList(req.body.dtcs, 'dtcs');
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+
+  try {
+    const result = oemRules.evaluate({ make: make.trim(), model: model ? model.trim() : null, year, events, dtcs });
+    res.json(result);
+  } catch (err) {
+    console.error('[oem/evaluate]', err);
+    res.status(500).json({ error: 'OEM evaluation failed.' });
+  }
 });
 
 // ─── Seed Platform Admin ──────────────────────────────────────────────────────
@@ -1182,6 +1427,18 @@ async function seedPlatformAdmin() {
     console.log('Platform admin created from PLATFORM_ADMIN_PASSWORD env var.');
   }
 }
+
+// ─── Error handler ────────────────────────────────────────────────────────────
+// Last in the chain: anything thrown (or passed to next(err)) ends here instead
+// of crashing the process or leaking a stack trace to the browser.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  console.error(`[error] ${req.method} ${req.originalUrl}:`, err && err.stack ? err.stack : err);
+  if (res.headersSent) return;
+  const status = err && Number.isInteger(err.status) && err.status >= 400 && err.status < 600 ? err.status : 500;
+  if (req.path.startsWith('/api/')) return res.status(status).json({ error: status === 500 ? 'Internal error.' : 'Bad request.' });
+  res.status(status).send(status === 500 ? 'Something went wrong. Please try again.' : 'Bad request.');
+});
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 seedPlatformAdmin().then(() => {
