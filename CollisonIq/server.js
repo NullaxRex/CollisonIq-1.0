@@ -398,11 +398,21 @@ const authLimiter = rateLimit({
 // one NAT'd IP at shift start isn't locked out. Per-IP caps spraying across
 // accounts; per-username caps guessing against one account from many IPs.
 const loginFailed = (req, res) => !res.locals.loginFailed;
+// Logs why a sign-in failed and for which username. Never the password.
+// The username is JSON-quoted so stray spaces show and control characters can't forge log lines.
+function logLoginFailure(req, reason) {
+  console.log(`login failed: reason=${reason} username=${JSON.stringify(str(req.body && req.body.username, 100))}`);
+}
+const lockedOut = (scope) => (req, res, next, options) => {
+  logLoginFailure(req, `locked_out (${scope})`);
+  res.status(options.statusCode).send(options.message);
+};
 const loginIpLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, max: 30,
   skipSuccessfulRequests: true, requestWasSuccessful: loginFailed,
   standardHeaders: true, legacyHeaders: false,
   message: 'Too many failed sign-in attempts. Please try again in 15 minutes.',
+  handler: lockedOut('ip'),
 });
 const loginUserLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, max: 10,
@@ -410,6 +420,7 @@ const loginUserLimiter = rateLimit({
   keyGenerator: (req) => 'user:' + str(req.body && req.body.username, 100).toLowerCase(),
   standardHeaders: true, legacyHeaders: false,
   message: 'Too many failed sign-in attempts for this account. Please try again in 15 minutes.',
+  handler: lockedOut('username'),
 });
 
 // ─── Stripe webhook (must be BEFORE the JSON body parser) ──────────────────────
@@ -816,11 +827,14 @@ app.get('/login', (req, res) => {
 app.post('/login', loginIpLimiter, loginUserLimiter, asyncRoute(async (req, res) => {
   const username = str(req.body.username, 100);
   const password = typeof req.body.password === 'string' ? req.body.password.slice(0, 200) : '';
-  const user = username ? db.prepare('SELECT * FROM users WHERE username=? AND active=1').get(username) : null;
+  // Looked up without the active filter only so the log can say "inactive"; inactive users still fail.
+  const user = username ? db.prepare('SELECT * FROM users WHERE username=?').get(username) : null;
   // Always run a compare so response timing doesn't reveal whether the username exists.
   const hash = user ? user.password_hash : '$2b$12$0000000000000000000000000000000000000000000000000000a';
   const match = await bcrypt.compare(password, hash);
-  if (!user || !match || !password) {
+  if (!user || !user.active || !match || !password) {
+    const reason = !username || !password ? 'other' : !user ? 'unknown_user' : !user.active ? 'inactive' : 'bad_password';
+    logLoginFailure(req, reason);
     res.locals.loginFailed = true;
     return res.redirect('/login?error=1');
   }
@@ -1443,6 +1457,14 @@ async function applyPlatformAdminPasswordReset() {
   const pw = process.env.PLATFORM_ADMIN_PASSWORD_RESET;
   if (!pw) return;
   try {
+    // One-line diagnostic before any rule runs. Never the value or the hash.
+    {
+      const name = process.env.PLATFORM_ADMIN_USERNAME || 'platform_admin';
+      const u = db.prepare("SELECT active, shop_id, password_hash FROM users WHERE username=? AND role='platform_admin'").get(name);
+      console.log(u
+        ? `platform_admin reset diagnostic: username=${JSON.stringify(name)} active=${u.active} shop_id=${u.shop_id === null ? 'null' : u.shop_id} env_matches_stored_hash=${Boolean(u.password_hash) && await bcrypt.compare(pw, u.password_hash)}`
+        : `platform_admin reset diagnostic: username=${JSON.stringify(name)} not found with role platform_admin`);
+    }
     // Pasted values often pick up a trailing newline or space. That would be hashed as
     // part of the password, so the typed password would never match. Refuse instead.
     if (/[\r\n\u2028\u2029]/.test(pw)) return console.log('platform_admin password reset skipped: value contains a line break.');

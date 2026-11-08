@@ -99,7 +99,8 @@ function addSessions() {
     check(`${label} → boots, logs reason, changes nothing`,
       r.started && reason.test(r.out) && !/reset applied/.test(r.out) && adminHash() === original && sessionIds() === 'admin,other',
       r.out.split('\n').find((l) => /password reset/.test(l)) || '');
-    check(`${label} → value not printed`, !r.out.includes(value) && !r.out.includes(value.trim()) && !r.out.includes(CORE));
+    check(`${label} → diagnostic line still printed`, /^platform_admin reset diagnostic: username="platform_admin" active=1 shop_id=null env_matches_stored_hash=false$/m.test(r.out));
+    check(`${label} → value not printed`,!r.out.includes(value) && !r.out.includes(value.trim()) && !r.out.includes(CORE));
   }
 
   // Valid value aimed at a username that does not exist: skipped, and the username is named.
