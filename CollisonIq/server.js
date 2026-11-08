@@ -1428,6 +1428,51 @@ async function seedPlatformAdmin() {
   }
 }
 
+// ─── One-time platform_admin password reset ───────────────────────────────────
+// For hosts without shell access. Same rules as scripts/set-platform-admin-password.js.
+// Set PLATFORM_ADMIN_PASSWORD_RESET, deploy once, then remove the variable.
+// Never logs the value. Any problem is logged briefly and boot continues unchanged.
+const KNOWN_DEFAULT_PASSWORDS = ['changeme123', 'demo1234', 'localadmin123'];
+const DEMO_USERNAMES = ['metro_admin','metro_qc','metro_tech1','metro_tech2','metro_writer','north_admin','north_qc','north_tech1','north_writer',
+  'south_admin','south_qc','south_tech1','south_writer','premier_admin','premier_qc','premier_tech1','premier_tech2','premier_writer',
+  'gulf_admin','gulf_qc','gulf_tech1','gulf_writer'];
+const DEMO_SHOP_NAMES = ['Metro Collision Center','Northside Auto Repair','Southbelt Body Works','Premier ADAS & Collision','Gulf Coast Auto Service'];
+
+async function applyPlatformAdminPasswordReset() {
+  const pw = process.env.PLATFORM_ADMIN_PASSWORD_RESET;
+  if (!pw) return;
+  try {
+    if (pw.length < 12) return console.log('platform_admin password reset skipped: value is shorter than 12 characters.');
+    if (KNOWN_DEFAULT_PASSWORDS.includes(pw)) return console.log('platform_admin password reset skipped: value is a known default.');
+    const username = process.env.PLATFORM_ADMIN_USERNAME || 'platform_admin';
+    const user = db.prepare("SELECT id, active, password_hash FROM users WHERE username=? AND role='platform_admin'").get(username);
+    if (!user) return console.log('platform_admin password reset skipped: platform_admin user not found.');
+
+    // The variable stays set across restarts; don't re-hash or sign out again each boot.
+    if (user.password_hash && await bcrypt.compare(pw, user.password_hash)) {
+      console.log('platform_admin password reset already applied; remove PLATFORM_ADMIN_PASSWORD_RESET.');
+    } else {
+      const hash = await bcrypt.hash(pw, BCRYPT_ROUNDS);
+      const r = db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hash, user.id);
+      if (r.changes !== 1) return console.log('platform_admin password reset skipped: update did not apply.');
+      sessionDb.prepare("DELETE FROM sessions WHERE json_extract(sess, '$.user.id') = ?").run(user.id);
+      console.log('platform_admin password reset applied');
+      if (!user.active) console.log('Note: platform_admin is marked inactive, so it still cannot sign in.');
+    }
+
+    // Read-only check: demo accounts must never exist in production.
+    const marks = (list) => list.map(() => '?').join(',');
+    const demo = db.prepare(`SELECT username FROM users WHERE username IN (${marks(DEMO_USERNAMES)})`).all(...DEMO_USERNAMES).map((x) => x.username);
+    const demoShops = db.prepare(`SELECT name FROM shops WHERE name IN (${marks(DEMO_SHOP_NAMES)})`).all(...DEMO_SHOP_NAMES).map((x) => x.name);
+    if (demo.length || demoShops.length) {
+      console.log(`WARNING: demo seed data present. Accounts: ${demo.join(', ') || 'none'}. Shops: ${demoShops.join(', ') || 'none'}.`);
+      console.log('         These share a publicly known demo password. Deactivate or remove them.');
+    }
+  } catch (err) {
+    console.log(`platform_admin password reset failed: ${err && err.message ? err.message : 'unknown error'}`);
+  }
+}
+
 // ─── Error handler ────────────────────────────────────────────────────────────
 // Last in the chain: anything thrown (or passed to next(err)) ends here instead
 // of crashing the process or leaking a stack trace to the browser.
@@ -1441,6 +1486,6 @@ app.use((err, req, res, next) => {
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
-seedPlatformAdmin().then(() => {
+seedPlatformAdmin().then(applyPlatformAdminPasswordReset).then(() => {
   app.listen(PORT, () => console.log(`CollisionIQ running on http://localhost:${PORT}`));
 });
