@@ -1431,7 +1431,8 @@ async function seedPlatformAdmin() {
 // ─── One-time platform_admin password reset ───────────────────────────────────
 // For hosts without shell access. Same rules as scripts/set-platform-admin-password.js.
 // Set PLATFORM_ADMIN_PASSWORD_RESET, deploy once, then remove the variable.
-// Never logs the value. Any problem is logged briefly and boot continues unchanged.
+// Never logs the value; logs the target username (quoted, so stray spaces show).
+// Any problem is logged briefly and boot continues unchanged.
 const KNOWN_DEFAULT_PASSWORDS = ['changeme123', 'demo1234', 'localadmin123'];
 const DEMO_USERNAMES = ['metro_admin','metro_qc','metro_tech1','metro_tech2','metro_writer','north_admin','north_qc','north_tech1','north_writer',
   'south_admin','south_qc','south_tech1','south_writer','premier_admin','premier_qc','premier_tech1','premier_tech2','premier_writer',
@@ -1442,22 +1443,27 @@ async function applyPlatformAdminPasswordReset() {
   const pw = process.env.PLATFORM_ADMIN_PASSWORD_RESET;
   if (!pw) return;
   try {
+    // Pasted values often pick up a trailing newline or space. That would be hashed as
+    // part of the password, so the typed password would never match. Refuse instead.
+    if (/[\r\n\u2028\u2029]/.test(pw)) return console.log('platform_admin password reset skipped: value contains a line break.');
+    if (pw !== pw.trim()) return console.log('platform_admin password reset skipped: value has leading or trailing whitespace.');
     if (pw.length < 12) return console.log('platform_admin password reset skipped: value is shorter than 12 characters.');
     if (KNOWN_DEFAULT_PASSWORDS.includes(pw)) return console.log('platform_admin password reset skipped: value is a known default.');
     const username = process.env.PLATFORM_ADMIN_USERNAME || 'platform_admin';
+    const who = JSON.stringify(username);
     const user = db.prepare("SELECT id, active, password_hash FROM users WHERE username=? AND role='platform_admin'").get(username);
-    if (!user) return console.log('platform_admin password reset skipped: platform_admin user not found.');
+    if (!user) return console.log(`platform_admin password reset skipped: no platform_admin user with username ${who}.`);
 
     // The variable stays set across restarts; don't re-hash or sign out again each boot.
     if (user.password_hash && await bcrypt.compare(pw, user.password_hash)) {
-      console.log('platform_admin password reset already applied; remove PLATFORM_ADMIN_PASSWORD_RESET.');
+      console.log(`platform_admin password reset already applied to username ${who}; remove PLATFORM_ADMIN_PASSWORD_RESET.`);
     } else {
       const hash = await bcrypt.hash(pw, BCRYPT_ROUNDS);
       const r = db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hash, user.id);
-      if (r.changes !== 1) return console.log('platform_admin password reset skipped: update did not apply.');
+      if (r.changes !== 1) return console.log(`platform_admin password reset skipped: update did not apply to username ${who}.`);
       sessionDb.prepare("DELETE FROM sessions WHERE json_extract(sess, '$.user.id') = ?").run(user.id);
-      console.log('platform_admin password reset applied');
-      if (!user.active) console.log('Note: platform_admin is marked inactive, so it still cannot sign in.');
+      console.log(`platform_admin password reset applied to username ${who}`);
+      if (!user.active) console.log(`Note: username ${who} is marked inactive, so it still cannot sign in.`);
     }
 
     // Read-only check: demo accounts must never exist in production.
