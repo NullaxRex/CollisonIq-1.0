@@ -393,7 +393,46 @@ function normalizeMake(make) {
 // Events every make recognizes; they add review flags, not calibrations.
 const COMMON_EVENTS = {
   BATTERY_DISCONNECT: '12V battery disconnected',
+  // Door / mirror / side panel work (side camera verification, all makes)
+  DOOR_LEFT_RI: 'Driver door removed/installed or replaced',
+  DOOR_RIGHT_RI: 'Front passenger door removed/installed or replaced',
+  DOOR_LEFT_ADJUST: 'Driver door adjusted',
+  DOOR_RIGHT_ADJUST: 'Front passenger door adjusted',
+  DOOR_LEFT_COLLISION_REPAIR: 'Collision repair to the driver door',
+  DOOR_RIGHT_COLLISION_REPAIR: 'Collision repair to the front passenger door',
+  MIRROR_LEFT_RI: 'Left mirror assembly removed/installed or replaced',
+  MIRROR_RIGHT_RI: 'Right mirror assembly removed/installed or replaced',
+  SIDE_PANEL_LEFT_REPAIR: 'Left side panel repaired or replaced (fender, quarter panel or rocker)',
+  SIDE_PANEL_RIGHT_REPAIR: 'Right side panel repaired or replaced (fender, quarter panel or rocker)',
 };
+
+// CollisionIQ field rule (founder, I-CAR PL3 ADAS technician; build list 4.3).
+// Not an OEM requirement: a documentation requirement on top of OEM rules.
+const SIDE_CAMERA_TRIGGERS = {
+  Left: ['DOOR_LEFT_RI', 'DOOR_LEFT_ADJUST', 'DOOR_LEFT_COLLISION_REPAIR', 'MIRROR_LEFT_RI', 'MIRROR_LEFT_ADJUST', 'SIDE_PANEL_LEFT_REPAIR'],
+  Right: ['DOOR_RIGHT_RI', 'DOOR_RIGHT_ADJUST', 'DOOR_RIGHT_COLLISION_REPAIR', 'MIRROR_RIGHT_RI', 'MIRROR_RIGHT_ADJUST', 'SIDE_PANEL_RIGHT_REPAIR'],
+};
+const SIDE_CAMERA_TEXT =
+  'Side mirror camera(s) must be inspected and verified through calibration setup procedure. Confirm lens clarity, correct aim, and full system function regardless of whether camera unit was replaced.';
+
+function sideCameraVerifications(events) {
+  const out = [];
+  for (const [side, triggers] of Object.entries(SIDE_CAMERA_TRIGGERS)) {
+    const hits = triggers.filter((e) => events.includes(e));
+    if (!hits.length) continue;
+    out.push({
+      id: `SIDE_CAMERA_VERIFICATION_${side.toUpperCase()}`,
+      side,
+      name: `${side} side mirror camera — inspection and verification`,
+      required: true,
+      text: SIDE_CAMERA_TEXT,
+      reasons: hits.map((e) => ({ event: e, label: COMMON_EVENTS[e] || ford.EVENTS[e] || e })),
+      basis: 'CollisionIQ field rule, not an OEM requirement. Applies to all makes; it adds a documentation step and does not replace OEM calibration requirements.',
+      failureModes: ['Camera angle shifted by mirror or door removal', 'Lens contamination from compound or overspray', 'Heat from adjacent panel work', 'Impact shock'],
+    });
+  }
+  return out;
+}
 
 function batteryFlag() {
   const t = (register.GENERIC_TRIGGERS || []).find((g) => /battery disconnect/i.test(g.event || ''));
@@ -409,11 +448,20 @@ function batteryFlag() {
 
 const isFord = (make) => ['ford', 'lincoln'].includes(norm(make));
 
+// A common event the make's own rules also use (e.g. Honda DOOR_LEFT_RI) is
+// passed through to them; otherwise it is handled here only.
+function makeKnows(input, e) {
+  const make = normalizeMake(input.make);
+  if (make) return Boolean(EVENTS[e]);
+  if (isFord(input.make) && ford.findVehicle(input.model, input.year)) return Boolean(ford.EVENTS[e]);
+  return false;
+}
+
 function evaluate(input = {}) {
   const all = (input.events || []).map(String);
-  const common = all.filter((e) => COMMON_EVENTS[e]);
-  const result = evaluateMake({ ...input, events: all.filter((e) => !COMMON_EVENTS[e]) });
-  if (common.includes('BATTERY_DISCONNECT')) result.flags.unshift(batteryFlag());
+  const result = evaluateMake({ ...input, events: all.filter((e) => !COMMON_EVENTS[e] || makeKnows(input, e)) });
+  if (all.includes('BATTERY_DISCONNECT')) result.flags.unshift(batteryFlag());
+  result.verifications = sideCameraVerifications(all);
   return result;
 }
 

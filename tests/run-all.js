@@ -13,6 +13,7 @@ const SUITES = [
   ['platform_admin reset hook', 'admin-reset-hook-test.js'],
   ['login failure diagnostics', 'login-diagnostics-test.js'],
   ['Ford calibration rules', 'ford-rules-test.js'],
+  ['side camera field rule', 'side-camera-rule-test.js'],
 ];
 
 console.log(`Node ${process.version}`);
