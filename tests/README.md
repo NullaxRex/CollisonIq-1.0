@@ -26,6 +26,6 @@ Without npm: `node tests/run-all.js` from the repo root, or
 | `migration-test.js` | Boot migrations run twice: `job_photos` rebuild and v1 `jobs` ADD COLUMN, idempotent, no data changes |
 | `bcrypt-compat-test.js` | Hashes made by bcrypt 5 still verify with the installed bcrypt |
 | `ford-rules-test.js` | Ford calibration trigger rules from the I-CAR matrix (18 vehicles): triggers, operation checks, camera variants, coverage limits; battery disconnect flag for all makes; Honda unchanged |
-| `side-camera-rule-test.js` | CollisionIQ field rule: door, mirror or side panel work → side mirror camera verification for every make, alongside OEM rules |
+| `field-rules-test.js` | CollisionIQ universal field rules for every make: side cameras (doors, mirrors, fenders), front radar and camera (front damage, bumper off, Subaru note), rear camera and parking aids (any rear-end work), blind spot ↔ parking aids; OEM results unchanged |
 | `password-script-test.js` | `CollisonIq/scripts/set-platform-admin-password.js` on a throwaway DB |
 | `run-all.js` | Runs all of the above and prints a summary; exits non-zero on any failure |
