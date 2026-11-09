@@ -1372,8 +1372,10 @@ app.get('/reference/lookup', requireAuth, requireSubscription, (req, res) => {
 });
 
 // ─── OEM Calibration Evaluation API ───────────────────────────────────────────
-// JSON body: { _csrf, make, model, year, lineItems: [eventId...], dtcs: [code...] }
-// lineItems are repair event IDs from oemCalibrationRules.EVENTS (e.g. 'WINDSHIELD_REPLACED').
+// JSON body: { _csrf, make, model, year, lineItems: [eventId...], dtcs: [code...],
+//             collisionRelated?: boolean, equipped?: { SYSTEM_ID: boolean } }
+// lineItems are repair event IDs: oemCalibrationRules.EVENTS (Honda/Acura),
+// oemFordRules.EVENTS (covered Fords) or COMMON_EVENTS (all makes).
 // CSRF is enforced by the global verifyCsrf middleware via the _csrf body field.
 const OEM_MAX_ITEMS = 100;
 function oemStringList(value, field) {
@@ -1406,8 +1408,25 @@ app.post('/api/oem/evaluate', requireAuth, requireSubscription, (req, res) => {
     return res.status(400).json({ error: err.message });
   }
 
+  const { collisionRelated, equipped } = req.body;
+  if (collisionRelated !== undefined && collisionRelated !== null && typeof collisionRelated !== 'boolean') {
+    return res.status(400).json({ error: 'collisionRelated must be true or false.' });
+  }
+  let equippedClean;
+  if (equipped !== undefined && equipped !== null) {
+    const entries = typeof equipped === 'object' && !Array.isArray(equipped) ? Object.entries(equipped) : null;
+    if (!entries || entries.length > 20 || entries.some(([k, v]) => !/^[A-Z0-9_]{1,32}$/.test(k) || typeof v !== 'boolean')) {
+      return res.status(400).json({ error: 'equipped must be an object of SYSTEM_ID: true/false.' });
+    }
+    equippedClean = Object.fromEntries(entries);
+  }
+
   try {
-    const result = oemRules.evaluate({ make: make.trim(), model: model ? model.trim() : null, year, events, dtcs });
+    const result = oemRules.evaluate({
+      make: make.trim(), model: model ? model.trim() : null, year, events, dtcs,
+      ...(collisionRelated === true ? { collisionRelated: true } : {}),
+      ...(equippedClean ? { equipped: equippedClean } : {}),
+    });
     res.json(result);
   } catch (err) {
     console.error('[oem/evaluate]', err);

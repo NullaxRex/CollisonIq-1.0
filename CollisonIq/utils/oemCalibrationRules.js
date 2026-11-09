@@ -1,5 +1,6 @@
 'use strict';
 const register = require('./oemSourceRegister');
+const ford = require('./oemFordRules');
 /**
  * CollisionIQ — OEM Calibration Trigger Rules: Honda & Acura
  * (All other makes: scan policy + sources from oemSourceRegister.js)
@@ -389,9 +390,41 @@ function normalizeMake(make) {
   return null;
 }
 
+// Events every make recognizes; they add review flags, not calibrations.
+const COMMON_EVENTS = {
+  BATTERY_DISCONNECT: '12V battery disconnected',
+};
+
+function batteryFlag() {
+  const t = (register.GENERIC_TRIGGERS || []).find((g) => /battery disconnect/i.test(g.event || ''));
+  return {
+    level: 'warning',
+    code: 'BATTERY_DISCONNECT_REVIEW',
+    text: t
+      ? `12V battery disconnect: ${t.checks}. Source: ${t.sourceToConsult}. ${t.limitation}.`
+      : '12V battery disconnect: review module initialization and relearns per the OEM battery disconnect procedure. Not a blanket ADAS calibration.',
+    evidenceToSave: t ? t.evidenceToSave : 'Disconnect time, voltages, relearns',
+  };
+}
+
+const isFord = (make) => ['ford', 'lincoln'].includes(norm(make));
+
 function evaluate(input = {}) {
+  const all = (input.events || []).map(String);
+  const common = all.filter((e) => COMMON_EVENTS[e]);
+  const result = evaluateMake({ ...input, events: all.filter((e) => !COMMON_EVENTS[e]) });
+  if (common.includes('BATTERY_DISCONNECT')) result.flags.unshift(batteryFlag());
+  return result;
+}
+
+function evaluateMake(input) {
   const make = normalizeMake(input.make);
   const scan = register.scanPolicy(input.make);
+
+  if (!make && isFord(input.make)) {
+    const fordResult = ford.evaluateFord(input, scan);
+    if (fordResult) return fordResult;
+  }
 
   if (!make) {
     // No encoded calibration rules: return scan policy, OEM sources and the
@@ -410,6 +443,13 @@ function evaluate(input = {}) {
           code: 'CAL_RULES_NOT_ENCODED',
           text: `Calibration trigger rules for ${input.make} are not encoded yet. Determine required calibrations from the VIN-specific OEM repair manual.`,
         },
+        ...(isFord(input.make)
+          ? [{
+              level: 'info',
+              code: 'FORD_MODEL_NOT_COVERED',
+              text: `Ford trigger rules cover only: ${ford.coverageText()}. This vehicle is not one of them.`,
+            }]
+          : []),
         ...(scan.flags || []),
       ],
       disclaimer:
@@ -577,6 +617,8 @@ module.exports = {
   TOOLS,
   ATTESTATION,
   vehicleProfile,
+  COMMON_EVENTS,
   evaluate,
   listEvents: () => Object.entries(EVENTS).map(([id, label]) => ({ id, label })),
+  listFordEvents: ford.listEvents,
 };

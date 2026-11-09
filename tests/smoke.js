@@ -430,6 +430,16 @@ const userId = (username) => DB.prepare('SELECT id FROM users WHERE username=?')
   r = await postJson(admin, { _csrf: apiTok, make: 'Honda', lineItems: ['BOGUS_EVENT'], dtcs: ['X1234'] });
   j = {}; try { j = JSON.parse(r.text); } catch {}
   check('OEM API: unknown events/DTCs flagged', r.status === 200 && j.flags?.some((f) => f.code === 'UNKNOWN_EVENTS') && j.flags?.some((f) => f.code === 'DTC_NOT_IN_RULESET'));
+  r = await postJson(admin, { _csrf: apiTok, make: 'Ford', model: 'Bronco Sport', year: 2023, lineItems: ['LIFTGATE_HANDLE_LATCH_RI', 'BATTERY_DISCONNECT'], collisionRelated: true, equipped: { CAMERA_360: false } });
+  j = {}; try { j = JSON.parse(r.text); } catch {}
+  const fordSystems = (j.calibrations || []).map((c) => c.systemName).sort().join(',');
+  check('OEM API: Ford Bronco Sport evaluates from I-CAR matrix', r.status === 200 && j.ruleDepth === 'VEHICLE_MATRIX' && fordSystems === 'Cruise Control Module,Rear Parking Aid Camera' && j.flags?.some((f) => f.code === 'BATTERY_DISCONNECT_REVIEW'), `status ${r.status} systems=${fordSystems}`);
+  r = await postJson(admin, { _csrf: apiTok, make: 'Ford', model: 'Escape', year: 2023, lineItems: ['WINDSHIELD_REPLACED'] });
+  j = {}; try { j = JSON.parse(r.text); } catch {}
+  check('OEM API: uncovered Ford → scan-policy-only', r.status === 200 && j.ruleDepth === 'SCAN_POLICY_ONLY' && j.flags?.some((f) => f.code === 'FORD_MODEL_NOT_COVERED'));
+  r = await postJson(admin, { _csrf: apiTok, make: 'Ford', equipped: { CAMERA_360: 'yes' } }); check('OEM API: non-boolean equipped → 400', r.status === 400);
+  r = await postJson(admin, { _csrf: apiTok, make: 'Ford', equipped: ['CAMERA_360'] }); check('OEM API: array equipped → 400', r.status === 400);
+  r = await postJson(admin, { _csrf: apiTok, make: 'Ford', collisionRelated: 'true' }); check('OEM API: non-boolean collisionRelated → 400', r.status === 400);
   r = await postJson(admin, { _csrf: apiTok, lineItems: [] }); check('OEM API: missing make → 400', r.status === 400);
   r = await postJson(admin, { _csrf: apiTok, make: 'Honda', lineItems: 'WINDSHIELD_REPLACED' }); check('OEM API: non-array lineItems → 400', r.status === 400);
   r = await postJson(admin, { _csrf: apiTok, make: 'Honda', year: 'abc' }); check('OEM API: bad year → 400', r.status === 400);

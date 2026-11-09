@@ -25,5 +25,6 @@ Without npm: `node tests/run-all.js` from the repo root, or
 | `prod-boot-test.js` | Refuses to boot without `SESSION_SECRET` under `NODE_ENV=production` or on Railway; Secure cookies, HSTS, CSP; `seed-demo.js` refuses to run in production |
 | `migration-test.js` | Boot migrations run twice: `job_photos` rebuild and v1 `jobs` ADD COLUMN, idempotent, no data changes |
 | `bcrypt-compat-test.js` | Hashes made by bcrypt 5 still verify with the installed bcrypt |
+| `ford-rules-test.js` | Ford calibration trigger rules from the I-CAR matrix (18 vehicles): triggers, operation checks, camera variants, coverage limits; battery disconnect flag for all makes; Honda unchanged |
 | `password-script-test.js` | `CollisonIq/scripts/set-platform-admin-password.js` on a throwaway DB |
 | `run-all.js` | Runs all of the above and prints a summary; exits non-zero on any failure |
