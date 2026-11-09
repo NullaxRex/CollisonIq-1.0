@@ -1,0 +1,11 @@
+{
+  "name": "collisioniq-tests",
+  "private": true,
+  "description": "Test suites for CollisonIq/. Lives outside CollisonIq/ so it never deploys to Railway.",
+  "scripts": {
+    "test": "node run-all.js",
+    "test:node22": "npx -y -p node@22 node run-all.js",
+    "test:node26": "npx -y -p node@26 node run-all.js",
+    "test:both": "npm run test:node22 && npm run test:node26"
+  }
+}
