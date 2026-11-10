@@ -2013,3 +2013,86 @@ a:hover {
   .print-only { display: block !important; }
 }
 .print-only { display: none; }
+
+/* ─── Job form: grouped repair checkboxes (Nov 2026) ─────────────────────── */
+
+.repair-group {
+  border: 1px solid #e0e8f0;
+  border-radius: 6px;
+  padding: 0.75rem 1rem 1rem;
+  margin-bottom: 1rem;
+}
+
+.repair-group legend {
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #1a3a5c;
+  padding: 0 0.35rem;
+}
+
+.repair-sided-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 0.65rem;
+}
+
+.repair-sided {
+  border: 1px solid #e0e8f0;
+  border-radius: 5px;
+  background: #f7f9fc;
+  padding: 0.5rem 0.75rem;
+}
+
+.repair-sided-label {
+  display: block;
+  font-size: 0.875rem;
+  margin-bottom: 0.4rem;
+}
+
+.repair-sided-boxes {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.repair-sided-boxes .checkbox-label {
+  flex: 1;
+  background: #ffffff;
+}
+
+/* ─── Hard copy: rules-engine sections ───────────────────────────────────── */
+
+.adas-item-rich { font-weight: 400; }
+.adas-body { flex: 1; min-width: 0; }
+.adas-name { font-weight: 600; color: #1a3a5c; }
+.adas-loc { font-weight: 400; color: #5a7a96; }
+.adas-detail { font-size: 0.82rem; color: #4a5568; line-height: 1.55; margin-top: 0.2rem; }
+.adas-detail-label { font-weight: 600; color: #2c3e50; }
+.adas-make-note { color: #7d4e00; }
+.adas-none-rich { font-weight: 500; color: #4a5568; }
+.adas-basis { font-size: 0.85rem; color: #4a5568; line-height: 1.6; }
+.adas-basis-none { color: #8B5A00; font-weight: 600; }
+.adas-src-link { display: inline-block; font-size: 0.75rem; word-break: break-all; color: #2980b9; }
+.field-rules-section { background: #fffbea; }
+.field-flag { color: #b8860b; }
+.review-list li { margin-bottom: 0.35rem; }
+.review-critical { color: #8B0000; }
+.attest-list { list-style: none; columns: 2; column-gap: 1.5rem; font-size: 0.82rem; color: #4a5568; }
+.attest-list li { break-inside: avoid; margin-bottom: 0.3rem; }
+.attest-box { font-size: 1rem; margin-right: 0.25rem; }
+
+@media (max-width: 640px) {
+  .attest-list { columns: 1; }
+}
+
+@media print {
+  .field-rules-section {
+    background: #fffbea !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  .adas-src-link { color: #2c3e50 !important; text-decoration: none; }
+  .adas-section, .field-rules-section { page-break-inside: auto; }
+  .adas-item-rich { page-break-inside: avoid; }
+}
