@@ -10,6 +10,7 @@ const jobRepairs = require(path.join(APP_DIR, 'utils', 'jobRepairs'));
 const jobReport = require(path.join(APP_DIR, 'utils', 'jobReport'));
 const oem = require(path.join(APP_DIR, 'utils', 'oemCalibrationRules'));
 const ford = require(path.join(APP_DIR, 'utils', 'oemFordPosition'));
+const gm = require(path.join(APP_DIR, 'utils', 'oemGmPosition'));
 const rep = reporter();
 const { check } = rep;
 
@@ -23,10 +24,11 @@ const ALL = jobRepairs.OPTIONS.flatMap((o) => (o.sided ? [`${o.key}:L`, `${o.key
 const known = {
   honda: new Set([...Object.keys(oem.EVENTS), ...Object.keys(oem.COMMON_EVENTS)]),
   ford: new Set([...Object.keys(ford.EVENTS), ...Object.keys(oem.COMMON_EVENTS)]),
+  gm: new Set([...Object.keys(gm.EVENTS), ...Object.keys(oem.COMMON_EVENTS)]),
   default: new Set(Object.keys(oem.COMMON_EVENTS)),
 };
 for (const [make, model, year, fam] of [['Honda', 'Accord', 2022, 'honda'], ['Acura', 'MDX', 2022, 'honda'], ['Ford', 'F-150', 2025, 'ford'],
-  ['Ford', 'Escape', 2023, 'ford'], ['Lincoln', 'Corsair', 2024, 'ford'], ['Toyota', 'Camry', 2025, 'default'], ['Subaru', 'Outback', 2024, 'default']]) {
+  ['Ford', 'Escape', 2023, 'ford'], ['Lincoln', 'Corsair', 2024, 'ford'], ['Toyota', 'Camry', 2025, 'default'], ['Chevrolet', 'Silverado', 2024, 'gm'], ['Cadillac', 'Lyriq', 2025, 'gm'], ['Subaru', 'Outback', 2024, 'default']]) {
   const t = jobRepairs.toEvents(ALL, { make, model, year });
   const bad = t.events.filter((e) => !known[fam].has(e));
   const r = build(make, model, year, ALL);

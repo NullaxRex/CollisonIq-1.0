@@ -49,12 +49,12 @@ function scanText(value, policy) {
 }
 
 function ruleBasis(result, make) {
-  if (result.ruleDepth === 'OEM_JOB_AID') {
+  if (result.ruleDepth === 'OEM_JOB_AID' || result.ruleDepth === 'OEM_POSITION_STATEMENT') {
     const s = result.source;
     const related = (s.related || []).map((r) => `${r.title} (${r.date})`).join('; ');
     return {
-      kind: 'oem',
-      text: `${s.publisher}: ${s.title} (${s.date}), with ${related}. Procedures: ${s.procedures}.`,
+      kind: result.coverage === 'PARTIAL' ? 'partial' : 'oem',
+      text: `${s.publisher}: ${s.title} (${s.date}), with ${related}. Procedures: ${s.procedures}.${result.coverage === 'PARTIAL' ? ' These statements cover only part of the vehicle\'s ADAS; other calibrations come from the OEM service information for this VIN.' : ''}`,
       url: (s.related || []).map((r) => r.url).find(Boolean) || null,
     };
   }
@@ -164,6 +164,9 @@ function buildJobAdas({ make, model, year, repairValues }) {
       ? [`[OEM] Calibrations not encoded for ${make || 'this make'} — determine from VIN-specific OEM service information`]
       : []),
     ...cals.map((c) => `[OEM] ${c.systemName}${c.location ? ` — ${c.location}` : ''}`),
+    ...(result.coverage === 'PARTIAL'
+      ? [`[OEM] Other ${make} calibrations are vehicle-specific — determine from OEM service information for this VIN`]
+      : []),
     ...ops.map((o) => `[OEM operation check] ${o.systemName} — ${o.checks.join(', ')}`),
     ...vers.map((v) => `[CollisionIQ field rule] ${v.name}`),
   ];
@@ -205,7 +208,7 @@ const safeUrl = (u) => (/^https:\/\//i.test(String(u || '')) ? u : null);
 const link = (u) => (safeUrl(u) ? ` <a class="adas-src-link" href="${esc(u)}" rel="noopener noreferrer" target="_blank">${esc(u)}</a>` : '');
 const detail = (label, value) => (value ? `<div class="adas-detail"><span class="adas-detail-label">${esc(label)}</span> ${value}</div>` : '');
 const list = (a) => a.map(esc).join('; ');
-const SHOWN_ELSEWHERE = new Set(['FIELD_RULES_APPLIED', 'CAL_RULES_NOT_ENCODED']);
+const SHOWN_ELSEWHERE = new Set(['FIELD_RULES_APPLIED', 'CAL_RULES_NOT_ENCODED', 'GM_OTHER_CALIBRATIONS_IN_SI']);
 
 function renderCalibration(c) {
   const head = `${esc(c.systemName)}${c.location ? ` <span class="adas-loc">— ${esc(c.location)}</span>` : ''}`;
@@ -256,8 +259,11 @@ function renderSections(result, opts = {}) {
   const scanSource = scan.source || {};
   const flags = (result.flags || []).filter((f) => !SHOWN_ELSEWHERE.has(f.code));
 
-  const oemItems = cals.length
-    ? cals.map(renderCalibration).join('')
+  const partialNote = basis.kind === 'partial'
+    ? `<li class="adas-item adas-none-rich"><span class="adas-flag">&#9888;</span><span>Other calibrations for this vehicle are vehicle-specific: determine them from the OEM service information for this VIN.</span></li>`
+    : '';
+  const oemItems = cals.length || partialNote
+    ? cals.map(renderCalibration).join('') + partialNote
     : `<li class="adas-item adas-none-rich"><span class="adas-flag">${basis.kind === 'none' ? '&#9888;' : '&#10003;'}</span><span>${
         basis.kind === 'none'
           ? 'OEM calibrations for this vehicle come from the VIN-specific OEM service information (not encoded in CollisionIQ).'

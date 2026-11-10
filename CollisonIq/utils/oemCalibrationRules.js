@@ -1,10 +1,12 @@
 'use strict';
 const register = require('./oemSourceRegister');
 const fordPosition = require('./oemFordPosition'); // Ford / Lincoln: Ford's own job aid and position statements
+const gmPosition = require('./oemGmPosition'); // Chevrolet / Buick / GMC / Cadillac: GM position statements
 const fieldRules = require('./fieldRules');
 /**
  * CollisionIQ — OEM Calibration Trigger Rules: Honda & Acura
  * Ford / Lincoln: utils/oemFordPosition.js (Ford's job aid and statements).
+ * GM: utils/oemGmPosition.js (GM position statements; windshield camera only).
  * All other makes: scan policy + sources from oemSourceRegister.js.
  * -----------------------------------------------------------------------------
  * Facts abstracted (paraphrased, not reproduced) from American Honda job aids
@@ -422,6 +424,7 @@ function makeKnows(input, e) {
   const make = normalizeMake(input.make);
   if (make) return Boolean(EVENTS[e]);
   if (isFord(input.make)) return Boolean(fordPosition.EVENTS[e]);
+  if (gmPosition.isGm(input.make)) return Boolean(gmPosition.EVENTS[e]);
   return false;
 }
 
@@ -445,6 +448,7 @@ function evaluateMake(input) {
   const scan = register.scanPolicy(input.make);
 
   if (!make && isFord(input.make)) return fordPosition.evaluateFordPosition(input, scan);
+  if (!make && gmPosition.isGm(input.make)) return gmPosition.evaluateGmPosition(input, scan);
 
   if (!make) {
     // No encoded calibration rules: return scan policy, OEM sources and the

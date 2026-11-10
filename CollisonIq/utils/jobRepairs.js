@@ -87,9 +87,9 @@ const GROUPS = [
       { key: 'SRS', label: 'Airbag / SRS deployment', events: [], honda: ['SRS_DEPLOYMENT'], ford: ['FRONT_AIRBAG_DEPLOYMENT'], collision: true, review: 'Airbag/SRS deployment' },
       { key: 'HUD', label: 'Head-up display R&I / replaced', events: [], ford: ['HUD_RI'] },
       { key: 'INSTRUMENT_PANEL', label: 'Instrument panel R&I / replaced', events: [], ford: ['INSTRUMENT_PANEL_RI'] },
-      { key: 'ALIGNMENT', label: 'Wheel alignment', events: [], honda: ['WHEEL_ALIGNMENT'], ford: ['WHEEL_ALIGNMENT'] },
-      { key: 'SUSPENSION', label: 'Suspension repair', events: [], ford: ['SUSPENSION_REPAIR'] },
-      { key: 'TIRE_SIZE', label: 'Tire size changed', events: [], ford: ['TIRE_SIZE_CHANGE'] },
+      { key: 'ALIGNMENT', label: 'Wheel alignment', events: [], honda: ['WHEEL_ALIGNMENT'], ford: ['WHEEL_ALIGNMENT'], gm: ['WHEEL_ALIGNMENT'] },
+      { key: 'SUSPENSION', label: 'Suspension repair', events: [], ford: ['SUSPENSION_REPAIR'], gm: ['SUSPENSION_REPAIR'] },
+      { key: 'TIRE_SIZE', label: 'Tire size changed', events: [], ford: ['TIRE_SIZE_CHANGE'], gm: ['TIRE_SIZE_CHANGE'] },
       { key: 'BATTERY', label: '12V battery disconnected', events: ['BATTERY_DISCONNECT'] },
       { key: 'EV_HYBRID', label: 'EV / hybrid vehicle', events: [], review: 'HV EV post-crash' },
       { key: 'OTHER', label: 'Other', events: [] },
@@ -148,11 +148,12 @@ function normalizeValues(values) {
   return out.sort((a, b) => order.indexOf(a) - order.indexOf(b));
 }
 
-/** Rule family for the vehicle: 'honda', 'ford' (covered models only) or 'default'. */
+/** Rule family for the vehicle: 'honda', 'ford', 'gm' or 'default'. */
 function family(make, model, year) {
   const m = String(make || '').toLowerCase().replace(/[^a-z]/g, '');
   if (m === 'honda' || m === 'acura') return 'honda';
   if (m === 'ford' || m === 'lincoln') return 'ford';
+  if (['chevrolet', 'chevy', 'gmc', 'buick', 'cadillac'].includes(m)) return 'gm';
   return 'default';
 }
 
