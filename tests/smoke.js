@@ -177,6 +177,32 @@ const userId = (username) => DB.prepare('SELECT id FROM users WHERE username=?')
   r = await admin.post(`/jobs/${jobA}/edit`, { ...jobForm, model: 'Civic' });
   check('POST /jobs/:id/edit as shop_admin', r.status === 302);
 
+  // Job form → OEM rules engine → hard copy (Nov 2026)
+  heading('Job hard copy (rules engine)');
+  r = await admin.req('GET', '/new');
+  check('job form has side-specific door/mirror boxes and tailgate/fender/rear door options',
+    ['value="FRONT_DOOR_RI:L"', 'value="MIRROR_RI:R"', 'value="LIFTGATE_RI"', 'value="TRUNK_RI"', 'value="FENDER:L"', 'value="REAR_DOOR:R"', 'value="FRONT_DAMAGE"', 'value="REAR_DAMAGE"'].every((v) => r.text.includes(v)));
+  r = await admin.req('POST', '/jobs', [['_csrf', admin.token], ['ro', 'RO-F150'], ['year', '2025'], ['make', 'Ford'], ['model', 'F-150'], ['technicianName', 'Tech One'],
+    ['repairs', 'FRONT_BUMPER_RI'], ['repairs', 'FRONT_DOOR_RI:L'], ['repairs', 'MIRROR_RI:L'], ['repairs', 'LIFTGATE_RI']]);
+  const jobF = (r.location.match(/\/jobs\/(CIQ-[\w-]+)/) || [])[1];
+  check('Ford F-150 job created from new checkboxes', r.status === 302 && !!jobF);
+  r = await admin.req('GET', `/jobs/${jobF}`);
+  check('hard copy shows I-CAR Ford calibrations, operation checks and field rules',
+    ['OEM Calibrations Required', 'Cruise Control Module', 'Side Parking Aid Camera', 'Rear Parking Aid Camera', 'OEM Operation Checks',
+      'CollisionIQ Field Rules — Not OEM Requirements', 'Left side mirror camera', 'Rear camera — test and verify', 'I-CAR OEM Calibration Requirements Search'].every((t) => r.text.includes(t)));
+  check('hard copy has no old-engine lines or company marking', !/SODCM Blind Spot|No rationale generated|Cueljuris/.test(r.text.split('site-footer')[0]));
+  r = await admin.req('GET', `/jobs/${jobF}/edit`);
+  check('edit form keeps the checked boxes', /value="FRONT_DOOR_RI:L" checked/.test(r.text) && /value="LIFTGATE_RI" checked/.test(r.text) && !/value="FRONT_DOOR_RI:R" checked/.test(r.text));
+  r = await admin.req('GET', `/jobs/${jobA}/edit`);
+  check('legacy "Windshield" value maps to Windshield replaced', /value="WINDSHIELD_REPLACED" checked/.test(r.text));
+  if (DB) {
+    DB.prepare("UPDATE jobs SET adas_eval=NULL, repair_keys=NULL, repairsPerformed='Windshield, Door / Mirror Repair' WHERE jobId=?").run(jobB);
+    r = await admin.req('GET', `/jobs/${jobB}`);
+    check('job saved by the old engine still renders, with a re-run note', r.status === 200 && /Saved with the original engine/.test(r.text));
+    r = await admin.req('GET', `/jobs/${jobB}/edit`);
+    check('old job edit form converts labels (door repair both sides)', /value="FRONT_DOOR_REPAIR:L" checked/.test(r.text) && /value="FRONT_DOOR_REPAIR:R" checked/.test(r.text) && /saved with the old checkboxes/.test(r.text));
+  }
+
   // Photos
   heading('Photo uploads');
   r = await admin.req('GET', `/jobs/${jobA}/photos`);

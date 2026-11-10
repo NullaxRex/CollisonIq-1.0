@@ -18,6 +18,8 @@ const { csrfField, verifyCsrf, csrfTokenValid } = require('./utils/csrf');
 const { generatePhotoLabels, ZONE_DISPLAY } = require('./utils/photoLabels');
 const { calculatePhotoStatus, updateJobPhotoStatus } = require('./utils/photoStatus');
 const oemRules   = require('./utils/oemCalibrationRules'); // loads ./utils/oemSourceRegister
+const jobRepairs = require('./utils/jobRepairs');
+const jobReport  = require('./utils/jobReport');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -133,6 +135,8 @@ const JOBS_COLUMNS = [
   ['shareUrl','TEXT'], ['shop_id','INTEGER'], ['created_by','INTEGER'], ['createdAt','TEXT'],
   ['updatedAt','TEXT'], ['last_changed','TEXT'],
   ['mileage','TEXT'], ['service_date','TEXT'], ['assigned_tech','TEXT'], ['impact_areas','TEXT'], ['photo_status','TEXT'],
+  // Nov 2026: job form values (JSON {values, other}) and the full rules-engine result (JSON).
+  ['repair_keys','TEXT'], ['adas_eval','TEXT'],
 ];
 {
   const present = new Set(db.prepare('PRAGMA table_info(jobs)').all().map(c => c.name));
@@ -216,7 +220,11 @@ for (const [col, def] of [
   try { db.exec(`ALTER TABLE shops ADD COLUMN ${col} ${def}`); } catch(e) {}
 }
 
-// ─── ADAS Engine ──────────────────────────────────────────────────────────────
+// ─── Legacy ADAS Engine ───────────────────────────────────────────────────────
+// Keyword engine from the first build. Jobs no longer use it: the job form and
+// the hard copy go through utils/jobReport.js (oemCalibrationRules.evaluate()).
+// It now feeds only the /reference lookup page. Many of its lines have no
+// source; do not wire it into anything new.
 function runADASEngine(make, model, year, repairs) {
   const m = (make || '').toLowerCase();
   const r = Array.isArray(repairs) ? repairs.join(' ').toLowerCase() : (repairs || '').toLowerCase();
@@ -891,10 +899,36 @@ app.get('/', requireAuth, requireSubscription, (req, res) => {
   res.send(layout('Jobs', content, 'list', user));
 });
 
+// ─── Repair checkboxes (job form) ─────────────────────────────────────────────
+// Values come from utils/jobRepairs.js. Sided items have a Left and a Right box.
+function repairFieldsets(selected = []) {
+  const on = new Set(selected);
+  const box = (value, text) => `<label class="checkbox-label"><input type="checkbox" name="repairs" value="${escapeHtml(value)}"${on.has(value)?' checked':''}><span>${escapeHtml(text)}</span></label>`;
+  return jobRepairs.GROUPS.map(g => {
+    const items = g.options.map(o => o.sided
+      ? `<div class="repair-sided"><span class="repair-sided-label">${escapeHtml(o.label)}</span><div class="repair-sided-boxes">${box(`${o.key}:L`, 'Left')}${box(`${o.key}:R`, 'Right')}</div></div>`
+      : box(o.key, o.label)).join('');
+    return `<fieldset class="repair-group"><legend>${escapeHtml(g.title)}</legend><div class="${g.id==='sides'?'repair-sided-grid':'checkbox-grid'}">${items}</div></fieldset>`;
+  }).join('');
+}
+function storedRepairs(job) {
+  try {
+    const r = JSON.parse(job.repair_keys || 'null');
+    if (r && Array.isArray(r.values)) return { values: jobRepairs.normalizeValues(r.values), other: typeof r.other === 'string' ? r.other : '' };
+  } catch (e) {}
+  // Jobs saved before Nov 2026: old checkbox labels, comma-separated.
+  return { values: jobRepairs.normalizeValues((job.repairsPerformed || '').split(',').map(s => s.trim())), other: '' };
+}
+// Runs the repairs through the rules engine and returns the columns to save.
+function jobAdasColumns({ make, model, year, values, other }) {
+  const built = jobReport.buildJobAdas({ make, model, year, repairValues: values });
+  const cols = built.columns;
+  if (other) cols.repairsPerformed = [cols.repairsPerformed, `Other: ${other}`].filter(Boolean).join(', ');
+  return { ...cols, repair_keys: JSON.stringify({ values: built.result.input.repairValues, other }), adas_eval: JSON.stringify(built.result), adasRequired: built.adasRequired };
+}
+
 // ─── New Job ──────────────────────────────────────────────────────────────────
 app.get('/new', requireJobEditor, requireSubscription, (req, res) => {
-  const repairOptions = ['Windshield','Front Camera Area','Front Bumper','Rear Bumper','Radar','Structural Body Repair','Airbag / SRS Deployment','Wheel Alignment','Suspension','Door / Mirror Repair','EV / Hybrid Vehicle','Other'];
-  const checkboxes = repairOptions.map(r => `<label class="checkbox-label"><input type="checkbox" name="repairs" value="${escapeHtml(r)}"><span>${escapeHtml(r)}</span></label>`).join('');
   const zoneCheckboxes = Object.entries(ZONE_DISPLAY).map(([key, label]) =>
     `<label class="checkbox-label"><input type="checkbox" name="impact_zones" value="${escapeHtml(key)}"><span>${escapeHtml(label)}</span></label>`
   ).join('');
@@ -910,7 +944,7 @@ app.get('/new', requireJobEditor, requireSubscription, (req, res) => {
         <div class="form-group"><label>Trim</label><input type="text" name="trim" placeholder="e.g. XSE"></div>
         <div class="form-group"><label>Technician Name <span class="req">*</span></label><input type="text" name="technicianName" required placeholder="Full name"></div>
       </div></div>
-      <div class="form-section"><h2 class="section-heading">Repairs Performed</h2><div class="checkbox-grid">${checkboxes}</div>
+      <div class="form-section"><h2 class="section-heading">Repairs Performed</h2><p style="color:#666;font-size:.85rem;margin-bottom:.75rem">Check every operation on the estimate. These drive the OEM calibration rules and the CollisionIQ field rules on the hard copy.</p>${repairFieldsets()}
         <div class="form-group" style="margin-top:1rem"><label>Other Repairs</label><input type="text" name="otherRepairs" placeholder="Describe additional repairs…"></div>
       </div>
       <div class="form-section"><h2 class="section-heading">Impact Zones</h2><p style="color:#666;font-size:.85rem;margin-bottom:.75rem">Select every area with visible damage — this determines which photos are required for documentation.</p><div class="checkbox-grid">${zoneCheckboxes}</div>
@@ -925,22 +959,20 @@ app.post('/jobs', requireJobEditor, requireSubscription, (req, res) => {
   const make = str(req.body.make, 50), model = str(req.body.model, 50), trim = str(req.body.trim, 50);
   const technicianName = str(req.body.technicianName, 100), otherRepairs = str(req.body.otherRepairs, 300);
   if (!ro) return res.status(400).send('RO number is required.');
-  const repairs = strList(req.body.repairs, 100);
-  if (otherRepairs) repairs.push(otherRepairs);
   const impactZones = strList(req.body.impact_zones, 50).filter(z => Object.prototype.hasOwnProperty.call(ZONE_DISPLAY, z));
 
-  const adas = runADASEngine(make, model, year, repairs);
-  const adasRequired = adas.adasSystems && !adas.adasSystems.startsWith('No ADAS calibration flagged');
+  const adas = jobAdasColumns({ make, model, year, values: strList(req.body.repairs, 100), other: otherRepairs });
+  const adasRequired = adas.adasRequired;
   const jobId = generateJobId();
   const shareToken = crypto.randomBytes(16).toString('hex');
   const now = new Date().toISOString();
 
-  db.prepare(`INSERT INTO jobs (jobId,ro,vin,year,make,model,trim,technicianName,repairsPerformed,adasSystems,rationale,liabilityWarning,makeSpecificNotes,preScanRequired,postScanRequired,approvedScanTool,status,shareToken,shareUrl,createdAt,updatedAt,last_changed,shop_id,created_by,impact_areas) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Created',?,?,?,?,?,?,?,?)`)
+  db.prepare(`INSERT INTO jobs (jobId,ro,vin,year,make,model,trim,technicianName,repairsPerformed,adasSystems,rationale,liabilityWarning,makeSpecificNotes,preScanRequired,postScanRequired,approvedScanTool,status,shareToken,shareUrl,createdAt,updatedAt,last_changed,shop_id,created_by,impact_areas,repair_keys,adas_eval) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Created',?,?,?,?,?,?,?,?,?,?)`)
     .run(jobId, ro, vin.toUpperCase(), year, make, model, trim, technicianName,
-      repairs.join(', '), adas.adasSystems, adas.rationale, adas.liabilityWarning, adas.makeSpecificNotes,
+      adas.repairsPerformed, adas.adasSystems, adas.rationale, adas.liabilityWarning, adas.makeSpecificNotes,
       adas.preScanRequired, adas.postScanRequired, adas.approvedScanTool,
       shareToken, `/share/${shareToken}`, now, now, now,
-      req.session.user.shop_id || null, req.session.user.id, JSON.stringify(impactZones));
+      req.session.user.shop_id || null, req.session.user.id, JSON.stringify(impactZones), adas.repair_keys, adas.adas_eval);
 
   // Generate the required photo-documentation slots for this job and persist
   // them (unfilled) so the photo checklist knows what's outstanding.
@@ -970,6 +1002,7 @@ app.get('/jobs/:jobId', requireAuth, requireSubscription, (req, res) => {
   const adasList = job.adasSystems ? job.adasSystems.split('\n').filter(Boolean) : [];
   const rationaleList = job.rationale ? job.rationale.split('\n').filter(Boolean) : [];
   const activeToken = db.prepare('SELECT token FROM share_tokens WHERE job_id=? AND revoked=0 ORDER BY id DESC LIMIT 1').get(job.jobId);
+  const adasEval = jobReport.parseStored(job.adas_eval);
 
   const adasItems = adasList.length > 0
     ? adasList.map(s => `<li class="adas-item"><span class="adas-flag">&#9888;</span><span>${escapeHtml(s)}</span></li>`).join('')
@@ -978,7 +1011,7 @@ app.get('/jobs/:jobId', requireAuth, requireSubscription, (req, res) => {
   const content = `
     <div class="job-doc">
       <div class="job-doc-header">
-        <div><div class="doc-brand">CollisionIQ</div><div class="doc-owner">Cueljuris LLC</div></div>
+        <div><div class="doc-brand">CollisionIQ</div><div class="doc-owner">ADAS Calibration Documentation</div></div>
         <div class="doc-meta">
           <div><span class="meta-label">Job ID</span> ${escapeHtml(job.jobId)}</div>
           <div><span class="meta-label">Date</span> ${formatDate(job.createdAt)}</div>
@@ -1011,16 +1044,16 @@ app.get('/jobs/:jobId', requireAuth, requireSubscription, (req, res) => {
           <div class="scan-req-row scan-req-tool-row"><span class="scan-req-label">&#128295; Approved Scan Tool</span><span class="scan-tool-value">${escapeHtml(job.approvedScanTool||'Consult OEM service information')}</span></div>
         </div>
       </section>
-      <section class="doc-section adas-section"><h2 class="doc-section-title">ADAS Systems — Calibration Required</h2><ul class="adas-list">${adasItems}</ul></section>
-      <section class="doc-section"><h2 class="doc-section-title">Rationale</h2><ul class="rationale-list">${rationaleList.map(r=>`<li>${escapeHtml(r)}</li>`).join('')||'<li>No rationale generated.</li>'}</ul></section>
+      ${adasEval ? jobReport.renderSections(adasEval) : `<section class="doc-section adas-section"><h2 class="doc-section-title">ADAS Systems — Calibration Required</h2><p class="adas-basis no-print">Saved with the original engine. Open Edit and save to re-run this job through the current OEM and field rules.</p><ul class="adas-list">${adasItems}</ul></section>
+      <section class="doc-section"><h2 class="doc-section-title">Rationale</h2><ul class="rationale-list">${rationaleList.map(r=>`<li>${escapeHtml(r)}</li>`).join('')||'<li>No rationale generated.</li>'}</ul></section>`}
       <section class="doc-section warning-section"><h2 class="doc-section-title">Liability Warning</h2><div class="warning-box"><span class="warning-icon">&#9888;</span><p>${escapeHtml(job.liabilityWarning)||'—'}</p></div></section>
-      <section class="doc-section"><h2 class="doc-section-title">Make-Specific Notes</h2><div class="notes-box"><p>${escapeHtml(job.makeSpecificNotes)||'—'}</p></div></section>
+      ${adasEval ? '' : `<section class="doc-section"><h2 class="doc-section-title">Make-Specific Notes</h2><div class="notes-box"><p>${escapeHtml(job.makeSpecificNotes)||'—'}</p></div></section>`}
       <section class="doc-section no-print"><h2 class="doc-section-title">Insurer Link</h2>
         ${activeToken
           ? `<div><code id="shareUrl">${escapeHtml(req.protocol+'://'+req.get('host')+'/share/'+activeToken.token)}</code> <button type="button" data-copy-target="shareUrl" class="btn btn-sm">Copy</button> <form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/share/revoke" style="display:inline">${csrfField(req)}<button class="btn btn-sm" style="border-color:#c0392b;color:#c0392b">Revoke</button></form></div>`
           : `<form method="POST" action="/jobs/${encodeURIComponent(job.jobId)}/share">${csrfField(req)}<button class="btn btn-primary btn-sm">Generate Insurer Link</button></form>`}
       </section>
-      <div class="doc-footer"><p>Generated by CollisionIQ — Job ID: ${escapeHtml(job.jobId)} — &copy; 2026 Cueljuris LLC</p></div>
+      <div class="doc-footer"><p>Generated by CollisionIQ — Job ID: ${escapeHtml(job.jobId)}</p></div>
     </div>`;
 
   res.send(layout(`Job ${job.jobId}`, content, '', user));
@@ -1032,9 +1065,7 @@ app.get('/jobs/:jobId/edit', requireJobEditor, requireSubscription, (req, res) =
   const job = ownedJob(req);
   if (!job) return res.status(404).send('Not found');
 
-  const repairOptions = ['Windshield','Front Camera Area','Front Bumper','Rear Bumper','Radar','Structural Body Repair','Airbag / SRS Deployment','Wheel Alignment','Suspension','Door / Mirror Repair','EV / Hybrid Vehicle','Other'];
-  const existing = (job.repairsPerformed||'').split(',').map(s=>s.trim());
-  const checkboxes = repairOptions.map(r => `<label class="checkbox-label"><input type="checkbox" name="repairs" value="${escapeHtml(r)}"${existing.includes(r)?' checked':''}><span>${escapeHtml(r)}</span></label>`).join('');
+  const existing = storedRepairs(job);
 
   const content = `
     <div style="max-width:720px;margin:0 auto">
@@ -1050,7 +1081,8 @@ app.get('/jobs/:jobId/edit', requireJobEditor, requireSubscription, (req, res) =
             <div class="form-group"><label>Trim</label><input type="text" name="trim" value="${escapeHtml(job.trim||'')}"></div>
             <div class="form-group"><label>Technician</label><input type="text" name="technicianName" value="${escapeHtml(job.technicianName||'')}"></div>
           </div>
-          <div class="form-section" style="margin-top:1rem"><h3>Repairs Performed</h3><div class="checkbox-grid">${checkboxes}</div></div>
+          <div class="form-section" style="margin-top:1rem"><h3>Repairs Performed</h3>${job.repair_keys ? '' : '<p style="color:#8B5A00;font-size:.85rem">This job was saved with the old checkboxes. They have been converted to the closest current options; check the side and any missing operations before saving.</p>'}${repairFieldsets(existing.values)}
+            <div class="form-group" style="margin-top:1rem"><label>Other Repairs</label><input type="text" name="otherRepairs" value="${escapeHtml(existing.other)}" placeholder="Describe additional repairs…"></div></div>
           <div style="margin-top:1.5rem;display:flex;gap:.75rem"><button type="submit" class="btn btn-primary">Save Changes</button><a href="/jobs/${encodeURIComponent(job.jobId)}" class="btn">Cancel</a></div>
         </form>
       </div>
@@ -1063,14 +1095,13 @@ app.post('/jobs/:jobId/edit', requireJobEditor, requireSubscription, (req, res) 
   if (!job) return res.status(404).send('Not found');
   const ro = str(req.body.ro, 50), vin = str(req.body.vin, 17), year = str(req.body.year, 4);
   const make = str(req.body.make, 50), model = str(req.body.model, 50), trim = str(req.body.trim, 50);
-  const technicianName = str(req.body.technicianName, 100);
-  const repairs = strList(req.body.repairs, 100);
-  const adas = runADASEngine(make, model, year, repairs);
+  const technicianName = str(req.body.technicianName, 100), otherRepairs = str(req.body.otherRepairs, 300);
+  const adas = jobAdasColumns({ make, model, year, values: strList(req.body.repairs, 100), other: otherRepairs });
   const now = new Date().toISOString();
-  db.prepare(`UPDATE jobs SET ro=?,vin=?,year=?,make=?,model=?,trim=?,technicianName=?,repairsPerformed=?,adasSystems=?,rationale=?,liabilityWarning=?,makeSpecificNotes=?,preScanRequired=?,postScanRequired=?,approvedScanTool=?,updatedAt=?,last_changed=? WHERE jobId=?`)
+  db.prepare(`UPDATE jobs SET ro=?,vin=?,year=?,make=?,model=?,trim=?,technicianName=?,repairsPerformed=?,adasSystems=?,rationale=?,liabilityWarning=?,makeSpecificNotes=?,preScanRequired=?,postScanRequired=?,approvedScanTool=?,repair_keys=?,adas_eval=?,updatedAt=?,last_changed=? WHERE jobId=?`)
     .run(ro, vin.toUpperCase(), year, make, model, trim, technicianName,
-      repairs.join(', '), adas.adasSystems, adas.rationale, adas.liabilityWarning, adas.makeSpecificNotes,
-      adas.preScanRequired, adas.postScanRequired, adas.approvedScanTool, now, now, job.jobId);
+      adas.repairsPerformed, adas.adasSystems, adas.rationale, adas.liabilityWarning, adas.makeSpecificNotes,
+      adas.preScanRequired, adas.postScanRequired, adas.approvedScanTool, adas.repair_keys, adas.adas_eval, now, now, job.jobId);
   setFlash(req, 'success', 'Job updated.');
   res.redirect(`/jobs/${encodeURIComponent(job.jobId)}`);
 });
@@ -1201,7 +1232,8 @@ app.get('/share/:token', (req, res) => {
   const job = db.prepare('SELECT * FROM jobs WHERE jobId=?').get(row.job_id);
   if (!job) return res.status(404).send('Not found');
   const adasList = job.adasSystems ? job.adasSystems.split('\n').filter(Boolean) : [];
-  const content = `<div class="job-doc"><div class="job-doc-header"><div><div class="doc-brand">CollisionIQ — Insurer View</div><div class="doc-owner">Cueljuris LLC</div></div><div class="doc-meta"><div><span class="meta-label">Job ID</span> ${escapeHtml(job.jobId)}</div><div><span class="meta-label">Date</span> ${formatDate(job.createdAt)}</div></div></div><section class="doc-section"><h2 class="doc-section-title">Vehicle</h2><div class="info-grid"><div class="info-row"><span class="info-label">VIN</span><span class="info-val mono">${escapeHtml(job.vin)||'—'}</span></div><div class="info-row"><span class="info-label">Vehicle</span><span class="info-val">${escapeHtml(job.year)} ${escapeHtml(job.make)} ${escapeHtml(job.model)}</span></div></div></section><section class="doc-section adas-section"><h2 class="doc-section-title">ADAS Requirements</h2><ul class="adas-list">${adasList.map(s=>`<li class="adas-item"><span class="adas-flag">&#9888;</span><span>${escapeHtml(s)}</span></li>`).join('')||'<li>No ADAS flagged.</li>'}</ul></section><div class="doc-footer"><p>CollisionIQ — Insurer Read-Only View — &copy; 2026 Cueljuris LLC</p></div></div>`;
+  const adasEval = jobReport.parseStored(job.adas_eval);
+  const content = `<div class="job-doc"><div class="job-doc-header"><div><div class="doc-brand">CollisionIQ — Insurer View</div><div class="doc-owner">ADAS Calibration Documentation</div></div><div class="doc-meta"><div><span class="meta-label">Job ID</span> ${escapeHtml(job.jobId)}</div><div><span class="meta-label">Date</span> ${formatDate(job.createdAt)}</div></div></div><section class="doc-section"><h2 class="doc-section-title">Vehicle</h2><div class="info-grid"><div class="info-row"><span class="info-label">VIN</span><span class="info-val mono">${escapeHtml(job.vin)||'—'}</span></div><div class="info-row"><span class="info-label">Vehicle</span><span class="info-val">${escapeHtml(job.year)} ${escapeHtml(job.make)} ${escapeHtml(job.model)}</span></div><div class="info-row info-row-full"><span class="info-label">Repairs</span><span class="info-val">${escapeHtml(job.repairsPerformed)||'—'}</span></div></div></section>${adasEval ? jobReport.renderSections(adasEval, { insurer: true }) : `<section class="doc-section adas-section"><h2 class="doc-section-title">ADAS Requirements</h2><ul class="adas-list">${adasList.map(s=>`<li class="adas-item"><span class="adas-flag">&#9888;</span><span>${escapeHtml(s)}</span></li>`).join('')||'<li>No ADAS flagged.</li>'}</ul></section>`}<div class="doc-footer"><p>CollisionIQ — Insurer Read-Only View</p></div></div>`;
   res.send(layout(`Insurer View — ${job.jobId}`, content));
 });
 
