@@ -174,6 +174,17 @@ db.exec(`
     FOREIGN KEY (calibration_id) REFERENCES job_calibrations(id)
   );
   CREATE INDEX IF NOT EXISTS idx_job_calibration_files_job ON job_calibration_files(job_id);
+  -- Technician sign-off, QC approval and QC override (exception record). Never deleted.
+  CREATE TABLE IF NOT EXISTS job_signoffs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    user_id INTEGER, user_name TEXT, role TEXT,
+    statement TEXT, justification TEXT, open_items TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (job_id) REFERENCES jobs(jobId)
+  );
+  CREATE INDEX IF NOT EXISTS idx_job_signoffs_job ON job_signoffs(job_id);
 `);
 
 // job_photos may already exist from an earlier development pass with a different
@@ -1060,6 +1071,8 @@ app.get('/jobs/:jobId', requireAuth, requireSubscription, (req, res) => {
   const canRecord = canUploadPhotos(user, job);
   const flash = consumeFlash(req);
   const jobPath = `/jobs/${encodeURIComponent(job.jobId)}`;
+  const signoffHtml = calRecord.renderSignoffs(rec.sign, rec.st.summary,
+    job.status === 'Closed' ? {} : { forms: { csrf: csrfField(req), base: jobPath, user } });
   const recordHtml = calRecord.renderSection(rec.st, rec.files, {
     fileUrl: (f) => `${jobPath}/calibrations/files/${f.id}`,
     voidForm: canRecord ? (r) => `<form method="POST" action="${jobPath}/calibrations/${r.id}/void" class="calrec-void no-print">${csrfField(req)}<input type="text" name="void_reason" maxlength="300" placeholder="Reason to void this record" required><button class="btn btn-sm">Void</button></form>` : null,
@@ -1114,6 +1127,7 @@ app.get('/jobs/:jobId', requireAuth, requireSubscription, (req, res) => {
       ${adasEval ? jobReport.renderSections(adasEval) : `<section class="doc-section adas-section"><h2 class="doc-section-title">ADAS Systems — Calibration Required</h2><p class="adas-basis no-print">Saved with the original engine. Open Edit and save to re-run this job through the current OEM and field rules.</p><ul class="adas-list">${adasItems}</ul></section>
       <section class="doc-section"><h2 class="doc-section-title">Rationale</h2><ul class="rationale-list">${rationaleList.map(r=>`<li>${escapeHtml(r)}</li>`).join('')||'<li>No rationale generated.</li>'}</ul></section>`}
       ${recordHtml}
+      ${signoffHtml}
       <section class="doc-section warning-section"><h2 class="doc-section-title">Liability Warning</h2><div class="warning-box"><span class="warning-icon">&#9888;</span><p>${escapeHtml(job.liabilityWarning)||'—'}</p></div></section>
       ${adasEval ? '' : `<section class="doc-section"><h2 class="doc-section-title">Make-Specific Notes</h2><div class="notes-box"><p>${escapeHtml(job.makeSpecificNotes)||'—'}</p></div></section>`}
       <section class="doc-section no-print"><h2 class="doc-section-title">Insurer Link</h2>
@@ -1281,8 +1295,68 @@ function loadCalibrationRecord(job, adasEval) {
   const items = calRecord.requiredItems(adasEval);
   const records = db.prepare('SELECT * FROM job_calibrations WHERE job_id=? ORDER BY id').all(job.jobId);
   const files = db.prepare('SELECT f.* FROM job_calibration_files f JOIN job_calibrations c ON c.id=f.calibration_id WHERE f.job_id=? AND c.voided_at IS NULL ORDER BY f.id').all(job.jobId);
-  return { items, records, files, st: calRecord.status(items, records) };
+  const st = calRecord.status(items, records);
+  const signoffs = db.prepare('SELECT * FROM job_signoffs WHERE job_id=? ORDER BY id').all(job.jobId);
+  return { items, records, files, st, signoffs, sign: calRecord.signoffState(records, signoffs, st.summary) };
 }
+
+// ─── Sign-off, QC approval, QC override ─────────────────────────────────────
+function signoffGuard(req, res, roles) {
+  const job = ownedJob(req);
+  if (!job) { res.status(404).send('Not found'); return null; }
+  if (!roles.includes(req.session.user.role)) { res.status(403).send('Access denied.'); return null; }
+  if (job.status === 'Closed') { res.status(403).send('This job is closed.'); return null; }
+  return job;
+}
+function addSignoff(job, user, kind, extra = {}) {
+  db.prepare('INSERT INTO job_signoffs (job_id,kind,user_id,user_name,role,statement,justification,open_items,created_at) VALUES (?,?,?,?,?,?,?,?,?)')
+    .run(job.jobId, kind, user.id, user.full_name || user.username, user.role, calRecord.STATEMENTS[kind], extra.justification || null, extra.open_items || null, new Date().toISOString());
+}
+function closeJob(job) {
+  const now = new Date().toISOString();
+  db.prepare("UPDATE jobs SET status='Closed', updatedAt=?, last_changed=? WHERE jobId=?").run(now, now, job.jobId);
+}
+app.post('/jobs/:jobId/signoff/tech', requireAuth, requireSubscription, (req, res) => {
+  const job = signoffGuard(req, res, calRecord.SIGN_ROLES); if (!job) return;
+  const jobPath = `/jobs/${encodeURIComponent(job.jobId)}`;
+  const { sign } = loadCalibrationRecord(job, jobReport.parseStored(job.adas_eval));
+  if (!sign.canTechSign) { setFlash(req, 'error', 'Document every record item before signing off.'); return res.redirect(jobPath); }
+  addSignoff(job, req.session.user, 'tech');
+  setFlash(req, 'success', 'Technician sign-off recorded.');
+  res.redirect(jobPath);
+});
+app.post('/jobs/:jobId/signoff/qc', requireAuth, requireSubscription, (req, res) => {
+  const job = signoffGuard(req, res, calRecord.QC_ROLES); if (!job) return;
+  const jobPath = `/jobs/${encodeURIComponent(job.jobId)}`;
+  const { sign } = loadCalibrationRecord(job, jobReport.parseStored(job.adas_eval));
+  if (!sign.canApprove) { setFlash(req, 'error', `QC approval needs: ${sign.approveBlockers.join('; ')}.`); return res.redirect(jobPath); }
+  addSignoff(job, req.session.user, 'qc');
+  setFlash(req, 'success', 'QC approval recorded. The job can now be closed.');
+  res.redirect(jobPath);
+});
+app.post('/jobs/:jobId/signoff/close', requireAuth, requireSubscription, (req, res) => {
+  const job = signoffGuard(req, res, calRecord.QC_ROLES); if (!job) return;
+  const jobPath = `/jobs/${encodeURIComponent(job.jobId)}`;
+  const { st, sign } = loadCalibrationRecord(job, jobReport.parseStored(job.adas_eval));
+  const blocker = calRecord.closeBlocker(sign, st.summary);
+  if (blocker) { setFlash(req, 'error', `Job not closed: ${blocker}.`); return res.redirect(jobPath); }
+  closeJob(job);
+  setFlash(req, 'success', 'Job closed.');
+  res.redirect(jobPath);
+});
+app.post('/jobs/:jobId/signoff/override', requireAuth, requireSubscription, (req, res) => {
+  const job = signoffGuard(req, res, calRecord.QC_ROLES); if (!job) return;
+  const jobPath = `/jobs/${encodeURIComponent(job.jobId)}`;
+  const { st, sign } = loadCalibrationRecord(job, jobReport.parseStored(job.adas_eval));
+  if (sign.canClose) { setFlash(req, 'error', 'The record is approved; close the job normally.'); return res.redirect(jobPath); }
+  const { errors, justification } = calRecord.validateOverride(req.body);
+  if (errors.length) { setFlash(req, 'error', `Override not saved: ${errors.join(' ')}`); return res.redirect(jobPath); }
+  const open = [...st.summary.openNames, ...(sign.techCurrent ? [] : ['Technician sign-off']), ...(sign.qcCurrent ? [] : ['QC approval'])];
+  addSignoff(job, req.session.user, 'override', { justification, open_items: JSON.stringify(open) });
+  closeJob(job);
+  setFlash(req, 'success', 'Job closed under QC override. The exception is on the job record.');
+  res.redirect(jobPath);
+});
 
 app.post('/jobs/:jobId/calibrations', requireAuth, requireSubscription, (req, res, next) => {
   proofUpload.array('proof', calRecord.MAX_PROOF_FILES)(req, res, (err) => {
@@ -1392,7 +1466,7 @@ app.get('/share/:token', (req, res) => {
   const adasEval = jobReport.parseStored(job.adas_eval);
   const rec = loadCalibrationRecord(job, adasEval);
   const recordHtml = calRecord.renderSection(rec.st, rec.files, { fileUrl: (f) => `/share/${encodeURIComponent(req.params.token)}/files/${f.id}` });
-  const content = `<div class="job-doc"><div class="job-doc-header"><div><div class="doc-brand">CollisionIQ — Insurer View</div><div class="doc-owner">ADAS Calibration Documentation</div></div><div class="doc-meta"><div><span class="meta-label">Job ID</span> ${escapeHtml(job.jobId)}</div><div><span class="meta-label">Date</span> ${formatDate(job.createdAt)}</div></div></div><section class="doc-section"><h2 class="doc-section-title">Vehicle</h2><div class="info-grid"><div class="info-row"><span class="info-label">VIN</span><span class="info-val mono">${escapeHtml(job.vin)||'—'}</span></div><div class="info-row"><span class="info-label">Vehicle</span><span class="info-val">${escapeHtml(job.year)} ${escapeHtml(job.make)} ${escapeHtml(job.model)}</span></div><div class="info-row info-row-full"><span class="info-label">Repairs</span><span class="info-val">${escapeHtml(job.repairsPerformed)||'—'}</span></div></div></section>${adasEval ? jobReport.renderSections(adasEval, { insurer: true }) : `<section class="doc-section adas-section"><h2 class="doc-section-title">ADAS Requirements</h2><ul class="adas-list">${adasList.map(s=>`<li class="adas-item"><span class="adas-flag">&#9888;</span><span>${escapeHtml(s)}</span></li>`).join('')||'<li>No ADAS flagged.</li>'}</ul></section>`}${recordHtml}<div class="doc-footer"><p>CollisionIQ — Insurer Read-Only View</p></div></div>`;
+  const content = `<div class="job-doc"><div class="job-doc-header"><div><div class="doc-brand">CollisionIQ — Insurer View</div><div class="doc-owner">ADAS Calibration Documentation</div></div><div class="doc-meta"><div><span class="meta-label">Job ID</span> ${escapeHtml(job.jobId)}</div><div><span class="meta-label">Date</span> ${formatDate(job.createdAt)}</div></div></div><section class="doc-section"><h2 class="doc-section-title">Vehicle</h2><div class="info-grid"><div class="info-row"><span class="info-label">VIN</span><span class="info-val mono">${escapeHtml(job.vin)||'—'}</span></div><div class="info-row"><span class="info-label">Vehicle</span><span class="info-val">${escapeHtml(job.year)} ${escapeHtml(job.make)} ${escapeHtml(job.model)}</span></div><div class="info-row info-row-full"><span class="info-label">Repairs</span><span class="info-val">${escapeHtml(job.repairsPerformed)||'—'}</span></div></div></section>${adasEval ? jobReport.renderSections(adasEval, { insurer: true }) : `<section class="doc-section adas-section"><h2 class="doc-section-title">ADAS Requirements</h2><ul class="adas-list">${adasList.map(s=>`<li class="adas-item"><span class="adas-flag">&#9888;</span><span>${escapeHtml(s)}</span></li>`).join('')||'<li>No ADAS flagged.</li>'}</ul></section>`}${recordHtml}${calRecord.renderSignoffs(rec.sign, rec.st.summary)}<div class="doc-footer"><p>CollisionIQ — Insurer Read-Only View</p></div></div>`;
   res.send(layout(`Insurer View — ${job.jobId}`, content));
 });
 
@@ -1415,11 +1489,14 @@ app.post('/jobs/:jobId/status', requireAdmin, requireSubscription, (req, res) =>
   if (!valid.includes(req.body.status)) return res.status(400).send('Invalid status');
   const job = ownedJob(req);
   if (!job) return res.status(404).send('Not found');
-  // A job cannot be marked complete or closed while required items are undocumented.
+  // Calibration Complete needs a complete record; Closed also needs a current
+  // technician sign-off and QC approval (or the QC override on the job page).
   if (['Calibration Complete', 'Closed'].includes(req.body.status)) {
-    const { st } = loadCalibrationRecord(job, jobReport.parseStored(job.adas_eval));
-    if (!st.summary.complete) {
-      setFlash(req, 'error', `${job.jobId} cannot be marked ${req.body.status}: ${st.summary.open} calibration record item(s) open — ${st.summary.openNames.join('; ')}.`);
+    const { st, sign } = loadCalibrationRecord(job, jobReport.parseStored(job.adas_eval));
+    const blocker = req.body.status === 'Closed' ? calRecord.closeBlocker(sign, st.summary)
+      : (st.summary.complete ? null : `${st.summary.open} calibration record item(s) open — ${st.summary.openNames.join('; ')}`);
+    if (blocker) {
+      setFlash(req, 'error', `${job.jobId} cannot be marked ${req.body.status}: ${blocker}.${req.body.status === 'Closed' ? ' Approve or override on the job page.' : ''}`);
       return res.redirect('/admin');
     }
   }

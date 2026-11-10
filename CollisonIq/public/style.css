@@ -2127,3 +2127,19 @@ a:hover {
   .calrec-item { border-left-width: 4px; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   .calrec-detail a { color: #2c3e50 !important; text-decoration: none; }
 }
+
+/* ─── Sign-off (Nov 2026) ────────────────────────────────────────────────── */
+.signoff-list { list-style: none; padding: 0; margin: 0.5rem 0 0; }
+.signoff-list li { border-left: 4px solid #c0392b; padding: 0.45rem 0.75rem; margin-bottom: 0.5rem; background: #fafbfc; font-size: 0.88rem; page-break-inside: avoid; }
+.signoff-list li.signoff-ok { border-left-color: #27ae60; }
+.signoff-list li.signoff-override { border-left-color: #8B0000; background: #fff5f5; }
+.signoff-note { color: #8B5A00; }
+.signoff-actions { margin-top: 0.75rem; display: grid; gap: 0.75rem; }
+.signoff-step { border: 1px solid #e0e8f0; border-radius: 6px; padding: 0.6rem 0.8rem; }
+.signoff-form { display: inline-block; margin-top: 0.4rem; }
+.signoff-override-form > summary { list-style: none; display: inline-block; cursor: pointer; }
+.signoff-override-form > summary::-webkit-details-marker { display: none; }
+.signoff-danger { border-color: #8B0000; color: #8B0000; }
+@media print {
+  .signoff-list li { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+}

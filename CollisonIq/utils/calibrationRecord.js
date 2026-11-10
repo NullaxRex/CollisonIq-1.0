@@ -239,7 +239,127 @@ function renderForm({ action, csrf, items, defaults }) {
     </form></details>`;
 }
 
+// ---------------------------------------------------------------------------
+// Sign-off, QC approval and override (patent draft sections 4.6–4.7)
+// ---------------------------------------------------------------------------
+// job_signoffs rows: { id, job_id, kind: 'tech' | 'qc' | 'override', user_id,
+// user_name, role, statement, justification, open_items (JSON), created_at }.
+// Rows are never deleted. A tech sign-off or QC approval is current only while
+// the record is unchanged after it; any new or voided record makes it stale.
+const STATEMENTS = {
+  tech: 'I performed or directly supervised the work recorded above, following the OEM service information listed, and the record is accurate and complete.',
+  qc: 'I reviewed the calibration record and its proof for this job and approve it.',
+  override: 'I am closing this job with incomplete calibration documentation. This exception is permanent and appears on the job record.',
+};
+const QC_ROLES = ['qc_manager', 'shop_admin', 'platform_admin'];
+const SIGN_ROLES = ['technician', 'qc_manager', 'shop_admin', 'platform_admin'];
+const MIN_JUSTIFICATION = 20;
+
+function lastRecordChange(records) {
+  let t = '';
+  for (const r of records) for (const v of [r.created_at, r.voided_at]) if (v && v > t) t = v;
+  return t;
+}
+
+/** Sign-off state for a job: current tech sign-off, current QC approval, overrides, and what is allowed next. */
+function signoffState(records, signoffs, summary) {
+  const changed = lastRecordChange(records);
+  const latest = (kind) => signoffs.filter((x) => x.kind === kind).sort((a, b) => b.id - a.id)[0] || null;
+  const isCurrent = (x) => Boolean(x) && x.created_at >= changed;
+  const tech = latest('tech');
+  const qc = latest('qc');
+  const techCurrent = isCurrent(tech) ? tech : null;
+  const qcCurrent = isCurrent(qc) && techCurrent && qc.id > techCurrent.id ? qc : null;
+  const approveBlockers = [];
+  if (!summary.complete) approveBlockers.push(`${summary.open} record item(s) open`);
+  if (!techCurrent) approveBlockers.push(tech ? 'the technician sign-off is out of date (the record changed after it)' : 'no technician sign-off yet');
+  return {
+    tech, techCurrent, qc, qcCurrent,
+    overrides: signoffs.filter((x) => x.kind === 'override').sort((a, b) => a.id - b.id),
+    history: [...signoffs].sort((a, b) => a.id - b.id),
+    canTechSign: summary.complete,
+    canApprove: approveBlockers.length === 0,
+    approveBlockers,
+    canClose: Boolean(qcCurrent),
+    samePerson: Boolean(qcCurrent && techCurrent && qcCurrent.user_id === techCurrent.user_id),
+  };
+}
+
+/** Why a job cannot be closed normally, or null if it can. */
+function closeBlocker(state, summary) {
+  if (state.canClose) return null;
+  if (!summary.complete) return `${summary.open} calibration record item(s) open — ${summary.openNames.join('; ')}`;
+  if (!state.techCurrent) return 'the technician has not signed off on the current record';
+  return 'QC has not approved the current record';
+}
+
+function validateOverride(input) {
+  const s = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
+  const justification = s(input.justification, 1000);
+  const errors = [];
+  if (justification.length < MIN_JUSTIFICATION) errors.push(`Write a justification of at least ${MIN_JUSTIFICATION} characters.`);
+  if (input.acknowledge !== '1') errors.push('Check the acknowledgement box.');
+  return { errors, justification };
+}
+
+const ROLE_LABEL = { technician: 'Technician', qc_manager: 'QC manager', shop_admin: 'Shop admin', platform_admin: 'Platform admin', service_writer: 'Service writer' };
+const when = (iso) => String(iso || '').replace('T', ' ').slice(0, 16) + (iso ? ' UTC' : '');
+
+/**
+ * Sign-off section. opts.forms: { csrf, base, user } on the job page (forms are
+ * no-print); omitted on the insurer view.
+ */
+function renderSignoffs(state, summary, opts = {}) {
+  const who = (x) => `${esc(x.user_name)} (${esc(ROLE_LABEL[x.role] || x.role)}), ${esc(when(x.created_at))}`;
+  const lines = [];
+  lines.push(state.techCurrent
+    ? `<li class="signoff-ok"><strong>Technician sign-off:</strong> ${who(state.techCurrent)}<div class="calrec-detail">“${esc(state.techCurrent.statement)}”</div></li>`
+    : `<li class="signoff-missing"><strong>Technician sign-off:</strong> ${state.tech ? `out of date — the record changed after ${who(state.tech)}` : 'not signed'}</li>`);
+  lines.push(state.qcCurrent
+    ? `<li class="signoff-ok"><strong>QC approval:</strong> ${who(state.qcCurrent)}<div class="calrec-detail">“${esc(state.qcCurrent.statement)}”</div>${state.samePerson ? '<div class="calrec-detail signoff-note">Signed off and approved by the same person.</div>' : ''}</li>`
+    : `<li class="signoff-missing"><strong>QC approval:</strong> ${state.qc ? `out of date — the record or technician sign-off changed after ${who(state.qc)}` : 'not approved'}</li>`);
+  for (const o of state.overrides) {
+    let open = [];
+    try { open = JSON.parse(o.open_items || '[]'); } catch (e) { open = []; }
+    lines.push(`<li class="signoff-override"><strong>Closed under QC override:</strong> ${who(o)}
+      <div class="calrec-detail"><span class="calrec-label">Justification</span> ${esc(o.justification)}</div>
+      <div class="calrec-detail"><span class="calrec-label">Incomplete at override</span> ${open.length ? esc(open.join('; ')) : '—'}</div></li>`);
+  }
+
+  let forms = '';
+  const f = opts.forms;
+  if (f) {
+    const btn = (action, label, cls = 'btn btn-primary btn-sm', extra = '') => `<form method="POST" action="${esc(f.base)}/signoff/${action}" class="signoff-form">${f.csrf}${extra}<button class="${cls}">${esc(label)}</button></form>`;
+    const parts = [];
+    if (SIGN_ROLES.includes(f.user.role)) {
+      parts.push(state.canTechSign
+        ? `<div class="signoff-step"><p class="calrec-detail">“${esc(STATEMENTS.tech)}”</p>${btn('tech', state.techCurrent ? 'Sign off again as technician' : 'Sign off as technician')}</div>`
+        : '<p class="calrec-detail">Technician sign-off opens when every record item is documented.</p>');
+    }
+    if (QC_ROLES.includes(f.user.role)) {
+      parts.push(state.canApprove
+        ? `<div class="signoff-step"><p class="calrec-detail">“${esc(STATEMENTS.qc)}”</p>${btn('qc', 'Approve as QC')}</div>`
+        : `<p class="calrec-detail">QC approval needs: ${esc(state.approveBlockers.join('; '))}.</p>`);
+      if (state.canClose) parts.push(btn('close', 'Close job'));
+      else {
+        parts.push(`<details class="signoff-override-form"><summary class="btn btn-sm">Close with QC override…</summary>
+          <form method="POST" action="${esc(f.base)}/signoff/override" class="calrec-form-body">${f.csrf}
+            <p class="calrec-detail">Use only when the documentation cannot be completed. Open now: ${esc(summary.openNames.join('; ') || 'none')}${state.techCurrent ? '' : '; technician sign-off'}${state.qcCurrent ? '' : '; QC approval'}.</p>
+            <div class="form-group"><label>Justification (at least ${MIN_JUSTIFICATION} characters)</label><textarea name="justification" maxlength="1000" rows="3" required minlength="${MIN_JUSTIFICATION}"></textarea></div>
+            <label class="checkbox-label"><input type="checkbox" name="acknowledge" value="1" required><span>${esc(STATEMENTS.override)}</span></label>
+            <button class="btn btn-sm signoff-danger">Close with override</button>
+          </form></details>`);
+      }
+    }
+    if (parts.length) forms = `<div class="signoff-actions no-print">${parts.join('')}</div>`;
+  }
+
+  return `<section class="doc-section signoff-section"><h2 class="doc-section-title">Sign-off</h2>
+    <ul class="signoff-list">${lines.join('')}</ul>${forms}</section>`;
+}
+
 module.exports = {
-  RESULTS, METHODS, PROOF_EXT, MAX_PROOF_FILES,
+  RESULTS, METHODS, PROOF_EXT, MAX_PROOF_FILES, STATEMENTS, QC_ROLES, SIGN_ROLES, MIN_JUSTIFICATION,
   requiredItems, status, validateRecord, summaryBadge, renderSection, renderForm,
+  lastRecordChange, signoffState, closeBlocker, validateOverride, renderSignoffs,
 };

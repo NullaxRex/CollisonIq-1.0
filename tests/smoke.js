@@ -416,12 +416,78 @@ const userId = (username) => DB.prepare('SELECT id FROM users WHERE username=?')
   await admin.req('POST', `/jobs/${jobB}/calibrations`, recordForm(admin, { item_key: 'ADDITIONAL', item_name: 'Front camera aiming', ...passFields, result: 'not_performed', reason: 'Customer declined; signed waiver on file' }));
   r = await admin.req('GET', `/jobs/${jobB}`);
   check('job header shows the record complete', /3\/3 documented/.test(r.text) && /All 3 required items are documented/.test(r.text));
+
+  // ─── Sign-off, QC approval, QC override (Nov 2026) ─────────────────────────
+  heading('Sign-off and QC override');
+  const signoffs = (job) => DB ? DB.prepare('SELECT * FROM job_signoffs WHERE job_id=? ORDER BY id').all(job) : [];
+  const statusOf = (job) => DB ? DB.prepare('SELECT status FROM jobs WHERE jobId=?').get(job).status : null;
+  check('job page shows the sign-off section with tech sign-off and QC approve', /Technician sign-off:<\/strong> not signed/.test(r.text) && /signoff\/tech/.test(r.text) && /QC approval needs: no technician sign-off yet/.test(r.text));
+  await admin.freshToken('/admin');
+  r = await admin.post(`/jobs/${jobB}/status`, { status: 'Closed' });
+  check('complete record alone cannot close the job', statusOf(jobB) !== 'Closed');
+  r = await admin.req('GET', '/admin');
+  check('admin page says the technician has not signed off', /technician has not signed off/.test(r.text));
+  await tech.freshToken(`/jobs/${jobB}`);
+  r = await tech.post(`/jobs/${jobB}/signoff/qc`);
+  check('technician cannot QC-approve', denied(r), `status ${r.status}`);
+  r = await tech.post(`/jobs/${jobB}/signoff/tech`);
+  check('technician signs off', r.status === 302 && signoffs(jobB).some((x) => x.kind === 'tech' && x.role === 'technician'));
+  await writer.freshToken(`/jobs/${jobB}`);
+  r = await writer.post(`/jobs/${jobB}/signoff/tech`);
+  check('service_writer cannot sign off', denied(r), `status ${r.status}`);
+  r = await north.post(`/jobs/${jobB}/signoff/qc`);
+  check('other shop cannot approve', r.status === 404);
+  // A record change after the sign-off makes it stale.
+  await admin.freshToken(`/jobs/${jobB}`);
+  await new Promise((res) => setTimeout(res, 5));
+  await admin.req('POST', `/jobs/${jobB}/calibrations`, recordForm(admin, { item_key: 'SCAN:POST', ...passFields, notes: 'Re-scan after road test' }));
+  r = await admin.req('GET', `/jobs/${jobB}`);
+  check('record change makes the tech sign-off out of date', /Technician sign-off:<\/strong> out of date/.test(r.text));
+  r = await admin.post(`/jobs/${jobB}/signoff/qc`);
+  check('QC approval refused while sign-off is stale', !signoffs(jobB).some((x) => x.kind === 'qc'));
+  await tech.freshToken(`/jobs/${jobB}`);
+  await new Promise((res) => setTimeout(res, 5));
+  await tech.post(`/jobs/${jobB}/signoff/tech`);
+  await admin.freshToken(`/jobs/${jobB}`);
+  await new Promise((res) => setTimeout(res, 5));
+  r = await admin.post(`/jobs/${jobB}/signoff/qc`);
+  check('QC approves the current record', r.status === 302 && signoffs(jobB).some((x) => x.kind === 'qc' && x.role === 'shop_admin'));
+  r = await admin.req('GET', `/jobs/${jobB}`);
+  check('job page shows approval and a Close job button', /QC approval:<\/strong> /.test(r.text) && /signoff\/close/.test(r.text) && !/signoff\/override/.test(r.text));
+  r = await anon.req('GET', `/share/${liveToken}`);
+  check('insurer view shows the sign-off section without forms', /Sign-off/.test(r.text) && !/signoff\/(tech|qc|close|override)/.test(r.text));
+
+  // Override on jobA, whose record is incomplete.
+  await admin.freshToken(`/jobs/${jobA}`);
+  r = await admin.post(`/jobs/${jobA}/signoff/close`);
+  check('normal close refused on an incomplete record', statusOf(jobA) !== 'Closed');
+  r = await admin.post(`/jobs/${jobA}/signoff/override`, { justification: 'too short', acknowledge: '1' });
+  check('override needs a real justification', statusOf(jobA) !== 'Closed' && !signoffs(jobA).some((x) => x.kind === 'override'));
+  r = await admin.post(`/jobs/${jobA}/signoff/override`, { justification: 'Vehicle released to the customer at their request; calibration scheduled at the dealer.' });
+  check('override needs the acknowledgement box', statusOf(jobA) !== 'Closed');
+  await tech.freshToken(`/jobs/${jobA}`);
+  r = await tech.post(`/jobs/${jobA}/signoff/override`, { justification: 'Vehicle released to the customer at their request; calibration scheduled at the dealer.', acknowledge: '1' });
+  check('technician cannot override', denied(r) && statusOf(jobA) !== 'Closed', `status ${r.status}`);
+  await admin.freshToken(`/jobs/${jobA}`);
+  r = await admin.post(`/jobs/${jobA}/signoff/override`, { justification: 'Vehicle released to the customer at their request; calibration scheduled at the dealer.', acknowledge: '1' });
+  const ov = signoffs(jobA).find((x) => x.kind === 'override');
+  check('QC override closes the job and keeps the exception record with the open items', r.status === 302 && statusOf(jobA) === 'Closed'
+    && ov && /dealer/.test(ov.justification) && ['Technician sign-off', 'QC approval'].every((x) => JSON.parse(ov.open_items).includes(x)) && JSON.parse(ov.open_items).length > 2, ov && ov.open_items);
+  r = await anon.req('GET', `/share/${liveToken}`);
+  check('insurer view shows the override, justification and what was open', /Closed under QC override/.test(r.text) && /calibration scheduled at the dealer/.test(r.text) && /Incomplete at override<\/span> [^<]*QC approval/.test(r.text));
+  r = await admin.req('GET', `/jobs/${jobA}`);
+  check('closed job page shows no sign-off or record forms', !/signoff\/(tech|qc|close|override)/.test(r.text) && !/name="item_key"/.test(r.text));
+  await admin.freshToken(`/jobs/${jobA}`);
+  r = await admin.post(`/jobs/${jobA}/signoff/tech`);
+  check('closed job: no further sign-offs', r.status === 403);
+  r = await admin.req('POST', `/jobs/${jobA}/calibrations`, recordForm(admin, { item_key: 'SCAN:POST', ...passFields }));
+  check('closed job: record locked', r.status === 403);
   await admin.freshToken('/admin');
 
   heading('Closed-job photo lock');
   await admin.freshToken('/new');
   r = await admin.post(`/jobs/${jobB}/status`, { status: 'Closed' });
-  check('shop_admin can close job', r.status === 302);
+  check('shop_admin can close an approved job from the admin page', r.status === 302 && (!DB || DB.prepare('SELECT status FROM jobs WHERE jobId=?').get(jobB).status === 'Closed'));
   r = await admin.req('GET', `/jobs/${jobB}/photos`);
   const slotB = (r.text.match(new RegExp(`/jobs/${jobB}/photos/(\\d+)/file`)) || [])[1] || DB?.prepare('SELECT id FROM job_photos WHERE job_id=? LIMIT 1').get(jobB).id;
   r = await admin.upload(`/jobs/${jobB}/photos/${slotB}`, PNG, 'image/png', 'x.png');
