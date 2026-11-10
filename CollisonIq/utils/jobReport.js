@@ -64,6 +64,60 @@ function ruleBasis(result, make) {
   };
 }
 
+// ---- OEM documents relevant to the repair (from the OEM source register) -----
+// Category → which repair events make a document relevant. Pre/post scan
+// statements are already the scan policy source and are not repeated.
+const DOC_RULES = [
+  { category: /glass|forward camera/i, events: /WINDSHIELD|FRONT_CAMERA|^CAMERA_/ },
+  { category: /bumper|radar|sonar/i, events: /BUMPER|FASCIA|GRILLE|RADAR|PARKING_SENSOR|CORNER_SENSOR|BLIND_SPOT|BSI_|COLLISION_DAMAGE/ },
+  { category: /surround-view/i, events: /MIRROR|SIDE_CAMERA|MVCS|PARKING_CAMERA|REAR_CAMERA|REARVIEW|DOOR|FENDER/ },
+  { category: /post collision/i, collision: true },
+  { category: /adas \/ calibration|diagnostics/i, any: true },
+];
+
+// Documents that apply to one model only; shown only when the job's model matches.
+const MODEL_SPECIFIC = [
+  [/\bARIYA\b/i, /ariya/i],
+  [/Eclipse Cross/i, /eclipse\s*cross/i],
+  [/\bR1\b/, /\br1[st]?\b/i],
+  [/\bR2\b/, /\br2\b/i],
+  [/\bEDV\b/, /\bedv\b|delivery van|commercial van/i],
+];
+const normBrand = (s) => String(s || '').toLowerCase().replace(/[^a-z]/g, '');
+
+function relevantDocuments(scan, events, collisionRelated, scanPolicyOnly, vehicle = {}) {
+  const docs = (scan && scan.documents) || [];
+  const scanUrl = scan && scan.source && scan.source.url;
+  const brands = String((scan && scan.brands) || '').split('/').map(normBrand).filter(Boolean);
+  const make = normBrand(vehicle.make);
+  const out = [];
+  for (const d of docs) {
+    if (!d.url || d.url === scanUrl || /pre\/post scan/i.test(d.category)) continue;
+    // A single-brand document from a shared group (e.g. Infiniti on a Nissan job) is skipped.
+    const mfr = normBrand(d.manufacturer);
+    if (!String(d.manufacturer).includes('/') && brands.length > 1 && brands.includes(mfr) && mfr !== make) continue;
+    const specific = MODEL_SPECIFIC.find(([t]) => t.test(d.title));
+    if (specific && !specific[1].test(String(vehicle.model || ''))) continue;
+    const libraryHit = /oem library/i.test(d.category) && scanPolicyOnly && events.length > 0;
+    const hit = libraryHit || DOC_RULES.some((r) => r.category.test(d.category) && (
+      (r.any && events.length > 0) || (r.collision && collisionRelated) || (r.events && events.some((e) => r.events.test(e)))));
+    if (hit) out.push({ title: d.title, issued: d.issued, category: d.category, whyItMatters: d.whyItMatters, url: d.url, notes: d.notes || null });
+  }
+  return out;
+}
+
+// ---- High-voltage vehicles detected from make/model --------------------------
+// Carried over from the July 2026 engine (adasEngine.js): EV makes and model
+// keywords. Detection only adds the register's HV post-crash review item.
+const EV_MAKES = ['tesla', 'rivian', 'lucid', 'polestar'];
+const EV_MODEL_WORDS = ['lightning', 'bolt', 'volt', 'ioniq', 'ev6', 'ev9', 'leaf', 'ariya', 'mach-e', 'id.4', 'bz4x', 'prius prime',
+  'rav4 prime', 'silverado ev', 'sierra ev', 'hummer ev', 'equinox ev', 'blazer ev', 'lyriq', 'hybrid', 'plug-in', 'phev'];
+function isHighVoltage(make, model) {
+  const mk = String(make || '').toLowerCase();
+  const md = String(model || '').toLowerCase();
+  return EV_MAKES.some((m) => mk.includes(m)) || EV_MODEL_WORDS.some((w) => md.includes(w));
+}
+
 const uniq = (a) => [...new Set(a)];
 const reasonLabels = (c) =>
   uniq((c.reasons || []).flatMap((r) => (r.triggeredBy ? r.triggeredBy.map((t) => t.label) : [r.label])));
@@ -89,8 +143,11 @@ function buildJobAdas({ make, model, year, repairValues }) {
       };
 
   result.input = { repairValues: values, repairLabels: values.map(repairs.valueLabel), events, collisionRelated, family };
-  result.reviewItems = reviewItems(reviewEvents);
+  const evDetected = !reviewEvents.includes('HV EV post-crash') && isHighVoltage(make, model);
+  result.reviewItems = reviewItems(evDetected ? [...reviewEvents, 'HV EV post-crash'] : reviewEvents)
+    .map((r) => (evDetected && r.event === 'HV EV post-crash' ? { ...r, detected: 'Detected from the vehicle make/model' } : r));
   result.basis = ruleBasis(result, make);
+  result.oemDocuments = relevantDocuments(result.scanPolicy, events, collisionRelated, result.ruleDepth === 'SCAN_POLICY_ONLY', { make, model });
 
   const cals = result.calibrations || [];
   const ops = result.operationChecks || [];
@@ -215,6 +272,13 @@ function renderSections(result, opts = {}) {
     parts.push(`<section class="doc-section adas-section"><h2 class="doc-section-title">OEM Operation Checks</h2><ul class="adas-list">${ops.map(renderOperationCheck).join('')}</ul></section>`);
   }
 
+  const docs = result.oemDocuments || [];
+  if (docs.length) {
+    parts.push(`<section class="doc-section"><h2 class="doc-section-title">OEM Documents for This Repair</h2>
+      <p class="adas-basis">From the CollisionIQ OEM source register. Consult each one for this vehicle; they are OEM property and are linked, not reproduced.</p>
+      <ul class="rationale-list">${docs.map((d) => `<li><strong>${esc(d.title)}</strong>${d.issued ? ` (${esc(d.issued)})` : ''} — ${esc(d.whyItMatters || d.category)}.${d.notes ? ` ${esc(d.notes)}.` : ''}${link(d.url)}</li>`).join('')}</ul></section>`);
+  }
+
   if (vers.length) {
     parts.push(`<section class="doc-section field-rules-section"><h2 class="doc-section-title">CollisionIQ Field Rules — Not OEM Requirements</h2>
       <p class="adas-basis">${esc(vers[0].basis)} Body work in an ADAS area calls for a calibration or, at a minimum, an extensive in-shop and on-road test and verification, because impact energy does not stop at the damaged panels.</p>
@@ -231,6 +295,7 @@ function renderSections(result, opts = {}) {
   if (flags.length || reviews.length) {
     const flagItems = flags.map((f) => `<li class="review-${esc(f.level)}"><strong>${esc(f.level === 'critical' ? 'CRITICAL' : f.level === 'warning' ? 'Review' : 'Note')}:</strong> ${esc(f.text)}</li>`);
     const reviewLis = reviews.map((r) => `<li class="review-warning"><strong>${esc(r.event)}:</strong> ${[
+      r.detected && `${r.detected}.`,
       r.subsystem && `Affects ${r.subsystem}.`,
       r.checks && `${r.checks}.`,
       r.sourceToConsult && `Consult: ${r.sourceToConsult}.`,
@@ -268,4 +333,4 @@ function parseStored(json) {
   }
 }
 
-module.exports = { LIABILITY, buildJobAdas, renderSections, parseStored };
+module.exports = { LIABILITY, buildJobAdas, renderSections, parseStored, isHighVoltage, relevantDocuments };

@@ -110,5 +110,31 @@ check('collision damage boxes set collisionRelated; door work alone does not',
   check('no make: field rules still apply, flagged', none.result.verifications.length === 1 && codes(none.result).includes('MAKE_MISSING'));
 }
 
+// ─── OEM documents for the repair (source register) ──────────────────────────
+{
+  const titles = (mk, md, v) => build(mk, md, '2025', v).result.oemDocuments.map((d) => d.title);
+  const n = titles('Nissan', 'Rogue', ['WINDSHIELD_REPLACED', 'FRONT_BUMPER_RI']);
+  check('Nissan windshield + bumper: ADAS components, glass and radar statements',
+    ['Nissan ADAS Components NPSB/26-971', 'Nissan vehicle glass statement', 'Nissan front radar calibration position'].every((t) => n.includes(t)), n.join(' ; '));
+  check('Nissan Rogue: no ARIYA-only or Infiniti-only documents, no repeat of the scan statement',
+    !n.some((t) => /ARIYA|Infiniti|pre\/post/i.test(t)));
+  check('Nissan Ariya: ARIYA bumper document shown', titles('Nissan', 'Ariya', ['FRONT_BUMPER_RI']).includes('Nissan ARIYA bumper repair restrictions'));
+  check('GM windshield: windshield statement, not the fascia one',
+    titles('Chevrolet', 'Silverado', ['WINDSHIELD_REPLACED']).includes('GM Windshield Replacement') && !titles('Chevrolet', 'Silverado', ['WINDSHIELD_REPLACED']).includes('GM Bumper Fascia with ADAS'));
+  check('no repairs checked: no documents', titles('Toyota', 'Camry', []).length === 0);
+  const html = jobReport.renderSections(build('Nissan', 'Rogue', '2025', ['WINDSHIELD_REPLACED']).result);
+  check('hard copy: OEM documents section with links', /OEM Documents for This Repair/.test(html) && /href="https:\/\/rts\.i-car\.com\/images\/pdf\/oem-info\/nissan\//.test(html));
+}
+
+// ─── High-voltage vehicles detected from make/model ──────────────────────────
+{
+  const hv = (mk, md, v = ['FRONT_DOOR_RI:L']) => build(mk, md, '2025', v).result.reviewItems.find((x) => x.event === 'HV EV post-crash');
+  check('Tesla, Rivian, F-150 Lightning, Ioniq 5, F-150 Hybrid: HV review item, marked as detected',
+    [['Tesla', 'Model Y'], ['Rivian', 'R1S'], ['Ford', 'F-150 Lightning'], ['Hyundai', 'Ioniq 5'], ['Ford', 'F-150 Hybrid']].every(([a, b]) => (hv(a, b) || {}).detected));
+  check('gas Camry and F-150: no HV item', !hv('Toyota', 'Camry') && !hv('Ford', 'F-150'));
+  const box = hv('Toyota', 'Camry', ['EV_HYBRID']);
+  check('EV box checked: one HV item, not marked as detected', box && !box.detected && build('Tesla', 'Model 3', '2025', ['EV_HYBRID']).result.reviewItems.filter((x) => x.event === 'HV EV post-crash').length === 1);
+}
+
 console.log(rep.failures ? `\n${rep.failures} job report check(s) FAILED` : '\nAll job report checks passed');
 process.exit(rep.failures ? 1 : 0);
