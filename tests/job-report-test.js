@@ -52,7 +52,7 @@ check('collision damage boxes set collisionRelated; door work alone does not',
 {
   const { result: r, columns } = build('Toyota', 'Camry', '2025', ['WINDSHIELD_REPLACED', 'FRONT_DOOR_RI:L', 'MIRROR_RI:L']);
   check('Camry: scan policy only, no invented OEM calibrations', r.ruleDepth === 'SCAN_POLICY_ONLY' && r.calibrations.length === 0 && r.basis.kind === 'none');
-  check('Camry: side mirror camera (left) + front camera field rules', verIds(r).join() === 'FIELD_FRONT_CAMERA,FIELD_SIDE_CAMERA_LEFT', verIds(r).join());
+  check('Camry: side mirror camera (left), blind spot, front camera, post-repair test field rules', verIds(r).join() === 'FIELD_BLIND_SPOT,FIELD_FRONT_CAMERA,FIELD_POST_REPAIR_TEST,FIELD_SIDE_CAMERA_LEFT', verIds(r).join());
   check('Camry: Toyota scan policy printed with source', /^REQUIRED — Toyota.*scan policy: Necessary$/.test(columns.preScanRequired) && columns.approvedScanTool.includes('Techstream') && /crn-429/.test(r.scanPolicy.source.url));
   check('Camry: no old-engine "PCS Static Calibration" line', !/PCS Static/.test(columns.adasSystems));
 }
@@ -81,7 +81,7 @@ check('collision damage boxes set collisionRelated; door work alone does not',
     ['Image Processing Module A Camera', 'Cruise Control Module', 'Side Parking Aid Camera', 'Front Parking Aid Camera', 'Center High Mount Stop Lamp Camera'].every((n) => names.includes(n)));
   check('F-150 #6755: blind spot (SODCM) calibration from blind spot sensor R&I', names.includes('Side Obstacle Detection Control Module'));
   check('F-150 #6755: every field rule applies',
-    ['FIELD_BLIND_SPOT', 'FIELD_FRONT_CAMERA', 'FIELD_FRONT_RADAR', 'FIELD_REAR_CAMERA', 'FIELD_REAR_PARKING', 'FIELD_SIDE_CAMERA_LEFT', 'FIELD_SIDE_CAMERA_RIGHT'].every((id) => verIds(r).includes(id)), verIds(r).join());
+    ['FIELD_BLIND_SPOT', 'FIELD_FRONT_CAMERA', 'FIELD_FRONT_RADAR', 'FIELD_POST_REPAIR_TEST', 'FIELD_REAR_CAMERA', 'FIELD_REAR_PARKING', 'FIELD_SIDE_CAMERA_LEFT', 'FIELD_SIDE_CAMERA_RIGHT'].every((id) => verIds(r).includes(id)), verIds(r).join());
   check('F-150 #6755: battery, structural, SRS and EV review items', codes(r).includes('BATTERY_DISCONNECT_REVIEW') && r.reviewItems.length === 3 && adasRequired);
   check('SRS review item omits the unverified register "checks" text', !r.reviewItems.find((x) => /SRS/.test(x.event)).checks);
 }
@@ -107,7 +107,7 @@ check('collision damage boxes set collisionRelated; door work alone does not',
   check('insurer view omits the shop checklist', !/Pre-Calibration Checklist/.test(insurer) && /OEM Calibrations Required/.test(insurer));
   check('parseStored tolerates junk', jobReport.parseStored('{bad') === null && jobReport.parseStored(null) === null);
   const none = build('', '', '', ['FRONT_DOOR_RI:L']);
-  check('no make: field rules still apply, flagged', none.result.verifications.length === 1 && codes(none.result).includes('MAKE_MISSING'));
+  check('no make: field rules still apply, flagged', none.result.verifications.length === 3 && codes(none.result).includes('MAKE_MISSING'));
 }
 
 // ─── OEM documents for the repair (source register) ──────────────────────────

@@ -107,6 +107,11 @@ const REAR_GATE = ['REAR_GATE_RI', 'REAR_GATE_ADJUST', 'REAR_GATE_HANDLE_LATCH_R
 const REAR_END = [...REAR_GATE, 'REAR_COLLISION_DAMAGE', 'REAR_BUMPER_RI', 'REAR_BUMPER_REPAIR'];
 const BLIND_SPOT_WORK = ['BLIND_SPOT_SENSOR_RI', 'BSI_RI', 'BSI_REPLACED', 'BSI_REPLACED_DAMAGE', 'BSI_MOUNT_PANEL_REPAIR', 'FRONT_CORNER_SENSOR_RI'];
 const PARKING_WORK = ['FRONT_PARKING_SENSOR_RI', 'REAR_PARKING_SENSOR_RI', 'REAR_BUMPER_RI', 'REAR_COLLISION_DAMAGE'];
+// Door and mirror work (either side): the side-object / blind spot system is checked too.
+// Fender and side panel work are not in this list; they reach the side camera rule only.
+const DOOR_MIRROR_WORK = [...SIDE.Left, ...SIDE.Right].filter((e) => !/FENDER|SIDE_PANEL/.test(e));
+// Service events that are not collision repair on their own (no post-repair test & verify).
+const NOT_COLLISION_REPAIR = ['BATTERY_DISCONNECT', 'WHEEL_ALIGNMENT', 'TIRE_SIZE_CHANGE'];
 
 const MINIMUM = 'Calibrate, or at a minimum perform an extensive in-shop and on-road test and verification, and document it.';
 const BASIS =
@@ -149,9 +154,15 @@ const RULES = [
   },
   {
     id: 'FIELD_BLIND_SPOT',
-    triggers: [...BLIND_SPOT_WORK, ...PARKING_WORK],
+    triggers: [...BLIND_SPOT_WORK, ...PARKING_WORK, ...DOOR_MIRROR_WORK],
     name: () => 'Blind spot system — verify and test (where equipped)',
-    text: 'Verify and test the blind spot system whenever its sensors or the parking aid sensors were worked on (the two systems are checked together).',
+    text: 'Verify and test the blind spot / side-object system, including lane-change assist where equipped, whenever its sensors or the parking aid sensors were worked on (the two systems are checked together), and after any door or mirror work, which can disturb side-mounted sensors, cameras and their modules.',
+  },
+  {
+    id: 'FIELD_POST_REPAIR_TEST',
+    anyExcept: NOT_COLLISION_REPAIR,
+    name: () => 'Post-repair test & verify — all collision repair',
+    text: 'Vehicle involved in collision repair. Confirm proper operation of the impacted driver-assist and safety systems after repairs are complete, and document it. This is an operational verification layer; it does not replace any required scan or calibration.',
   },
 ];
 
@@ -160,7 +171,8 @@ function apply(make, events) {
   const m = String(make || '').toLowerCase();
   const out = [];
   for (const r of RULES) {
-    const groups = r.sided ? Object.entries(r.triggers) : [[null, r.triggers]];
+    const triggers = r.anyExcept ? events.filter((e) => !r.anyExcept.includes(e)) : r.triggers;
+    const groups = r.sided ? Object.entries(triggers) : [[null, triggers]];
     for (const [side, triggers] of groups) {
       const hits = [...new Set(triggers)].filter((e) => has.has(e));
       if (!hits.length) continue;
