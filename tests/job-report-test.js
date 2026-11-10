@@ -52,7 +52,7 @@ check('collision damage boxes set collisionRelated; door work alone does not',
 {
   const { result: r, columns } = build('Toyota', 'Camry', '2025', ['WINDSHIELD_REPLACED', 'FRONT_DOOR_RI:L', 'MIRROR_RI:L']);
   check('Camry: scan policy only, no invented OEM calibrations', r.ruleDepth === 'SCAN_POLICY_ONLY' && r.calibrations.length === 0 && r.basis.kind === 'none');
-  check('Camry: side mirror camera (left) + front camera field rules', verIds(r).join() === 'FIELD_FRONT_CAMERA,FIELD_SIDE_CAMERA_LEFT', verIds(r).join());
+  check('Camry: side mirror camera (left), blind spot, front camera, post-repair test field rules', verIds(r).join() === 'FIELD_BLIND_SPOT,FIELD_FRONT_CAMERA,FIELD_POST_REPAIR_TEST,FIELD_SIDE_CAMERA_LEFT', verIds(r).join());
   check('Camry: Toyota scan policy printed with source', /^REQUIRED — Toyota.*scan policy: Necessary$/.test(columns.preScanRequired) && columns.approvedScanTool.includes('Techstream') && /crn-429/.test(r.scanPolicy.source.url));
   check('Camry: no old-engine "PCS Static Calibration" line', !/PCS Static/.test(columns.adasSystems));
 }
@@ -81,7 +81,7 @@ check('collision damage boxes set collisionRelated; door work alone does not',
     ['Image Processing Module A Camera', 'Cruise Control Module', 'Side Parking Aid Camera', 'Front Parking Aid Camera', 'Center High Mount Stop Lamp Camera'].every((n) => names.includes(n)));
   check('F-150 #6755: blind spot (SODCM) calibration from blind spot sensor R&I', names.includes('Side Obstacle Detection Control Module'));
   check('F-150 #6755: every field rule applies',
-    ['FIELD_BLIND_SPOT', 'FIELD_FRONT_CAMERA', 'FIELD_FRONT_RADAR', 'FIELD_REAR_CAMERA', 'FIELD_REAR_PARKING', 'FIELD_SIDE_CAMERA_LEFT', 'FIELD_SIDE_CAMERA_RIGHT'].every((id) => verIds(r).includes(id)), verIds(r).join());
+    ['FIELD_BLIND_SPOT', 'FIELD_FRONT_CAMERA', 'FIELD_FRONT_RADAR', 'FIELD_POST_REPAIR_TEST', 'FIELD_REAR_CAMERA', 'FIELD_REAR_PARKING', 'FIELD_SIDE_CAMERA_LEFT', 'FIELD_SIDE_CAMERA_RIGHT'].every((id) => verIds(r).includes(id)), verIds(r).join());
   check('F-150 #6755: battery, structural, SRS and EV review items', codes(r).includes('BATTERY_DISCONNECT_REVIEW') && r.reviewItems.length === 3 && adasRequired);
   check('SRS review item omits the unverified register "checks" text', !r.reviewItems.find((x) => /SRS/.test(x.event)).checks);
 }
@@ -107,7 +107,33 @@ check('collision damage boxes set collisionRelated; door work alone does not',
   check('insurer view omits the shop checklist', !/Pre-Calibration Checklist/.test(insurer) && /OEM Calibrations Required/.test(insurer));
   check('parseStored tolerates junk', jobReport.parseStored('{bad') === null && jobReport.parseStored(null) === null);
   const none = build('', '', '', ['FRONT_DOOR_RI:L']);
-  check('no make: field rules still apply, flagged', none.result.verifications.length === 1 && codes(none.result).includes('MAKE_MISSING'));
+  check('no make: field rules still apply, flagged', none.result.verifications.length === 3 && codes(none.result).includes('MAKE_MISSING'));
+}
+
+// ─── OEM documents for the repair (source register) ──────────────────────────
+{
+  const titles = (mk, md, v) => build(mk, md, '2025', v).result.oemDocuments.map((d) => d.title);
+  const n = titles('Nissan', 'Rogue', ['WINDSHIELD_REPLACED', 'FRONT_BUMPER_RI']);
+  check('Nissan windshield + bumper: ADAS components, glass and radar statements',
+    ['Nissan ADAS Components NPSB/26-971', 'Nissan vehicle glass statement', 'Nissan front radar calibration position'].every((t) => n.includes(t)), n.join(' ; '));
+  check('Nissan Rogue: no ARIYA-only or Infiniti-only documents, no repeat of the scan statement',
+    !n.some((t) => /ARIYA|Infiniti|pre\/post/i.test(t)));
+  check('Nissan Ariya: ARIYA bumper document shown', titles('Nissan', 'Ariya', ['FRONT_BUMPER_RI']).includes('Nissan ARIYA bumper repair restrictions'));
+  check('GM windshield: windshield statement, not the fascia one',
+    titles('Chevrolet', 'Silverado', ['WINDSHIELD_REPLACED']).includes('GM Windshield Replacement') && !titles('Chevrolet', 'Silverado', ['WINDSHIELD_REPLACED']).includes('GM Bumper Fascia with ADAS'));
+  check('no repairs checked: no documents', titles('Toyota', 'Camry', []).length === 0);
+  const html = jobReport.renderSections(build('Nissan', 'Rogue', '2025', ['WINDSHIELD_REPLACED']).result);
+  check('hard copy: OEM documents section with links', /OEM Documents for This Repair/.test(html) && /href="https:\/\/rts\.i-car\.com\/images\/pdf\/oem-info\/nissan\//.test(html));
+}
+
+// ─── High-voltage vehicles detected from make/model ──────────────────────────
+{
+  const hv = (mk, md, v = ['FRONT_DOOR_RI:L']) => build(mk, md, '2025', v).result.reviewItems.find((x) => x.event === 'HV EV post-crash');
+  check('Tesla, Rivian, F-150 Lightning, Ioniq 5, F-150 Hybrid: HV review item, marked as detected',
+    [['Tesla', 'Model Y'], ['Rivian', 'R1S'], ['Ford', 'F-150 Lightning'], ['Hyundai', 'Ioniq 5'], ['Ford', 'F-150 Hybrid']].every(([a, b]) => (hv(a, b) || {}).detected));
+  check('gas Camry and F-150: no HV item', !hv('Toyota', 'Camry') && !hv('Ford', 'F-150'));
+  const box = hv('Toyota', 'Camry', ['EV_HYBRID']);
+  check('EV box checked: one HV item, not marked as detected', box && !box.detected && build('Tesla', 'Model 3', '2025', ['EV_HYBRID']).result.reviewItems.filter((x) => x.event === 'HV EV post-crash').length === 1);
 }
 
 console.log(rep.failures ? `\n${rep.failures} job report check(s) FAILED` : '\nAll job report checks passed');
