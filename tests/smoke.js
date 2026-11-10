@@ -323,6 +323,101 @@ const userId = (username) => DB.prepare('SELECT id FROM users WHERE username=?')
   check('service_writer blocked from uploading photos', denied(r), `status ${r.status}`);
   r = await writer.req('GET', '/admin'); check('service_writer blocked from /admin', denied(r), `status ${r.status}`);
 
+  // ─── Calibration record (Nov 2026) ─────────────────────────────────────────
+  heading('Calibration record');
+  const PDF = Buffer.from('%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n');
+  const recordForm = (client, fields, files = []) => {
+    const fd = new FormData();
+    fd.append('_csrf', client.token);
+    for (const [k, v] of Object.entries(fields)) fd.append(k, v);
+    for (const [buf, type, name] of files) fd.append('proof', new Blob([buf], { type }), name);
+    return fd;
+  };
+  const today = new Date().toISOString().slice(0, 10);
+  const passFields = { result: 'pass', method: 'Scan', si_reference: 'OEM SI doc 12345, 2026-10-01', tool: 'OEM scan tool', performed_by_name: 'Tech One', performed_on: today };
+  await admin.freshToken(`/jobs/${jobA}`);
+  r = await admin.req('GET', `/jobs/${jobA}`);
+  check('job page shows the calibration record and the add form', /Calibration Record/.test(r.text) && /name="item_key"/.test(r.text) && /value="SCAN:PRE"/.test(r.text) && /documented/.test(r.text));
+  r = await admin.req('POST', `/jobs/${jobA}/calibrations`, recordForm(admin, { item_key: 'SCAN:PRE', ...passFields }, [[PDF, 'application/pdf', 'prescan.pdf'], [PNG, 'image/png', 'screen.png']]));
+  check('record with PDF + photo proof saved', r.status === 302 && /\/jobs\//.test(r.location), `status ${r.status}`);
+  const recRow = DB ? DB.prepare("SELECT * FROM job_calibrations WHERE job_id=? AND item_key='SCAN:PRE'").get(jobA) : null;
+  const proofRows = DB && recRow ? DB.prepare('SELECT * FROM job_calibration_files WHERE calibration_id=? ORDER BY id').all(recRow.id) : [];
+  check('record and 2 proof files stored', !DB || (recRow && recRow.result === 'pass' && recRow.tool === 'OEM scan tool' && proofRows.length === 2 && proofRows[0].file_path.endsWith('.pdf')));
+  r = await admin.req('GET', `/jobs/${jobA}`);
+  check('job page shows the record with proof links', /prescan\.pdf/.test(r.text) && /OEM SI doc 12345/.test(r.text));
+  const pdfId = proofRows[0] && proofRows[0].id;
+  if (pdfId) {
+    r = await admin.req('GET', `/jobs/${jobA}/calibrations/files/${pdfId}`);
+    check('proof PDF served to own shop as application/pdf, inline', r.status === 200 && /application\/pdf/.test(r.headers.get('content-type')) && /^inline/.test(r.headers.get('content-disposition') || ''));
+    r = await anon.req('GET', `/jobs/${jobA}/calibrations/files/${pdfId}`);
+    check('proof file needs login', r.status === 302 && /\/login/.test(r.location));
+    r = await north.req('GET', `/jobs/${jobA}/calibrations/files/${pdfId}`);
+    check('other shop cannot fetch proof file', r.status === 404);
+    r = await anon.req('GET', `/share/${liveToken}`);
+    check('insurer view shows the calibration record with proof links', r.status === 200 && /Calibration Record/.test(r.text) && new RegExp(`/share/${liveToken}/files/${pdfId}`).test(r.text) && !/name="item_key"/.test(r.text));
+    r = await anon.req('GET', `/share/${liveToken}/files/${pdfId}`);
+    check('insurer can open proof file via share link', r.status === 200 && /application\/pdf/.test(r.headers.get('content-type')));
+    r = await anon.req('GET', `/share/${crypto.randomUUID()}/files/${pdfId}`);
+    check('bad share token cannot open proof file', r.status === 404);
+  }
+  r = await admin.req('POST', `/jobs/${jobA}/calibrations`, recordForm(admin, { item_key: 'SCAN:POST', ...passFields }, [[Buffer.from('<html><script>alert(1)</script>'), 'application/pdf', 'fake.pdf']]));
+  check('fake PDF rejected', r.status === 400 && /not a valid PDF/.test(r.text));
+  r = await admin.req('POST', `/jobs/${jobA}/calibrations`, recordForm(admin, { item_key: 'SCAN:POST', ...passFields }, [[Buffer.from('<svg/>'), 'image/svg+xml', 'x.svg']]));
+  check('SVG proof rejected', r.status === 400);
+  const fdNoTok = new FormData(); fdNoTok.append('item_key', 'SCAN:POST'); fdNoTok.append('result', 'pass');
+  r = await admin.req('POST', `/jobs/${jobA}/calibrations`, fdNoTok);
+  check('record without CSRF token rejected', r.status === 403 && /form token/i.test(r.text));
+  const countBefore = DB ? DB.prepare('SELECT COUNT(*) n FROM job_calibrations').get().n : 0;
+  r = await admin.req('POST', `/jobs/${jobA}/calibrations`, recordForm(admin, { item_key: 'SCAN:POST', result: 'pass', performed_by_name: 'Tech One', performed_on: today }));
+  check('scan record without tool not saved (validation)', r.status === 302 && (!DB || DB.prepare('SELECT COUNT(*) n FROM job_calibrations').get().n === countBefore));
+  r = await admin.req('GET', `/jobs/${jobA}`);
+  check('validation message shown on the job page', /Record not saved: .*scan tool/.test(r.text));
+  r = await admin.req('POST', `/jobs/${jobA}/calibrations`, recordForm(admin, { item_key: 'OEM:NOT_ON_THIS_JOB', ...passFields }));
+  check('unknown requirement key not saved', r.status === 302 && (!DB || DB.prepare('SELECT COUNT(*) n FROM job_calibrations').get().n === countBefore));
+  r = await admin.req('POST', `/jobs/${jobA}/calibrations`, recordForm(admin, { item_key: 'ADDITIONAL', item_name: 'Rear radar alignment', ...passFields, method: 'Dynamic' }));
+  check('additional calibration from OEM SI recorded', r.status === 302 && (!DB || DB.prepare("SELECT 1 FROM job_calibrations WHERE job_id=? AND item_key='ADDITIONAL:REAR_RADAR_ALIGNMENT'").get(jobA)));
+  r = await north.req('POST', `/jobs/${jobA}/calibrations`, recordForm(north, { item_key: 'SCAN:POST', ...passFields }));
+  check('other shop cannot add a record', r.status === 404);
+  await tech.freshToken(`/jobs/${jobA}`);
+  r = await tech.req('POST', `/jobs/${jobA}/calibrations`, recordForm(tech, { item_key: 'SCAN:POST', ...passFields }));
+  check('technician can add a record', r.status === 302);
+  await writer.freshToken(`/jobs/${jobA}`);
+  r = await writer.req('GET', `/jobs/${jobA}`);
+  check('service_writer sees the record but no record form', /Calibration Record/.test(r.text) && !/name="item_key"/.test(r.text));
+  r = await writer.req('POST', `/jobs/${jobA}/calibrations`, recordForm(writer, { item_key: 'SCAN:POST', ...passFields }));
+  check('service_writer cannot add a record', denied(r), `status ${r.status}`);
+  if (recRow) {
+    await admin.freshToken(`/jobs/${jobA}`);
+    r = await admin.post(`/jobs/${jobA}/calibrations/${recRow.id}/void`, { void_reason: '' });
+    check('void without a reason refused', r.status === 302 && !DB.prepare('SELECT voided_at FROM job_calibrations WHERE id=?').get(recRow.id).voided_at);
+    r = await admin.post(`/jobs/${jobA}/calibrations/${recRow.id}/void`, { void_reason: 'Wrong VIN on scan report' });
+    const v = DB.prepare('SELECT voided_at, void_reason FROM job_calibrations WHERE id=?').get(recRow.id);
+    check('record voided with reason, row kept', r.status === 302 && v.voided_at && v.void_reason === 'Wrong VIN on scan report');
+    r = await anon.req('GET', `/share/${liveToken}/files/${pdfId}`);
+    check('voided record proof no longer served', r.status === 404);
+    r = await north.post(`/jobs/${jobA}/calibrations/${recRow.id}/void`, { void_reason: 'cross shop' });
+    check('other shop cannot void', r.status === 404);
+  }
+  // Status gate: jobB was saved by the old engine (scans + OEM SI review required).
+  await admin.freshToken(`/jobs/${jobB}`);
+  r = await admin.post(`/jobs/${jobB}/status`, { status: 'Calibration Complete' });
+  check('Calibration Complete blocked while items are open', r.status === 302 && (!DB || DB.prepare('SELECT status FROM jobs WHERE jobId=?').get(jobB).status !== 'Calibration Complete'));
+  r = await admin.req('GET', '/admin');
+  check('admin page explains what is open', /cannot be marked Calibration Complete: 3 calibration record item\(s\) open/.test(r.text) && /Pre-repair scan/.test(r.text));
+  await admin.freshToken(`/jobs/${jobB}`);
+  for (const key of ['SCAN:PRE', 'SI:REVIEW', 'SCAN:POST']) {
+    await admin.req('POST', `/jobs/${jobB}/calibrations`, recordForm(admin, { item_key: key, ...passFields }));
+  }
+  r = await admin.req('POST', `/jobs/${jobB}/calibrations`, recordForm(admin, { item_key: 'ADDITIONAL', item_name: 'Front camera aiming', ...passFields, result: 'fail' }));
+  await admin.freshToken('/admin');
+  r = await admin.post(`/jobs/${jobB}/status`, { status: 'Closed' });
+  check('failed additional calibration keeps the job open', !DB || DB.prepare('SELECT status FROM jobs WHERE jobId=?').get(jobB).status !== 'Closed');
+  await admin.freshToken(`/jobs/${jobB}`);
+  await admin.req('POST', `/jobs/${jobB}/calibrations`, recordForm(admin, { item_key: 'ADDITIONAL', item_name: 'Front camera aiming', ...passFields, result: 'not_performed', reason: 'Customer declined; signed waiver on file' }));
+  r = await admin.req('GET', `/jobs/${jobB}`);
+  check('job header shows the record complete', /3\/3 documented/.test(r.text) && /All 3 required items are documented/.test(r.text));
+  await admin.freshToken('/admin');
+
   heading('Closed-job photo lock');
   await admin.freshToken('/new');
   r = await admin.post(`/jobs/${jobB}/status`, { status: 'Closed' });
