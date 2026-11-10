@@ -2143,3 +2143,5 @@ a:hover {
 @media print {
   .signoff-list li { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
 }
+.access-open-form { display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center; }
+.access-open-form select, .access-open-form input { font-size: 0.8rem; padding: 0.25rem 0.4rem; max-width: 220px; }

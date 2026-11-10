@@ -198,22 +198,22 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_job_assignments_job ON job_assignments(job_id);
   CREATE INDEX IF NOT EXISTS idx_job_assignments_user ON job_assignments(user_id);
-  -- Support access: the only way platform admin sees a shop's jobs. Granted by
-  -- the shop admin, time-limited, read-only, revocable; every view is logged.
-  CREATE TABLE IF NOT EXISTS support_grants (
+  -- Platform access: how platform admin opens a shop's jobs, read-only, for a
+  -- reason the terms of service allow. Private to the platform (shops don't see
+  -- it); every view is logged as the platform's own record of staying in terms.
+  CREATE TABLE IF NOT EXISTS platform_access (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     shop_id INTEGER NOT NULL,
-    granted_by INTEGER NOT NULL, reason TEXT NOT NULL,
-    granted_at TEXT NOT NULL, expires_at TEXT NOT NULL,
-    revoked_by INTEGER, revoked_at TEXT,
+    opened_by INTEGER NOT NULL, reason_type TEXT NOT NULL, note TEXT NOT NULL,
+    opened_at TEXT NOT NULL, expires_at TEXT NOT NULL, closed_at TEXT,
     FOREIGN KEY (shop_id) REFERENCES shops(id)
   );
-  CREATE TABLE IF NOT EXISTS support_access_log (
+  CREATE TABLE IF NOT EXISTS platform_access_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    grant_id INTEGER NOT NULL, shop_id INTEGER NOT NULL, user_id INTEGER,
+    access_id INTEGER NOT NULL, shop_id INTEGER NOT NULL, user_id INTEGER,
     method TEXT, path TEXT, at TEXT NOT NULL
   );
-  CREATE INDEX IF NOT EXISTS idx_support_access_log_shop ON support_access_log(shop_id, id);
+  CREATE INDEX IF NOT EXISTS idx_platform_access_log_shop ON platform_access_log(shop_id, id);
 `);
 // One-time link for jobs saved before assignments existed: a job whose typed
 // technician name matches exactly one active technician in its shop (full name
@@ -449,9 +449,9 @@ function layout(title, content, activeNav='', user=null) {
   const logout = ctxReq ? `<form method="POST" action="/logout" class="nav-logout-form">${csrfField(ctxReq)}<button type="submit" class="nav-logout">Logout</button></form>` : '';
   let navLinks = '';
   if (role === 'platform_admin') {
-    navLinks = `${nav('/','list','Support Access')}${nav('/reference','reference','ADAS Reference')}${nav('/platform/shops','shops','Shops')}${nav('/platform/billing','billing','Billing')}${logout}`;
+    navLinks = `${nav('/','list','Jobs')}${nav('/reference','reference','ADAS Reference')}${nav('/platform/shops','shops','Shops')}${nav('/platform/access','access','Access Log')}${nav('/platform/billing','billing','Billing')}${logout}`;
   } else if (role === 'shop_admin') {
-    navLinks = `${nav('/','list','Jobs')}${nav('/new','new','New Job')}${nav('/reference','reference','ADAS Reference')}${nav('/admin','admin','Admin')}${nav('/admin/users','users','Users')}${nav('/admin/support','support','Support Access')}${logout}`;
+    navLinks = `${nav('/','list','Jobs')}${nav('/new','new','New Job')}${nav('/reference','reference','ADAS Reference')}${nav('/admin','admin','Admin')}${nav('/admin/users','users','Users')}${logout}`;
   } else if (role === 'technician') {
     navLinks = `${nav('/','list','My Jobs')}${nav('/reference','reference','ADAS Reference')}${logout}`;
   } else if (role) {
@@ -743,22 +743,23 @@ function canUploadPhotos(user, job) {
 function isAssigned(jobId, userId) {
   return Boolean(db.prepare('SELECT 1 FROM job_assignments WHERE job_id=? AND user_id=? AND removed_at IS NULL').get(jobId, userId));
 }
-// ─── Support access (platform admin) ────────────────────────────────────────
-// Platform admin never sees a shop's jobs unless that shop's admin has granted
-// support access: read-only, time-limited, revocable, and every view is logged
-// for the shop to see.
-const SUPPORT_HOURS = [4, 24, 72];
-function activeGrant(shopId) {
+// ─── Platform access (platform admin) ───────────────────────────────────────
+// Platform admin sees a shop's jobs only after opening access to that shop for
+// a reason the terms of service allow. Read-only; 4-hour window; every view is
+// logged. The log is the platform's own record and is not shown to shops.
+const ACCESS_REASONS = { legal: 'Legal matter involving the shop and the platform', support: 'Technical support', update: 'Platform update or maintenance' };
+const ACCESS_HOURS = 4;
+function activeAccess(shopId) {
   if (shopId === null || shopId === undefined) return null;
-  return db.prepare('SELECT * FROM support_grants WHERE shop_id=? AND revoked_at IS NULL AND expires_at > ? ORDER BY id DESC LIMIT 1')
+  return db.prepare('SELECT * FROM platform_access WHERE shop_id=? AND closed_at IS NULL AND expires_at > ? ORDER BY id DESC LIMIT 1')
     .get(shopId, new Date().toISOString()) || null;
 }
-function grantedShopIds() {
-  return db.prepare('SELECT DISTINCT shop_id FROM support_grants WHERE revoked_at IS NULL AND expires_at > ?').all(new Date().toISOString()).map((r) => r.shop_id);
+function openShopIds() {
+  return db.prepare('SELECT DISTINCT shop_id FROM platform_access WHERE closed_at IS NULL AND expires_at > ?').all(new Date().toISOString()).map((r) => r.shop_id);
 }
-function logSupportAccess(req, grant) {
-  db.prepare('INSERT INTO support_access_log (grant_id,shop_id,user_id,method,path,at) VALUES (?,?,?,?,?,?)')
-    .run(grant.id, grant.shop_id, req.session.user.id, req.method, String(req.originalUrl || '').slice(0, 300), new Date().toISOString());
+function logPlatformAccess(req, access) {
+  db.prepare('INSERT INTO platform_access_log (access_id,shop_id,user_id,method,path,at) VALUES (?,?,?,?,?,?)')
+    .run(access.id, access.shop_id, req.session.user.id, req.method, String(req.originalUrl || '').slice(0, 300), new Date().toISOString());
 }
 function assignedTechs(jobId) {
   return db.prepare(`SELECT u.id, u.full_name, u.username FROM job_assignments a JOIN users u ON u.id=a.user_id
@@ -788,9 +789,9 @@ function ownedJob(req) {
   const u = req.session.user;
   if (u.role === 'platform_admin') {
     const j = db.prepare('SELECT * FROM jobs WHERE jobId=?').get(req.params.jobId);
-    const grant = j ? activeGrant(j.shop_id) : null;
-    if (!grant) return undefined;
-    logSupportAccess(req, grant);
+    const access = j ? activeAccess(j.shop_id) : null;
+    if (!access) return undefined;
+    logPlatformAccess(req, access);
     return j;
   }
   const job = db.prepare('SELECT * FROM jobs WHERE jobId=? AND shop_id=?').get(req.params.jobId, u.shop_id);
@@ -1028,9 +1029,9 @@ app.get('/', requireAuth, requireSubscription, (req, res) => {
   }
   if (user.role === 'technician') jobs = jobs.filter((j) => isAssigned(j.jobId, user.id));
   if (user.role === 'platform_admin') {
-    const granted = new Set(grantedShopIds());
-    jobs = jobs.filter((j) => granted.has(j.shop_id));
-    for (const sid of granted) logSupportAccess(req, activeGrant(sid));
+    const open = new Set(openShopIds());
+    jobs = jobs.filter((j) => open.has(j.shop_id));
+    for (const sid of open) logPlatformAccess(req, activeAccess(sid));
   }
 
   const rows = jobs.map(j => `<tr>
@@ -1045,7 +1046,7 @@ app.get('/', requireAuth, requireSubscription, (req, res) => {
 
   const content = `
     ${flash?`<div style="background:${flash.type==='success'?'#D6F0D6':'#FFD6D6'};color:${flash.type==='success'?'#1A6B1A':'#8B0000'};padding:.65rem 1rem;border-radius:6px;margin-bottom:1rem">${escapeHtml(flash.msg)}</div>`:''}
-    ${user.role === 'platform_admin' ? '<p class="adas-basis" style="margin-bottom:1rem">Shop jobs are private to each shop. This list shows only shops whose admin has granted read-only support access, and every view is logged for that shop.</p>' : ''}
+    ${user.role === 'platform_admin' ? '<p class="adas-basis" style="margin-bottom:1rem">Shop jobs are the shops\' records. This list shows only shops you have opened under Shops for a reason the terms allow (legal, technical support, update). Access is read-only and every view is in your Access Log.</p>' : ''}
     ${user.role === 'technician' ? '<p class="adas-basis" style="margin-bottom:1rem">Jobs assigned to you.</p>' : ''}
     <div class="page-header"><h1>Jobs <span class="count-badge">${jobs.length}</span></h1>${JOB_EDITORS.includes(user.role) ? '<a href="/new" class="btn btn-primary">+ New Job</a>' : ''}</div>
     <div class="search-bar"><form method="GET" action="/"><input type="text" name="search" placeholder="Search by RO#, VIN, or Technician…" value="${escapeHtml(search)}"><button type="submit" class="btn">Search</button>${search?'<a href="/" class="btn btn-ghost">Clear</a>':''}</form></div>
@@ -1389,57 +1390,6 @@ app.get('/jobs/:jobId/photos/:photoId/file', requireAuth, requireSubscription, (
   });
 });
 
-// ─── Support access (shop admin controls) ───────────────────────────────────
-function requireShopAdmin(req, res, next) {
-  if (!req.session.user) return res.redirect('/login');
-  if (req.session.user.role !== 'shop_admin' || !req.session.user.shop_id) return res.status(403).send('Access denied.');
-  next();
-}
-app.get('/admin/support', requireShopAdmin, (req, res) => {
-  const user = req.session.user;
-  const flash = consumeFlash(req);
-  const g = activeGrant(user.shop_id);
-  const grants = db.prepare(`SELECT g.*, u.full_name AS by_name, r.full_name AS revoked_name FROM support_grants g
-    LEFT JOIN users u ON u.id=g.granted_by LEFT JOIN users r ON r.id=g.revoked_by WHERE g.shop_id=? ORDER BY g.id DESC LIMIT 50`).all(user.shop_id);
-  const log = db.prepare('SELECT * FROM support_access_log WHERE shop_id=? ORDER BY id DESC LIMIT 200').all(user.shop_id);
-  const t = (iso) => iso ? `${escapeHtml(iso.replace('T', ' ').slice(0, 16))} UTC` : '—';
-  const content = `${flash?`<div style="background:${flash.type==='success'?'#D6F0D6':'#FFD6D6'};color:${flash.type==='success'?'#1A6B1A':'#8B0000'};padding:.65rem 1rem;border-radius:6px;margin-bottom:1rem">${escapeHtml(flash.msg)}</div>`:''}
-    <div class="page-header"><h1>Support Access</h1></div>
-    <div class="doc-section"><p class="adas-basis">CollisionIQ staff cannot see your jobs, records, photos or files. If you need help, you can grant temporary, read-only support access here. You can end it at any time, and every page viewed is listed below.</p>
-    ${g ? `<p style="margin:.75rem 0"><span class="badge badge-orange">Support access is ON</span> until ${t(g.expires_at)}. Reason: ${escapeHtml(g.reason)}</p>
-      <form method="POST" action="/admin/support/revoke">${csrfField(req)}<button class="btn btn-primary">End support access now</button></form>`
-    : `<p style="margin:.75rem 0"><span class="badge badge-green">Support access is OFF</span></p>
-      <form method="POST" action="/admin/support/grant" style="display:grid;gap:.75rem;max-width:520px">${csrfField(req)}
-        <div class="form-group"><label>Reason (what you need help with)</label><input type="text" name="reason" maxlength="300" required minlength="10"></div>
-        <div class="form-group"><label>Length</label><select name="hours">${SUPPORT_HOURS.map((h) => `<option value="${h}"${h === 24 ? ' selected' : ''}>${h} hours</option>`).join('')}</select></div>
-        <button class="btn">Grant read-only support access</button></form>`}</div>
-    <div class="doc-section"><h2 class="doc-section-title">Grants</h2><div class="table-wrap"><table class="data-table"><thead><tr><th>Granted</th><th>By</th><th>Reason</th><th>Ends</th><th>Ended early</th></tr></thead><tbody>
-      ${grants.map((x) => `<tr><td>${t(x.granted_at)}</td><td>${escapeHtml(x.by_name || '—')}</td><td>${escapeHtml(x.reason)}</td><td>${t(x.expires_at)}</td><td>${x.revoked_at ? `${t(x.revoked_at)} by ${escapeHtml(x.revoked_name || '—')}` : '—'}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">Never granted.</td></tr>'}</tbody></table></div></div>
-    <div class="doc-section"><h2 class="doc-section-title">Pages viewed by CollisionIQ staff</h2><div class="table-wrap"><table class="data-table"><thead><tr><th>When</th><th>Page</th></tr></thead><tbody>
-      ${log.map((x) => `<tr><td>${t(x.at)}</td><td class="mono">${escapeHtml(x.method)} ${escapeHtml(x.path)}</td></tr>`).join('') || '<tr><td colspan="2" class="empty">No views.</td></tr>'}</tbody></table></div></div>`;
-  res.send(layout('Support Access', content, 'support', user));
-});
-app.post('/admin/support/grant', requireShopAdmin, (req, res) => {
-  const user = req.session.user;
-  const reason = str(req.body.reason, 300);
-  const hours = Number(req.body.hours);
-  if (reason.length < 10) { setFlash(req, 'error', 'Describe what you need help with (at least 10 characters).'); return res.redirect('/admin/support'); }
-  if (!SUPPORT_HOURS.includes(hours)) return res.status(400).send('Invalid length');
-  if (activeGrant(user.shop_id)) { setFlash(req, 'error', 'Support access is already on.'); return res.redirect('/admin/support'); }
-  const now = new Date();
-  db.prepare('INSERT INTO support_grants (shop_id,granted_by,reason,granted_at,expires_at) VALUES (?,?,?,?,?)')
-    .run(user.shop_id, user.id, reason, now.toISOString(), new Date(now.getTime() + hours * 3600 * 1000).toISOString());
-  setFlash(req, 'success', `Read-only support access granted for ${hours} hours.`);
-  res.redirect('/admin/support');
-});
-app.post('/admin/support/revoke', requireShopAdmin, (req, res) => {
-  const user = req.session.user;
-  db.prepare('UPDATE support_grants SET revoked_by=?, revoked_at=? WHERE shop_id=? AND revoked_at IS NULL AND expires_at > ?')
-    .run(user.id, new Date().toISOString(), user.shop_id, new Date().toISOString());
-  setFlash(req, 'success', 'Support access ended.');
-  res.redirect('/admin/support');
-});
-
 // ─── Technician assignment ──────────────────────────────────────────────────
 app.post('/jobs/:jobId/assign', requireAuth, requireSubscription, (req, res) => {
   const user = req.session.user;
@@ -1656,9 +1606,9 @@ app.get('/admin', requireAdmin, (req, res) => {
     ? db.prepare('SELECT * FROM jobs WHERE shop_id=? ORDER BY createdAt DESC').all(shopId)
     : db.prepare('SELECT * FROM jobs ORDER BY createdAt DESC').all();
   if (user.role === 'platform_admin') {
-    const granted = new Set(grantedShopIds());
-    jobs = jobs.filter((j) => granted.has(j.shop_id));
-    for (const sid of granted) logSupportAccess(req, activeGrant(sid));
+    const open = new Set(openShopIds());
+    jobs = jobs.filter((j) => open.has(j.shop_id));
+    for (const sid of open) logPlatformAccess(req, activeAccess(sid));
   }
   const statusOptions = ['Created','In Progress','Calibration Complete','Closed'];
   const flash = consumeFlash(req);
@@ -1753,13 +1703,48 @@ app.get('/platform/shops', requirePlatformAdmin, (req, res) => {
   const rows = shops.map(s => {
     const uc = db.prepare('SELECT COUNT(*) as c FROM users WHERE shop_id=?').get(s.id);
     const jc = db.prepare('SELECT COUNT(*) as c FROM jobs WHERE shop_id=?').get(s.id);
-    const g = activeGrant(s.id);
-    return `<tr><td><strong>${escapeHtml(s.name)}</strong></td><td>${escapeHtml(s.subscription_status||'inactive')}</td><td>${uc.c}</td><td>${jc.c}</td><td>${g ? `Granted until ${escapeHtml(g.expires_at.replace('T',' ').slice(0,16))} UTC` : '—'}</td><td>${formatDate(s.created_at)}</td></tr>`;
+    const a = activeAccess(s.id);
+    const accessCell = a
+      ? `Open until ${escapeHtml(a.expires_at.replace('T',' ').slice(0,16))} UTC (${escapeHtml(ACCESS_REASONS[a.reason_type] || a.reason_type)})<form method="POST" action="/platform/access/${a.id}/close" class="inline-form">${csrfField(req)}<button class="btn btn-sm">Close</button></form>`
+      : `<form method="POST" action="/platform/shops/${s.id}/access" class="inline-form access-open-form">${csrfField(req)}<select name="reason_type" required><option value="">Reason…</option>${Object.entries(ACCESS_REASONS).map(([k, v]) => `<option value="${k}">${escapeHtml(v)}</option>`).join('')}</select><input type="text" name="note" maxlength="300" minlength="10" required placeholder="What and why (ticket, matter)"><button class="btn btn-sm">Open read-only</button></form>`;
+    return `<tr><td><strong>${escapeHtml(s.name)}</strong></td><td>${escapeHtml(s.subscription_status||'inactive')}</td><td>${uc.c}</td><td>${jc.c}</td><td>${accessCell}</td><td>${formatDate(s.created_at)}</td></tr>`;
   }).join('');
   const content = `<div class="page-header"><h1>Shops <span class="count-badge">${shops.length}</span></h1></div>
     <div class="doc-section" style="margin-bottom:2rem"><h2 class="doc-section-title">Onboard New Shop</h2><form method="POST" action="/platform/shops/create" style="display:grid;gap:1rem;max-width:520px">${csrfField(req)}<div class="form-group"><label>Shop Name</label><input type="text" name="shop_name" required></div><div class="form-group"><label>Admin Full Name</label><input type="text" name="admin_full_name" required></div><div class="form-group"><label>Admin Username</label><input type="text" name="admin_username" required autocomplete="off"></div><div class="form-group"><label>Temporary Password</label><input type="password" name="admin_password" required autocomplete="new-password"></div><button type="submit" class="btn btn-primary">Create Shop</button></form></div>
-    <div class="table-wrap"><table class="data-table"><thead><tr><th>Shop</th><th>Status</th><th>Users</th><th>Jobs</th><th>Support access</th><th>Created</th></tr></thead><tbody>${rows||'<tr><td colspan="6" class="empty">No shops.</td></tr>'}</tbody></table></div>`;
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Shop</th><th>Status</th><th>Users</th><th>Jobs</th><th>Job access</th><th>Created</th></tr></thead><tbody>${rows||'<tr><td colspan="6" class="empty">No shops.</td></tr>'}</tbody></table></div>`;
   res.send(layout('Shops', content, 'shops', req.session.user));
+});
+
+app.post('/platform/shops/:id/access', requirePlatformAdmin, (req, res) => {
+  const shop = db.prepare('SELECT id, name FROM shops WHERE id=?').get(req.params.id);
+  if (!shop) return res.status(404).send('Not found');
+  const reasonType = str(req.body.reason_type, 20);
+  const note = str(req.body.note, 300);
+  if (!ACCESS_REASONS[reasonType]) return res.status(400).send('Choose a reason the terms of service allow.');
+  if (note.length < 10) return res.status(400).send('Describe the matter (at least 10 characters).');
+  if (!activeAccess(shop.id)) {
+    const now = new Date();
+    db.prepare('INSERT INTO platform_access (shop_id,opened_by,reason_type,note,opened_at,expires_at) VALUES (?,?,?,?,?,?)')
+      .run(shop.id, req.session.user.id, reasonType, note, now.toISOString(), new Date(now.getTime() + ACCESS_HOURS * 3600 * 1000).toISOString());
+  }
+  res.redirect('/');
+});
+app.post('/platform/access/:id/close', requirePlatformAdmin, (req, res) => {
+  db.prepare('UPDATE platform_access SET closed_at=? WHERE id=? AND closed_at IS NULL').run(new Date().toISOString(), req.params.id);
+  res.redirect('/platform/shops');
+});
+app.get('/platform/access', requirePlatformAdmin, (req, res) => {
+  const t = (iso) => iso ? `${escapeHtml(iso.replace('T', ' ').slice(0, 16))} UTC` : '—';
+  const sessions = db.prepare(`SELECT a.*, s.name AS shop_name, u.username FROM platform_access a JOIN shops s ON s.id=a.shop_id
+    LEFT JOIN users u ON u.id=a.opened_by ORDER BY a.id DESC LIMIT 100`).all();
+  const views = db.prepare(`SELECT l.*, s.name AS shop_name FROM platform_access_log l JOIN shops s ON s.id=l.shop_id ORDER BY l.id DESC LIMIT 300`).all();
+  const content = `<div class="page-header"><h1>Access Log</h1></div>
+    <p class="adas-basis" style="margin-bottom:1rem">Your record of every time shop jobs were opened and every page viewed. It is private to the platform and kept as evidence that access stayed within the terms of service.</p>
+    <div class="doc-section"><h2 class="doc-section-title">Access sessions</h2><div class="table-wrap"><table class="data-table"><thead><tr><th>Opened</th><th>Shop</th><th>By</th><th>Reason</th><th>Note</th><th>Ends</th><th>Closed</th></tr></thead><tbody>
+      ${sessions.map((x) => `<tr><td>${t(x.opened_at)}</td><td>${escapeHtml(x.shop_name)}</td><td>${escapeHtml(x.username || '—')}</td><td>${escapeHtml(ACCESS_REASONS[x.reason_type] || x.reason_type)}</td><td>${escapeHtml(x.note)}</td><td>${t(x.expires_at)}</td><td>${t(x.closed_at)}</td></tr>`).join('') || '<tr><td colspan="7" class="empty">None.</td></tr>'}</tbody></table></div></div>
+    <div class="doc-section"><h2 class="doc-section-title">Pages viewed</h2><div class="table-wrap"><table class="data-table"><thead><tr><th>When</th><th>Shop</th><th>Page</th></tr></thead><tbody>
+      ${views.map((x) => `<tr><td>${t(x.at)}</td><td>${escapeHtml(x.shop_name)}</td><td class="mono">${escapeHtml(x.method)} ${escapeHtml(x.path)}</td></tr>`).join('') || '<tr><td colspan="3" class="empty">None.</td></tr>'}</tbody></table></div></div>`;
+  res.send(layout('Access Log', content, 'access', req.session.user));
 });
 
 app.post('/platform/shops/create', requirePlatformAdmin, asyncRoute(async (req, res) => {

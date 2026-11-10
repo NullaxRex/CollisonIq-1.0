@@ -551,37 +551,44 @@ const userId = (username) => DB.prepare('SELECT id FROM users WHERE username=?')
     r = await pa.req('GET', p);
     check(`GET ${p} as platform_admin`, r.status === 200, `status ${r.status}`);
   }
-  // Shop data is private: platform admin sees a shop's jobs only while that
-  // shop's admin has granted read-only support access (Nov 2026).
-  r = await pa.req('GET', `/jobs/${jobA}`); check('platform_admin cannot open a shop job without a grant', r.status === 404, `status ${r.status} ${r.location || ''}`);
-  r = await pa.req('GET', '/'); check('platform_admin job list is empty without grants', r.status === 200 && !r.text.includes(jobA));
-  r = await pa.req('GET', '/admin'); check('platform_admin admin page lists no shop jobs without grants', !r.text.includes(jobA));
-  r = await pa.req('GET', `/jobs/${jobA}/calibrations/files/1`); check('platform_admin cannot fetch proof files without a grant', r.status === 404);
+  // Platform admin sees a shop's jobs only after opening access for a reason
+  // the terms allow (legal, support, update). Read-only, logged privately, and
+  // not shown to the shop (Nov 2026).
+  r = await pa.req('GET', `/jobs/${jobA}`); check('platform_admin cannot open a shop job without opening access', r.status === 404, `status ${r.status} ${r.location || ''}`);
+  r = await pa.req('GET', '/'); check('platform_admin job list is empty with no access open', r.status === 200 && !r.text.includes(jobA));
+  r = await pa.req('GET', '/admin'); check('platform_admin admin page lists no shop jobs with no access open', !r.text.includes(jobA));
+  r = await pa.req('GET', `/jobs/${jobA}/calibrations/files/1`); check('platform_admin cannot fetch proof files with no access open', r.status === 404);
   r = await pa.req('GET', '/new'); check('platform_admin cannot create jobs', denied(r), `status ${r.status}`);
-  await admin.freshToken('/admin/support');
-  r = await admin.req('GET', '/admin/support');
-  check('shop admin sees support access OFF', /Support access is OFF/.test(r.text));
-  r = await admin.post('/admin/support/grant', { reason: 'short', hours: '24' });
-  check('grant needs a real reason', !DB || !DB.prepare('SELECT 1 FROM support_grants').get());
-  r = await admin.post('/admin/support/grant', { reason: 'Help with a stuck job photo upload', hours: '24' });
-  check('shop admin grants 24h support access', r.status === 302 && (!DB || DB.prepare('SELECT 1 FROM support_grants WHERE revoked_at IS NULL').get()));
-  r = await tech.req('GET', '/admin/support'); check('technician cannot manage support access', denied(r), `status ${r.status}`);
-  r = await pa.req('GET', `/jobs/${jobA}`); check('platform_admin can view the granted shop job', r.status === 200);
-  r = await pa.req('GET', '/'); check('granted shop jobs listed for platform_admin', r.text.includes(jobA));
+  const shopA = DB ? DB.prepare('SELECT shop_id FROM jobs WHERE jobId=?').get(jobA).shop_id : 1;
+  await pa.freshToken('/platform/shops');
+  r = await pa.post(`/platform/shops/${shopA}/access`, { reason_type: 'curiosity', note: 'Just looking around the shop' });
+  check('access needs a reason the terms allow', r.status === 400 && (!DB || !DB.prepare('SELECT 1 FROM platform_access').get()), `status ${r.status}`);
+  r = await pa.post(`/platform/shops/${shopA}/access`, { reason_type: 'support', note: 'short' });
+  check('access needs a note', r.status === 400, `status ${r.status}`);
+  r = await pa.post(`/platform/shops/${shopA}/access`, { reason_type: 'support', note: 'Ticket 12: stuck photo upload' });
+  check('platform_admin opens support access', r.status === 302 && (!DB || DB.prepare('SELECT 1 FROM platform_access WHERE closed_at IS NULL').get()), `status ${r.status}`);
+  r = await pa.req('GET', `/jobs/${jobA}`); check('platform_admin can view the opened shop job', r.status === 200);
+  r = await pa.req('GET', '/'); check('opened shop jobs listed for platform_admin', r.text.includes(jobA));
   r = await pa.req('GET', `/jobs/${jobB}/photos`);
   r = await pa.upload(`/jobs/${jobB}/photos/${slotB}`, PNG, 'image/png', 'x.png');
-  check('platform_admin cannot upload, even with a grant', denied(r), `status ${r.status}`);
+  check('platform_admin cannot upload, even with access open', denied(r), `status ${r.status}`);
   await pa.freshToken(`/jobs/${jobA}`);
   for (const [path, body] of [[`/jobs/${jobA}/edit`, { ro: 'PA' }], [`/jobs/${jobA}/status`, { status: 'In Progress' }], [`/jobs/${jobA}/assign`, { tech_ids: '1' }],
     [`/jobs/${jobA}/signoff/qc`, {}], [`/jobs/${jobA}/signoff/override`, { justification: 'x'.repeat(30), acknowledge: '1' }], [`/jobs/${jobA}/share`, {}]]) {
     r = await pa.post(path, body);
-    check(`platform_admin read-only with a grant: POST ${path.split('/').slice(3).join('/')}`, denied(r), `status ${r.status}`);
+    check(`platform_admin read-only with access open: POST ${path.split('/').slice(3).join('/')}`, denied(r), `status ${r.status}`);
   }
-  r = await admin.req('GET', '/admin/support');
-  check('shop admin sees every page platform_admin viewed', new RegExp(`GET /jobs/${jobA}`).test(r.text) && /Support access is ON/.test(r.text));
-  await admin.freshToken('/admin/support');
-  r = await admin.post('/admin/support/revoke');
-  r = await pa.req('GET', `/jobs/${jobA}`); check('ending the grant removes access immediately', r.status === 404);
+  r = await pa.req('GET', '/platform/access');
+  check('access log records the reason and every page viewed', r.status === 200 && r.text.includes('Ticket 12: stuck photo upload') && r.text.includes(`GET /jobs/${jobA}`));
+  for (const u of [admin, tech]) {
+    r = await u.req('GET', '/platform/access'); check('shop users cannot see the platform access log', denied(r), `status ${r.status}`);
+  }
+  r = await admin.req('GET', '/'); check('shop does not see platform access in its system', !/Support Access|platform admin/i.test(r.text));
+  r = await admin.req('GET', '/admin/support'); check('shop-side support access page is gone', r.status === 404 || denied(r), `status ${r.status}`);
+  const accessId = DB ? DB.prepare('SELECT id FROM platform_access WHERE closed_at IS NULL').get().id : 1;
+  await pa.freshToken('/platform/shops');
+  r = await pa.post(`/platform/access/${accessId}/close`, {});
+  r = await pa.req('GET', `/jobs/${jobA}`); check('closing access removes it immediately', r.status === 404);
   await pa.freshToken('/platform/shops');
   const shopsBefore = DB ? DB.prepare('SELECT COUNT(*) c FROM shops').get().c : 0;
   r = await pa.post('/platform/shops/create', { shop_name: 'Dup Shop', admin_full_name: 'D', admin_username: 'metro_admin', admin_password: 'longenough1' });
