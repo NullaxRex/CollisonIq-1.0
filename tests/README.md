@@ -25,7 +25,7 @@ Without npm: `node tests/run-all.js` from the repo root, or
 | `prod-boot-test.js` | Refuses to boot without `SESSION_SECRET` under `NODE_ENV=production` or on Railway; Secure cookies, HSTS, CSP; `seed-demo.js` refuses to run in production |
 | `migration-test.js` | Boot migrations run twice: `job_photos` rebuild and v1 `jobs` ADD COLUMN, idempotent, no data changes |
 | `bcrypt-compat-test.js` | Hashes made by bcrypt 5 still verify with the installed bcrypt |
-| `ford-rules-test.js` | Ford calibration trigger rules from the I-CAR matrix (18 vehicles): triggers, operation checks, camera variants, coverage limits; battery disconnect flag for all makes; Honda unchanged |
+| `ford-rules-test.js` | Ford / Lincoln rules from Ford's own job aid (Sept 29, 2026) and position statements: every Ford and Lincoln covered, CCM / IPMA / HUD / corner radars / parking sensors / 360° and rear cameras, Ford's no-routine exception for an undisturbed radar, flags; I-CAR matrix removed; battery disconnect flag for all makes; Honda unchanged |
 | `field-rules-test.js` | CollisionIQ universal field rules for every make: side cameras (doors, mirrors, fenders), front radar and camera (front damage, bumper off, Subaru note), rear camera and parking aids (any rear-end work), blind spot ↔ parking aids, door/mirror work → blind spot, post-repair test & verify on every collision repair; OEM results unchanged |
 | `job-report-test.js` | Job form → rules engine → hard copy: every checkbox maps to events its make knows (Honda, covered Ford, all others), sides, old-label conversion, the three Nov 9 production jobs as acceptance tests, escaping, insurer view |
 | `password-script-test.js` | `CollisonIq/scripts/set-platform-admin-password.js` on a throwaway DB |

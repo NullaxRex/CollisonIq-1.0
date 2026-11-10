@@ -33,7 +33,7 @@ check('every item is a warning and says it is not an OEM requirement',
   r.verifications.every((v) => v.level === 'warning' && /not an OEM requirement/.test(v.basis) && /vary by model/.test(v.basis)));
 check('FIELD_RULES_APPLIED warning flag added', codes(r).includes('FIELD_RULES_APPLIED'));
 r = run('Ford', 'Bronco', 2022, ['LIFTGATE_HANDLE_LATCH_RI']);
-check('Ford Bronco liftgate latch: I-CAR lists nothing, field rule still fires', r.calibrations.length === 0 && has(r, 'FIELD_REAR_CAMERA'));
+check('Ford Bronco liftgate latch: no Ford calibration, field rule still fires', r.calibrations.length === 0 && has(r, 'FIELD_REAR_CAMERA'));
 
 // ─── Side cameras ────────────────────────────────────────────────────────────
 r = run('Kia', 'Sorento', 2024, ['FENDER_RIGHT_REPAIR']);
@@ -100,8 +100,8 @@ check('no events → no field items', run('Kia', 'Soul', 2024, []).verifications
 r = run('Honda', 'Accord', 2021, ['DOOR_LEFT_RI']);
 check('Honda keeps its OEM rule for the same event (MVCS)', r.calibrations.some((c) => c.system === 'MVCS') && has(r, 'FIELD_SIDE_CAMERA_LEFT'));
 r = run('Ford', 'F-150', 2025, ['FRONT_BUMPER_RI'], );
-check('Ford F-150 front bumper: I-CAR calibrations kept + field items added',
-  r.calibrations.some((c) => c.systemName === 'Cruise Control Module') && has(r, 'FIELD_FRONT_RADAR'));
+check('Ford F-150 front bumper: Ford job aid calibrations kept + field items added',
+  r.calibrations.some((c) => c.system === 'FORD_PARK_FRONT') && has(r, 'FIELD_FRONT_RADAR'));
 r = run('Toyota', 'Camry', 2025, ['BATTERY_DISCONNECT']);
 check('battery alone → no field items', r.verifications.length === 0 && codes(r).includes('BATTERY_DISCONNECT_REVIEW'));
 

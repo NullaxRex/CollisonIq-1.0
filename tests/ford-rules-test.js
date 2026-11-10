@@ -1,124 +1,103 @@
 'use strict';
-// Ford calibration trigger rules (CollisonIq/utils/oemFordRules.js) and the
-// 12V battery disconnect flag. Pure unit checks: no server, no database.
+// Ford / Lincoln calibration rules from Ford's own documents
+// (CollisonIq/utils/oemFordPosition.js): the Ford/Lincoln ADAS Job Aid
+// (Sept 29, 2026) and the ADAS Integrity (May 1, 2026) and Bumper Fascia
+// (Oct 1, 2025) position statements. Pure unit checks.
 // Usage: node tests/ford-rules-test.js
 const path = require('path');
+const fs = require('fs');
 const { APP_DIR, reporter } = require('./lib');
 
 const oem = require(path.join(APP_DIR, 'utils', 'oemCalibrationRules'));
-const ford = require(path.join(APP_DIR, 'utils', 'oemFordRules'));
-const { VEHICLES } = require(path.join(APP_DIR, 'utils', 'fordCalibrationMatrix'));
+const ford = require(path.join(APP_DIR, 'utils', 'oemFordPosition'));
 const rep = reporter();
 const { check } = rep;
-
-const run = (input) => oem.evaluate({ make: 'Ford', ...input });
-const names = (r) => r.calibrations.map((c) => c.systemName).sort();
+const run = (o) => oem.evaluate({ make: 'Ford', model: 'F-150', year: 2025, ...o });
+const ids = (r) => r.calibrations.map((c) => c.system).sort().join(',');
 const flagCodes = (r) => r.flags.map((f) => f.code);
-const entry = (model, year, oemName, locStart) =>
-  VEHICLES.find((v) => v.model === model && v.year === year).systems.find(
-    (s) => s.oemName === oemName && (!locStart || s.location.startsWith(locStart)),
-  );
 
-// ─── Matrix ──────────────────────────────────────────────────────────────────
-check('matrix: 18 vehicles, 196 I-CAR entries', VEHICLES.length === 18 && VEHICLES.reduce((n, v) => n + v.systems.length, 0) === 196);
-check('matrix: every vehicle has an I-CAR URL and capture date', VEHICLES.every((v) => /^https:\/\/rts\.i-car\.com\/calv-\d+\.html$/.test(v.url) && v.captured === '2026-03-24'));
-check('matrix: every entry has Yes/No/Not identified columns', VEHICLES.every((v) => v.systems.every((s) =>
-  ['dtcSet', 'scanToolRequired', 'specialToolsRequired'].every((k) => ['Yes', 'No', 'Not identified'].includes(s[k])))));
-check('matrix: every I-CAR phrase maps (module loaded)', ford._compiled.length === 18);
+// ─── No third-party data left in the product ─────────────────────────────────
+const utils = path.join(APP_DIR, 'utils');
+check('I-CAR matrix files removed', !fs.existsSync(path.join(utils, 'fordCalibrationMatrix.js')) && !fs.existsSync(path.join(utils, 'oemFordRules.js')));
+const fordSrc = fs.readFileSync(path.join(utils, 'oemFordPosition.js'), 'utf8');
+check('Ford module cites Ford documents, not the I-CAR calibration search',
+  !/calv-\d+|OEM Calibration Requirements Search|I-CAR OEM/i.test(fordSrc) && ford.SOURCES.JOB_AID.date === '2026-09-29');
+check('every Ford rule has a WSM reference, a procedure and triggers that are known events',
+  ford.RULES.every((r) => r.wsm && r.procedure && r.triggers.length && r.triggers.every(([e, why]) => ford.EVENTS[e] && why)));
 
-// Spot checks against the source PDFs
-const ipma25 = entry('Bronco', 2025, 'Image Processing Module A');
-check('source: 2025 Bronco IPMA has its 6 events', ipma25 && ipma25.events.length === 6 && ipma25.events.includes('If tire size is changed'));
-const rps23 = entry('Bronco Sport', 2023, 'Rear Parking Aid Sensor');
-// This table breaks across a page in the PDF; the columns must still read Yes / Yes / Yes.
-check('source: 2023 Bronco Sport rear parking sensor (table split across pages) = Yes / Yes / Yes',
-  rps23 && rps23.dtcSet === 'Yes' && rps23.scanToolRequired === 'Yes' && rps23.specialToolsRequired === 'Yes');
-const sod23 = entry('Bronco Sport', 2023, 'Side Obstacle Detection Control Module');
-check('source: 2023 Bronco Sport blind spot module = Yes / Not identified / Not identified',
-  sod23 && sod23.dtcSet === 'Yes' && sod23.scanToolRequired === 'Not identified' && sod23.specialToolsRequired === 'Not identified');
-const chmsl = entry('F-250', 2025, 'Center High Mounted Stop Lamp Camera', 'Camera in Headliner/Roof (Rear View Only)');
-check('source: 2025 F-250 CHMSL camera (rear view only) triggers on stop lamp R&I',
-  chmsl && chmsl.events.includes('If high mounted stop lamp is removed/installed or replaced'));
-const sodcm = entry('Bronco', 2021, 'Side Obstacle Detection Control Module');
-check('source: 2021 Bronco blind spot module lists no calibration requirement',
-  sodcm && sodcm.events.length === 1 && sodcm.events[0] === 'No calibration/initialization requirements found');
+// ─── Applies to every Ford and Lincoln ───────────────────────────────────────
+for (const [make, model, year] of [['Ford', 'F-150', 2025], ['Ford', 'F-150', 2021], ['Ford', 'Escape', 2023], ['Ford', 'Bronco', 2022],
+  ['Lincoln', 'Aviator', 2024], ['Ford', 'Mustang Mach-E', 2024], ['Ford', 'F-250 Super Duty', 2019], ['Ford', '', '']]) {
+  const r = oem.evaluate({ make, model, year, events: ['WINDSHIELD_REPLACED'] });
+  check(`windshield replaced → IPMA camera + HUD, job aid basis (${make} ${model || 'no model'} ${year || ''})`,
+    r.ruleDepth === 'OEM_JOB_AID' && ids(r) === 'FORD_HUD,FORD_IPMA' && !flagCodes(r).includes('UNKNOWN_EVENTS'));
+}
 
-// ─── Triggers ────────────────────────────────────────────────────────────────
-let r = run({ model: 'Bronco Sport', year: 2022, events: ['LIFTGATE_HANDLE_LATCH_RI'] });
-check('liftgate handle/latch → Bronco Sport rear camera', r.supported && r.ruleDepth === 'VEHICLE_MATRIX' && names(r).join() === 'Rear Parking Aid Camera');
-r = run({ model: 'Bronco', year: 2022, events: ['LIFTGATE_HANDLE_LATCH_RI'] });
-check('liftgate handle/latch → nothing on Bronco (not in its I-CAR entry)', r.calibrations.length === 0);
-r = run({ model: 'F-150', year: 2025, events: ['TAILGATE_HANDLE_RI'], equipped: { CAMERA_360: false } });
-check('tailgate handle → F-150 rear camera (rear view only)', names(r).join() === 'Rear Parking Aid Camera' && r.calibrations[0].variant === 'REAR_VIEW_ONLY');
+// ─── Front radar (CCM) ───────────────────────────────────────────────────────
+let r = run({ events: ['FRONT_BUMPER_RI'] });
+check('front bumper cover R&I alone → no CCM (radar undisturbed), flagged', !ids(r).includes('FORD_CCM') && flagCodes(r).includes('FORD_CCM_UNDISTURBED'));
+check('front bumper cover R&I → front parking sensor checks + front 360° camera', ids(r) === 'FORD_CAM_FRONT,FORD_PARK_FRONT');
+check('front bumper cover R&I → corner radar and fascia refinish flags',
+  flagCodes(r).includes('FORD_SOD_FRONT_COVER') && /12 mils/.test(r.flags.find((f) => f.code === 'FORD_FASCIA_REPAIR_LIMITS').text));
+for (const e of ['FRONT_RADAR_RI', 'FRONT_RADAR_BRACKET_RI', 'FRONT_BUMPER_BEAM_RI']) {
+  r = run({ events: [e] });
+  check(`${e} → CCM alignment (419-03)`, ids(r).includes('FORD_CCM') && r.calibrations.find((c) => c.system === 'FORD_CCM').wsmSection === '419-03'
+    && !flagCodes(r).includes('FORD_CCM_UNDISTURBED'));
+}
+r = run({ events: ['FRONT_BUMPER_REPAIR_ON_CAR'] });
+check('on-car bumper repair → no calibration, fascia refinish limits flagged', r.calibrations.length === 0 && flagCodes(r).includes('FORD_FASCIA_REPAIR_LIMITS'));
 
-const tireAll = VEHICLES.every((v) => {
-  const x = run({ model: v.model, year: v.year, events: ['TIRE_SIZE_CHANGE'] });
-  return x.calibrations.length === 1 && /^Image Processing Module A/.test(x.calibrations[0].systemName);
-});
-check('tire size change → IPMA camera on all 18 vehicles', tireAll);
-const collAll = VEHICLES.every((v) => {
-  const x = run({ model: v.model, year: v.year, collisionRelated: true });
-  return x.calibrations.some((c) => c.systemName === 'Cruise Control Module' && c.reasons.some((e) => e.event === 'COLLISION'));
-});
-check('collision → Cruise Control Module radar on all 18 vehicles', collAll);
-r = run({ model: 'F-150', year: 2025, events: ['COLLISION'] });
-check('COLLISION line item works like collisionRelated', r.collisionRelated === true && names(r).includes('Cruise Control Module'));
-r = run({ model: 'Bronco', year: 2024, events: ['FRONT_AIRBAG_DEPLOYMENT'] });
-check('front airbag deployment → IPMA camera', names(r).join() === 'Image Processing Module A');
-r = run({ model: 'Bronco', year: 2024, events: ['WHEEL_ALIGNMENT'] });
-check('alignment → IPMA camera (Ford: "If suspension is repaired or aligned")', names(r).join() === 'Image Processing Module A');
-r = run({ model: 'F-350', year: 2025, events: ['HEADLAMP_LEVELING_SENSOR_RI'] });
-check('headlamp leveling sensor → multiple-inputs entry on Super Duty', names(r).join() === '(multiple inputs)');
-r = run({ model: 'F-150 Lightning', year: 2025, events: ['FRONT_CORNER_SENSOR_RI'] });
-check('front corner sensor → SODCM C/D on F-150 Lightning', names(r).join() === 'Side Obstacle Detection Control Module C/D');
-r = run({ model: 'Bronco', year: 2023, events: ['BLIND_SPOT_SENSOR_RI'] });
-check('blind spot sensor on Bronco → no calibration (I-CAR lists none)', r.calibrations.length === 0);
+// ─── Windshield camera, HUD, modules ─────────────────────────────────────────
+r = run({ events: ['FRONT_CAMERA_RI'] });
+check('camera R&I → IPMA only (no HUD)', ids(r) === 'FORD_IPMA' && flagCodes(r).includes('FORD_GENUINE_SENSORS'));
+r = run({ events: ['WINDSHIELD_RI'] });
+check('windshield R&I → IPMA (camera off and on), no HUD (not a new windshield)', ids(r) === 'FORD_IPMA'
+  && /CollisionIQ reading/.test(r.calibrations[0].reasons[0].why));
+r = run({ events: ['INSTRUMENT_PANEL_RI'] });
+check('instrument panel R&I → HUD configuration', ids(r) === 'FORD_HUD');
+r = run({ events: ['IPMB_MODULE_REPLACED'] });
+check('IPMB replaced → ADAS module per WSM', ids(r) === 'FORD_IPM_MODULE');
 
-// Operation checks (azimuth / elevation)
-r = run({ model: 'F-150', year: 2025, events: ['FRONT_BUMPER_RI'], equipped: { CAMERA_360: true } });
-check('F-150 front bumper R&I → front camera + radar calibrations',
-  names(r).join() === 'Cruise Control Module,Front Parking Aid Camera');
-check('F-150 front bumper R&I → front parking sensor operation checks',
-  r.operationChecks.length === 1 && r.operationChecks[0].systemName === 'Front Parking Aid Sensor'
-  && r.operationChecks[0].checks.join() === 'Azimuth System Check,Elevation System Check'
-  && /Per the Ford Workshop manual/.test(r.operationChecks[0].sourceNote));
-r = run({ model: 'Bronco Sport', year: 2024, events: ['REAR_PARKING_SENSOR_RI'] });
-check('rear parking sensor R&I → operation check, no calibration', r.calibrations.length === 0 && r.operationChecks.length === 1);
+// ─── Corner radars ───────────────────────────────────────────────────────────
+r = run({ events: ['TAIL_LAMP_RIGHT_RI'] });
+check('right tail lamp R&I → SODR alignment only', ids(r) === 'FORD_SOD_REAR_RIGHT' && r.calibrations[0].side === 'Right');
+r = run({ events: ['BLIND_SPOT_SENSOR_RI'] });
+check('rear corner radar R&I → SODL and SODR entries', ids(r) === 'FORD_SOD_REAR_LEFT,FORD_SOD_REAR_RIGHT');
+r = run({ events: ['FRONT_CORNER_SENSOR_RI'] });
+check('front corner radar R&I → SODCMC / SODCMD (419-04)', ids(r) === 'FORD_SOD_FRONT' && r.calibrations[0].wsmSection === '419-04');
+r = run({ events: ['REAR_BUMPER_RI'] });
+check('rear bumper cover R&I → rear parking sensor checks; corner radar and bumper camera flags',
+  ids(r) === 'FORD_PARK_REAR' && flagCodes(r).includes('FORD_SOD_REAR_COVER') && flagCodes(r).includes('FORD_REAR_CAMERA_BUMPER'));
+check('parking sensor checks are documented as a calibration', /calibration procedure/.test(r.calibrations[0].note));
 
-// Camera system variants
-r = run({ model: 'Bronco', year: 2023, events: ['REAR_CAMERA_RI'] });
-check('rear camera, system unknown → both entries + CAMERA_SYSTEM_UNVERIFIED',
-  r.calibrations.length === 2 && flagCodes(r).includes('CAMERA_SYSTEM_UNVERIFIED'));
-r = run({ model: 'Bronco', year: 2023, events: ['REAR_CAMERA_RI'], equipped: { CAMERA_360: true } });
-check('rear camera, 360° confirmed → only the 360° entry', r.calibrations.length === 1 && r.calibrations[0].variant === 'CAMERA_360'
-  && !flagCodes(r).includes('CAMERA_SYSTEM_UNVERIFIED') && flagCodes(r).includes('CAMERA_360_ANY_CAMERA'));
-r = run({ model: 'Bronco', year: 2023, events: ['REAR_CAMERA_RI'], equipped: { CAMERA_360: false } });
-check('rear camera, rear view only → only that entry', r.calibrations.length === 1 && r.calibrations[0].variant === 'REAR_VIEW_ONLY');
-r = run({ model: 'Bronco', year: 2023, events: ['MIRROR_LEFT_RI'] });
-check('left mirror R&I → left side camera only', r.calibrations.length === 1 && r.calibrations[0].location === 'Camera in Side Mirror (Left)');
+// ─── Cameras ─────────────────────────────────────────────────────────────────
+r = run({ events: ['MIRROR_LEFT_RI'] });
+check('left mirror R&I → left mirror camera only', ids(r) === 'FORD_CAM_LEFT');
+r = run({ events: ['MIRROR_RIGHT_ADJUST'] });
+check('right mirror adjusted (moved) → right mirror camera', ids(r) === 'FORD_CAM_RIGHT');
+r = run({ events: ['DOOR_LEFT_RI'] });
+check('door R&I → no Ford calibration (field rules cover the mirror camera)', r.calibrations.length === 0
+  && r.verifications.some((v) => v.id === 'FIELD_SIDE_CAMERA_LEFT'));
+r = run({ events: ['REAR_GATE_RI'] });
+check('tailgate R&I → rear camera, both routines described', ids(r) === 'FORD_CAM_REAR' && /Initialization/.test(r.calibrations[0].method));
+r = run({ events: ['FRONT_GRILLE_RI'] });
+check('grille R&I → front 360° camera', ids(r) === 'FORD_CAM_FRONT');
+r = run({ events: ['CHMSL_RI'] });
+check('CHMSL R&I → no calibration, flagged as not in the job aid', r.calibrations.length === 0 && flagCodes(r).includes('FORD_CHMSL_CAMERA'));
 
-// Result shape
-r = run({ model: 'Bronco', year: 2021, events: ['WINDSHIELD_REPLACED'] });
-const c0 = r.calibrations[0] || {};
-check('result carries I-CAR source, scan policy and verbatim events',
-  r.source.url === 'https://rts.i-car.com/calv-4496.html' && r.source.captured === '2026-03-24'
-  && r.scanPolicy && r.scanPolicy.found === true && Array.isArray(c0.sourceEvents) && c0.scanToolRequired === 'Yes');
-r = run({ model: 'Bronco', year: 2021, events: ['BOGUS'], dtcs: ['U0100'] });
-check('Ford: unknown events and DTCs flagged', flagCodes(r).includes('UNKNOWN_EVENTS') && flagCodes(r).includes('DTC_NOT_IN_RULESET') && r.dtcActions.length === 1);
+// ─── Not triggers in the job aid ─────────────────────────────────────────────
+r = run({ events: ['WHEEL_ALIGNMENT', 'TIRE_SIZE_CHANGE'] });
+check('alignment / tire size → no calibration, geometry flag pointing to the WSM', r.calibrations.length === 0 && flagCodes(r).includes('FORD_GEOMETRY'));
+r = run({ events: ['FRONT_AIRBAG_DEPLOYMENT'] });
+check('airbag deployment → no calibration, flagged', r.calibrations.length === 0 && flagCodes(r).includes('FORD_AIRBAG_NOT_IN_JOB_AID'));
 
-// ─── Coverage boundaries ─────────────────────────────────────────────────────
-check('model aliases: "F-250 Super Duty", "f250", "Bronco-Sport"',
-  run({ model: 'F-250 Super Duty', year: 2025, events: [] }).supported
-  && run({ model: 'f250', year: '2025', events: [] }).supported
-  && run({ model: 'Bronco-Sport', year: 2021, events: [] }).supported);
-r = run({ model: 'Escape', year: 2023, events: ['WINDSHIELD_REPLACED'] });
-check('uncovered Ford → scan policy only + FORD_MODEL_NOT_COVERED', !r.supported && r.ruleDepth === 'SCAN_POLICY_ONLY' && flagCodes(r).includes('FORD_MODEL_NOT_COVERED'));
-r = run({ model: 'F-150', year: 2024, events: ['WINDSHIELD_REPLACED'] });
-check('F-150 2024 (only 2025 exported) → not extrapolated', !r.supported && flagCodes(r).includes('FORD_MODEL_NOT_COVERED'));
-r = oem.evaluate({ make: 'Lincoln', model: 'Aviator', year: 2024, events: [] });
-check('Lincoln → scan policy only', !r.supported && flagCodes(r).includes('FORD_MODEL_NOT_COVERED'));
-r = run({ model: 'Bronco', events: [] });
-check('Ford without a year → scan policy only', !r.supported);
+// ─── Result shape ────────────────────────────────────────────────────────────
+r = oem.evaluate({ make: 'Lincoln', model: 'Nautilus', year: 2024, events: ['FRONT_RADAR_RI', 'NOT_AN_EVENT'], dtcs: ['U0235'] });
+check('Lincoln: Lincoln service info and scan statement cited',
+  /lincolnserviceinfo\.com/.test(r.source.procedures) && r.source.related.some((s) => /Scanning/.test(s.title)));
+check('unknown events flagged; DTCs get a WSM troubleshooting action', flagCodes(r).includes('UNKNOWN_EVENTS') && r.dtcActions.length === 1);
+check('every Ford result says where equipped and calibrate regardless of DTC',
+  r.calibrations.every((c) => c.whereEquipped) && flagCodes(r).includes('FORD_CALIBRATE_REGARDLESS_OF_DTC') && flagCodes(r).includes('FORD_EQUIPMENT_UNVERIFIED'));
 
 // ─── Battery disconnect (all makes) ──────────────────────────────────────────
 for (const [make, model, year] of [['Honda', 'Accord', 2021], ['Toyota', 'Camry', 2022], ['Ford', 'Bronco', 2023], ['Ford', 'Escape', 2023]]) {
@@ -131,7 +110,8 @@ check('battery flag quotes the register: not a blanket ADAS calibration', /Not a
 
 // ─── Honda unchanged ─────────────────────────────────────────────────────────
 r = oem.evaluate({ make: 'Honda', model: 'Accord', year: 2021, events: ['FRONT_FASCIA_REPAIR_300MM', 'WINDSHIELD_REPLACED'], dtcs: ['P2583-54'] });
-check('Honda Accord result unchanged', r.ruleDepth === 'FULL_TRIGGER_RULES' && r.calibrations.map((c) => c.system).sort().join() === 'CAMERA,RADAR');
+check('Honda Accord result unchanged; Honda named as publisher', r.ruleDepth === 'FULL_TRIGGER_RULES'
+  && r.calibrations.map((c) => c.system).sort().join() === 'CAMERA,RADAR' && r.source.publisher === 'American Honda Motor Co., Inc.' && !r.source.via);
 
 console.log(rep.failures ? `\n${rep.failures} Ford rules check(s) FAILED` : '\nall Ford rules checks passed');
 process.exit(rep.failures ? 1 : 0);

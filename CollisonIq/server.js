@@ -1407,7 +1407,7 @@ app.get('/reference/lookup', requireAuth, requireSubscription, (req, res) => {
 // JSON body: { _csrf, make, model, year, lineItems: [eventId...], dtcs: [code...],
 //             collisionRelated?: boolean, equipped?: { SYSTEM_ID: boolean } }
 // lineItems are repair event IDs: oemCalibrationRules.EVENTS (Honda/Acura),
-// oemFordRules.EVENTS (covered Fords) or COMMON_EVENTS (all makes).
+// oemFordPosition.EVENTS (all Ford / Lincoln) or COMMON_EVENTS (all makes).
 // CSRF is enforced by the global verifyCsrf middleware via the _csrf body field.
 const OEM_MAX_ITEMS = 100;
 function oemStringList(value, field) {

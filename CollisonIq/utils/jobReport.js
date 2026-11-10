@@ -3,7 +3,7 @@
  * CollisionIQ — Job ADAS report (job form → rules engine → hard copy)
  * -----------------------------------------------------------------------------
  * buildJobAdas() runs the job's repairs through oemCalibrationRules.evaluate()
- * (Honda/Acura job aid, covered Fords from the I-CAR matrix, scan policy for
+ * (Honda/Acura and Ford/Lincoln OEM job aids, scan policy for
  * every other make, plus the CollisionIQ universal field rules). The full result
  * is stored on the job as JSON (jobs.adas_eval) and printed by renderSections().
  *
@@ -49,13 +49,18 @@ function scanText(value, policy) {
 }
 
 function ruleBasis(result, make) {
-  if (result.ruleDepth === 'VEHICLE_MATRIX') {
+  if (result.ruleDepth === 'OEM_JOB_AID') {
     const s = result.source;
-    return { kind: 'oem', text: `${s.title} — ${s.provider}, captured ${s.captured}. ${s.basis}.`, url: s.url };
+    const related = (s.related || []).map((r) => `${r.title} (${r.date})`).join('; ');
+    return {
+      kind: 'oem',
+      text: `${s.publisher}: ${s.title} (${s.date}), with ${related}. Procedures: ${s.procedures}.`,
+      url: (s.related || []).map((r) => r.url).find(Boolean) || null,
+    };
   }
   if (result.ruleDepth === 'FULL_TRIGGER_RULES') {
     const s = result.source || {};
-    return { kind: 'oem', text: `${s.oem} ${s.title}, version ${s.version} (${s.published}), via ${s.via}.`, url: null };
+    return { kind: 'oem', text: `${s.publisher || s.oem}: ${s.oem} ${s.title}, version ${s.version} (${s.published}).`, url: null };
   }
   return {
     kind: 'none',
@@ -207,7 +212,10 @@ function renderCalibration(c) {
   return `<li class="adas-item adas-item-rich"><span class="adas-flag">&#9888;</span><div class="adas-body">
     <div class="adas-name">${head}</div>
     ${detail('Triggered by', list(reasonLabels(c)))}
-    ${detail('Method', c.method ? esc(c.method) : '')}
+    ${detail('Why', c.reasons && c.reasons.some((r) => r.why) ? list(c.reasons.filter((r) => r.why).map((r) => r.why)) : '')}
+    ${detail('Procedure', c.method ? esc(c.method) : '')}
+    ${detail('Workshop manual section', c.wsmSection ? esc(c.wsmSection) : '')}
+    ${detail('Applies', c.whereEquipped ? 'Where the vehicle is equipped with this sensor' : '')}
     ${detail('OEM trigger wording', c.sourceEvents ? list(c.sourceEvents) : '')}
     ${detail('Note', c.note ? esc(c.note) : '')}
     ${detail('Prerequisites', c.prerequisites && c.prerequisites.length ? list(c.prerequisites.map((p) => p.text)) : '')}

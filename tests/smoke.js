@@ -187,9 +187,10 @@ const userId = (username) => DB.prepare('SELECT id FROM users WHERE username=?')
   const jobF = (r.location.match(/\/jobs\/(CIQ-[\w-]+)/) || [])[1];
   check('Ford F-150 job created from new checkboxes', r.status === 302 && !!jobF);
   r = await admin.req('GET', `/jobs/${jobF}`);
-  check('hard copy shows I-CAR Ford calibrations, operation checks and field rules',
-    ['OEM Calibrations Required', 'Cruise Control Module', 'Side Parking Aid Camera', 'Rear Parking Aid Camera', 'OEM Operation Checks',
-      'CollisionIQ Field Rules — Not OEM Requirements', 'Left side mirror camera', 'Rear camera — test and verify', 'I-CAR OEM Calibration Requirements Search'].every((t) => r.text.includes(t)));
+  check('hard copy shows Ford job aid calibrations and field rules',
+    ['OEM Calibrations Required', 'Front parking aid sensors', 'Left mirror camera (360°)', 'Rear camera (tailgate / liftgate / decklid)', 'Workshop manual section',
+      'CollisionIQ Field Rules — Not OEM Requirements', 'Left side mirror camera', 'Rear camera — test and verify', 'Advanced Drive Assist Systems Job Aid'].every((t) => r.text.includes(t)));
+  check('hard copy cites no I-CAR calibration search', !/Calibration Requirements Search/.test(r.text));
   check('hard copy has no old-engine lines or company marking', !/SODCM Blind Spot|No rationale generated|Cueljuris/.test(r.text.split('site-footer')[0]));
   r = await admin.req('GET', `/jobs/${jobF}/edit`);
   check('edit form keeps the checked boxes', /value="FRONT_DOOR_RI:L" checked/.test(r.text) && /value="LIFTGATE_RI" checked/.test(r.text) && !/value="FRONT_DOOR_RI:R" checked/.test(r.text));
@@ -456,13 +457,13 @@ const userId = (username) => DB.prepare('SELECT id FROM users WHERE username=?')
   r = await postJson(admin, { _csrf: apiTok, make: 'Honda', lineItems: ['BOGUS_EVENT'], dtcs: ['X1234'] });
   j = {}; try { j = JSON.parse(r.text); } catch {}
   check('OEM API: unknown events/DTCs flagged', r.status === 200 && j.flags?.some((f) => f.code === 'UNKNOWN_EVENTS') && j.flags?.some((f) => f.code === 'DTC_NOT_IN_RULESET'));
-  r = await postJson(admin, { _csrf: apiTok, make: 'Ford', model: 'Bronco Sport', year: 2023, lineItems: ['LIFTGATE_HANDLE_LATCH_RI', 'BATTERY_DISCONNECT'], collisionRelated: true, equipped: { CAMERA_360: false } });
+  r = await postJson(admin, { _csrf: apiTok, make: 'Ford', model: 'Bronco Sport', year: 2023, lineItems: ['REAR_GATE_RI', 'FRONT_RADAR_RI', 'BATTERY_DISCONNECT'], collisionRelated: true });
   j = {}; try { j = JSON.parse(r.text); } catch {}
-  const fordSystems = (j.calibrations || []).map((c) => c.systemName).sort().join(',');
-  check('OEM API: Ford Bronco Sport evaluates from I-CAR matrix', r.status === 200 && j.ruleDepth === 'VEHICLE_MATRIX' && fordSystems === 'Cruise Control Module,Rear Parking Aid Camera' && j.flags?.some((f) => f.code === 'BATTERY_DISCONNECT_REVIEW'), `status ${r.status} systems=${fordSystems}`);
-  r = await postJson(admin, { _csrf: apiTok, make: 'Ford', model: 'Escape', year: 2023, lineItems: ['WINDSHIELD_REPLACED'] });
+  const fordSystems = (j.calibrations || []).map((c) => c.system).sort().join(',');
+  check('OEM API: Ford evaluates from the Ford job aid', r.status === 200 && j.ruleDepth === 'OEM_JOB_AID' && fordSystems === 'FORD_CAM_REAR,FORD_CCM' && j.flags?.some((f) => f.code === 'BATTERY_DISCONNECT_REVIEW'), `status ${r.status} systems=${fordSystems}`);
+  r = await postJson(admin, { _csrf: apiTok, make: 'Lincoln', model: 'Corsair', year: 2023, lineItems: ['WINDSHIELD_REPLACED'] });
   j = {}; try { j = JSON.parse(r.text); } catch {}
-  check('OEM API: uncovered Ford → scan-policy-only', r.status === 200 && j.ruleDepth === 'SCAN_POLICY_ONLY' && j.flags?.some((f) => f.code === 'FORD_MODEL_NOT_COVERED'));
+  check('OEM API: any Ford / Lincoln model is covered (no model list)', r.status === 200 && j.ruleDepth === 'OEM_JOB_AID' && (j.calibrations || []).some((c) => c.system === 'FORD_IPMA'));
   r = await postJson(admin, { _csrf: apiTok, make: 'Ford', equipped: { CAMERA_360: 'yes' } }); check('OEM API: non-boolean equipped → 400', r.status === 400);
   r = await postJson(admin, { _csrf: apiTok, make: 'Ford', equipped: ['CAMERA_360'] }); check('OEM API: array equipped → 400', r.status === 400);
   r = await postJson(admin, { _csrf: apiTok, make: 'Ford', collisionRelated: 'true' }); check('OEM API: non-boolean collisionRelated → 400', r.status === 400);

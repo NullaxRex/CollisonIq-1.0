@@ -9,7 +9,7 @@ const { APP_DIR, reporter } = require('./lib');
 const jobRepairs = require(path.join(APP_DIR, 'utils', 'jobRepairs'));
 const jobReport = require(path.join(APP_DIR, 'utils', 'jobReport'));
 const oem = require(path.join(APP_DIR, 'utils', 'oemCalibrationRules'));
-const ford = require(path.join(APP_DIR, 'utils', 'oemFordRules'));
+const ford = require(path.join(APP_DIR, 'utils', 'oemFordPosition'));
 const rep = reporter();
 const { check } = rep;
 
@@ -26,7 +26,7 @@ const known = {
   default: new Set(Object.keys(oem.COMMON_EVENTS)),
 };
 for (const [make, model, year, fam] of [['Honda', 'Accord', 2022, 'honda'], ['Acura', 'MDX', 2022, 'honda'], ['Ford', 'F-150', 2025, 'ford'],
-  ['Ford', 'Escape', 2023, 'default'], ['Toyota', 'Camry', 2025, 'default'], ['Subaru', 'Outback', 2024, 'default']]) {
+  ['Ford', 'Escape', 2023, 'ford'], ['Lincoln', 'Corsair', 2024, 'ford'], ['Toyota', 'Camry', 2025, 'default'], ['Subaru', 'Outback', 2024, 'default']]) {
   const t = jobRepairs.toEvents(ALL, { make, model, year });
   const bad = t.events.filter((e) => !known[fam].has(e));
   const r = build(make, model, year, ALL);
@@ -58,31 +58,33 @@ check('collision damage boxes set collisionRelated; door work alone does not',
 }
 
 // ─── Acceptance 2: CIQ-20261109-8437, 2025 F-150, front bumper + door/mirror ─
+// Ford job aid (Sept 29, 2026): a bumper cover replacement needs no radar routine
+// if the radar is undisturbed; the field rules still call for a radar test.
 {
   const { result: r, columns } = build('Ford', 'F-150', '2025', ['FRONT_BUMPER_RI', 'FRONT_DOOR_RI:L', 'MIRROR_RI:L', 'FRONT_DOOR_RI:R', 'MIRROR_RI:R']);
-  const names = calNames(r);
-  check('F-150 #8437: Cruise Control Module radar from bumper cover R&I', names.some((n) => n.startsWith('Cruise Control Module')));
-  check('F-150 #8437: front parking aid camera + both side parking aid cameras',
-    names.some((n) => n.startsWith('Front Parking Aid Camera')) && names.filter((n) => n.startsWith('Side Parking Aid Camera')).length === 2, names.join(' | '));
-  check('F-150 #8437: front parking aid sensor operation checks', r.operationChecks.some((o) => o.systemName === 'Front Parking Aid Sensor'));
-  check('F-150 #8437: no SODCM blind spot calibration for door work', !names.some((n) => /Side Obstacle/.test(n)));
+  const sys = r.calibrations.map((c) => c.system).sort().join();
+  check('F-150 #8437: front parking sensor checks, front 360° camera, both mirror cameras (Ford job aid)',
+    sys === 'FORD_CAM_FRONT,FORD_CAM_LEFT,FORD_CAM_RIGHT,FORD_PARK_FRONT', sys);
+  check('F-150 #8437: no radar routine for the bumper cover alone, explained', !sys.includes('FORD_CCM') && codes(r).includes('FORD_CCM_UNDISTURBED'));
+  check('F-150 #8437: no blind spot module calibration for door work', !/SOD/.test(sys));
   check('F-150 #8437: no "static" claim for the radar', !/Static/i.test(columns.adasSystems));
   check('F-150 #8437: side camera field rules both sides + front radar/camera',
     ['FIELD_FRONT_CAMERA', 'FIELD_FRONT_RADAR', 'FIELD_SIDE_CAMERA_LEFT', 'FIELD_SIDE_CAMERA_RIGHT'].every((id) => verIds(r).includes(id)));
-  check('F-150 #8437: I-CAR source and rationale present', r.basis.kind === 'oem' && /I-CAR/.test(r.basis.text) && /^https:/.test(r.basis.url) && !/No rationale/.test(columns.rationale));
+  check('F-150 #8437: Ford job aid basis, no I-CAR anywhere', r.basis.kind === 'oem' && /Ford Motor Company/.test(r.basis.text) && /Job Aid \(2026-09-29\)/.test(r.basis.text)
+    && !/I-CAR/.test(JSON.stringify(r.calibrations) + r.basis.text + columns.rationale) && !/No rationale/.test(columns.rationale));
 }
 
 // ─── Acceptance 3: CIQ-20261109-6755, 2025 F-150, every checkbox ─────────────
 {
   const { result: r, adasRequired } = build('Ford', 'F-150', '2025', ALL);
-  const names = calNames(r).join(' | ');
-  check('F-150 #6755: rear camera entries (rear-view-only and 360°) for tailgate/rear work', (names.match(/Rear Parking Aid Camera/g) || []).length === 2, names);
-  check('F-150 #6755: windshield camera (IPMA), radar, side cameras, front camera, CHMSL camera',
-    ['Image Processing Module A Camera', 'Cruise Control Module', 'Side Parking Aid Camera', 'Front Parking Aid Camera', 'Center High Mount Stop Lamp Camera'].every((n) => names.includes(n)));
-  check('F-150 #6755: blind spot (SODCM) calibration from blind spot sensor R&I', names.includes('Side Obstacle Detection Control Module'));
+  const sys = r.calibrations.map((c) => c.system).sort().join();
+  check('F-150 #6755: every Ford job aid component the form can reach',
+    sys === 'FORD_CAM_FRONT,FORD_CAM_LEFT,FORD_CAM_REAR,FORD_CAM_RIGHT,FORD_CCM,FORD_HUD,FORD_IPMA,FORD_PARK_FRONT,FORD_PARK_REAR,FORD_SOD_FRONT,FORD_SOD_REAR_LEFT,FORD_SOD_REAR_RIGHT', sys);
+  check('F-150 #6755: every calibration names its WSM section and procedure', r.calibrations.every((c) => c.wsmSection && c.method));
   check('F-150 #6755: every field rule applies',
     ['FIELD_BLIND_SPOT', 'FIELD_FRONT_CAMERA', 'FIELD_FRONT_RADAR', 'FIELD_POST_REPAIR_TEST', 'FIELD_REAR_CAMERA', 'FIELD_REAR_PARKING', 'FIELD_SIDE_CAMERA_LEFT', 'FIELD_SIDE_CAMERA_RIGHT'].every((id) => verIds(r).includes(id)), verIds(r).join());
-  check('F-150 #6755: battery, structural, SRS and EV review items', codes(r).includes('BATTERY_DISCONNECT_REVIEW') && r.reviewItems.length === 3 && adasRequired);
+  check('F-150 #6755: battery, structural, SRS and EV review items; CHMSL and geometry flags', codes(r).includes('BATTERY_DISCONNECT_REVIEW') && r.reviewItems.length === 3 && adasRequired
+    && codes(r).includes('FORD_CHMSL_CAMERA') && codes(r).includes('FORD_GEOMETRY'));
   check('SRS review item omits the unverified register "checks" text', !r.reviewItems.find((x) => /SRS/.test(x.event)).checks);
 }
 
@@ -95,11 +97,11 @@ check('collision damage boxes set collisionRelated; door work alone does not',
 
 // ─── Hard copy rendering ─────────────────────────────────────────────────────
 {
-  const { result } = build('Ford', 'F-150', '2025', ['FRONT_BUMPER_RI', 'MIRROR_RI:L', 'REAR_HANDLE_LATCH']);
+  const { result } = build('Ford', 'F-150', '2025', ['FRONT_RADAR', 'MIRROR_RI:L', 'REAR_HANDLE_LATCH']);
   const html = jobReport.renderSections(JSON.parse(JSON.stringify(result)));
-  check('hard copy: OEM, operation check and field-rule sections', /OEM Calibrations Required/.test(html) && /OEM Operation Checks/.test(html)
-    && /CollisionIQ Field Rules — Not OEM Requirements/.test(html) && /Cruise Control Module/.test(html));
-  check('hard copy: I-CAR source link printed', /href="https:\/\/rts\.i-car\.com\//.test(html));
+  check('hard copy: OEM and field-rule sections with Ford procedure and WSM section', /OEM Calibrations Required/.test(html)
+    && /CollisionIQ Field Rules — Not OEM Requirements/.test(html) && /Cruise Control Module/.test(html) && /Workshop manual section<\/span> 419-03/.test(html));
+  check('hard copy: Ford statement linked, no I-CAR calibration search', /href="https:\/\/rts\.i-car\.com\/images\/pdf\/oem-info\/ford\//.test(html) && !/Calibration Requirements Search/.test(html));
   const evil = build('<script>alert(1)</script>', '"><img src=x onerror=alert(1)>', '2025', ['FRONT_DOOR_RI:L']).result;
   const h2 = jobReport.renderSections(evil);
   check('hard copy: make/model escaped', !/<script>|<img/i.test(h2) && /&lt;script&gt;/.test(h2));
