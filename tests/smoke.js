@@ -304,7 +304,21 @@ const userId = (username) => DB.prepare('SELECT id FROM users WHERE username=?')
   r = await tech.req('GET', `/jobs/${jobA}/edit`); check('technician blocked from GET edit', denied(r), `status ${r.status}`);
   r = await tech.post(`/jobs/${jobA}/edit`, { ro: 'TECH' }); check('technician blocked from POST edit', denied(r), `status ${r.status}`);
   r = await tech.post('/onboarding', { shop_name: 'Renamed by tech' }); check('technician blocked from POST /onboarding', denied(r), `status ${r.status}`);
-  r = await tech.req('GET', `/jobs/${jobA}`); check('technician can view own-shop job', r.status === 200);
+  // Technicians see and work only on jobs assigned to them (Nov 2026).
+  const uid = (name) => (DB ? userId(name) : 0);
+  r = await tech.req('GET', `/jobs/${jobA}`); check('technician cannot open an unassigned job', r.status === 404, `status ${r.status} ${r.location || ''}`);
+  r = await tech.req('GET', '/'); check('unassigned job not in the technician job list', r.status === 200 && !r.text.includes(jobA));
+  r = await tech.post(`/jobs/${jobA}/assign`, { tech_ids: String(uid('metro_tech1')) });
+  check('technician cannot assign', denied(r), `status ${r.status}`);
+  await admin.freshToken(`/jobs/${jobA}`);
+  r = await admin.req('GET', `/jobs/${jobA}`);
+  check('job page offers technician assignment to shop admin', /name="tech_ids"/.test(r.text) && /Assigned Technicians/.test(r.text));
+  r = await admin.post(`/jobs/${jobA}/assign`, { tech_ids: String(uid('north_tech1')) });
+  check("cannot assign another shop's technician", !DB || !DB.prepare('SELECT 1 FROM job_assignments WHERE job_id=? AND user_id=?').get(jobA, uid('north_tech1')));
+  for (const j of [jobA, jobB]) await admin.post(`/jobs/${j}/assign`, { tech_ids: String(uid('metro_tech1')) });
+  check('shop admin assigns the technician', !DB || DB.prepare('SELECT COUNT(*) n FROM job_assignments WHERE user_id=? AND job_id IN (?,?) AND removed_at IS NULL').get(uid('metro_tech1'), jobA, jobB).n === 2);
+  r = await tech.req('GET', '/'); check('assigned job appears in the technician job list', r.text.includes(jobA));
+  r = await tech.req('GET', `/jobs/${jobA}`); check('technician can view an assigned job', r.status === 200);
   check('technician job page hides Edit button', !r.text.includes(`/jobs/${jobA}/edit`));
   r = await tech.req('GET', `/jobs/${jobA}/photos`);
   r = await tech.upload(`/jobs/${jobA}/photos/${slotA2}`, PNG, 'image/png', 'x.png');
@@ -537,10 +551,44 @@ const userId = (username) => DB.prepare('SELECT id FROM users WHERE username=?')
     r = await pa.req('GET', p);
     check(`GET ${p} as platform_admin`, r.status === 200, `status ${r.status}`);
   }
-  r = await pa.req('GET', `/jobs/${jobA}`); check('platform_admin can view any shop job', r.status === 200);
-  await pa.req('GET', `/jobs/${jobB}/photos`);
+  // Platform admin sees a shop's jobs only after opening access for a reason
+  // the terms allow (legal, support, update). Read-only, logged privately, and
+  // not shown to the shop (Nov 2026).
+  r = await pa.req('GET', `/jobs/${jobA}`); check('platform_admin cannot open a shop job without opening access', r.status === 404, `status ${r.status} ${r.location || ''}`);
+  r = await pa.req('GET', '/'); check('platform_admin job list is empty with no access open', r.status === 200 && !r.text.includes(jobA));
+  r = await pa.req('GET', '/admin'); check('platform_admin admin page lists no shop jobs with no access open', !r.text.includes(jobA));
+  r = await pa.req('GET', `/jobs/${jobA}/calibrations/files/1`); check('platform_admin cannot fetch proof files with no access open', r.status === 404);
+  r = await pa.req('GET', '/new'); check('platform_admin cannot create jobs', denied(r), `status ${r.status}`);
+  const shopA = DB ? DB.prepare('SELECT shop_id FROM jobs WHERE jobId=?').get(jobA).shop_id : 1;
+  await pa.freshToken('/platform/shops');
+  r = await pa.post(`/platform/shops/${shopA}/access`, { reason_type: 'curiosity', note: 'Just looking around the shop' });
+  check('access needs a reason the terms allow', r.status === 400 && (!DB || !DB.prepare('SELECT 1 FROM platform_access').get()), `status ${r.status}`);
+  r = await pa.post(`/platform/shops/${shopA}/access`, { reason_type: 'support', note: 'short' });
+  check('access needs a note', r.status === 400, `status ${r.status}`);
+  r = await pa.post(`/platform/shops/${shopA}/access`, { reason_type: 'support', note: 'Ticket 12: stuck photo upload' });
+  check('platform_admin opens support access', r.status === 302 && (!DB || DB.prepare('SELECT 1 FROM platform_access WHERE closed_at IS NULL').get()), `status ${r.status}`);
+  r = await pa.req('GET', `/jobs/${jobA}`); check('platform_admin can view the opened shop job', r.status === 200);
+  r = await pa.req('GET', '/'); check('opened shop jobs listed for platform_admin', r.text.includes(jobA));
+  r = await pa.req('GET', `/jobs/${jobB}/photos`);
   r = await pa.upload(`/jobs/${jobB}/photos/${slotB}`, PNG, 'image/png', 'x.png');
-  check('platform_admin may upload to Closed job', r.status === 302, `status ${r.status}`);
+  check('platform_admin cannot upload, even with access open', denied(r), `status ${r.status}`);
+  await pa.freshToken(`/jobs/${jobA}`);
+  for (const [path, body] of [[`/jobs/${jobA}/edit`, { ro: 'PA' }], [`/jobs/${jobA}/status`, { status: 'In Progress' }], [`/jobs/${jobA}/assign`, { tech_ids: '1' }],
+    [`/jobs/${jobA}/signoff/qc`, {}], [`/jobs/${jobA}/signoff/override`, { justification: 'x'.repeat(30), acknowledge: '1' }], [`/jobs/${jobA}/share`, {}]]) {
+    r = await pa.post(path, body);
+    check(`platform_admin read-only with access open: POST ${path.split('/').slice(3).join('/')}`, denied(r), `status ${r.status}`);
+  }
+  r = await pa.req('GET', '/platform/access');
+  check('access log records the reason and every page viewed', r.status === 200 && r.text.includes('Ticket 12: stuck photo upload') && r.text.includes(`GET /jobs/${jobA}`));
+  for (const u of [admin, tech]) {
+    r = await u.req('GET', '/platform/access'); check('shop users cannot see the platform access log', denied(r), `status ${r.status}`);
+  }
+  r = await admin.req('GET', '/'); check('shop does not see platform access in its system', !/Support Access|platform admin/i.test(r.text));
+  r = await admin.req('GET', '/admin/support'); check('shop-side support access page is gone', r.status === 404 || denied(r), `status ${r.status}`);
+  const accessId = DB ? DB.prepare('SELECT id FROM platform_access WHERE closed_at IS NULL').get().id : 1;
+  await pa.freshToken('/platform/shops');
+  r = await pa.post(`/platform/access/${accessId}/close`, {});
+  r = await pa.req('GET', `/jobs/${jobA}`); check('closing access removes it immediately', r.status === 404);
   await pa.freshToken('/platform/shops');
   const shopsBefore = DB ? DB.prepare('SELECT COUNT(*) c FROM shops').get().c : 0;
   r = await pa.post('/platform/shops/create', { shop_name: 'Dup Shop', admin_full_name: 'D', admin_username: 'metro_admin', admin_password: 'longenough1' });

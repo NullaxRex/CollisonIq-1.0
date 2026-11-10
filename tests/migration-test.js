@@ -3,6 +3,7 @@
 //  (a) a database whose job_photos.shop_id is NOT NULL (needs the one-time rebuild)
 //  (b) a v1-schema database (jobs table without shop_id etc.; needs ADD COLUMN only)
 // and checks schema, idempotency, and that no rows or values change.
+// Also (c): the one-time technician assignment link for older jobs.
 // Usage: node tests/migration-test.js
 const { spawnSync } = require('child_process');
 const { DatabaseSync } = require('node:sqlite');
@@ -83,6 +84,34 @@ const b = path.join(tmp, 'legacy-v1.db');
   check('shops/users tables created', !!d.prepare("SELECT 1 FROM sqlite_master WHERE name='users'").get());
   d.prepare("INSERT INTO jobs (jobId, ro, shop_id, created_by, last_changed) VALUES ('CIQ-MIG-1','RO-M',1,1,'2026-01-01')").run();
   check('job insert with shop_id works on migrated v1 db', !!d.prepare("SELECT 1 FROM jobs WHERE jobId='CIQ-MIG-1' AND shop_id=1").get());
+  d.close();
+}
+
+// (c) Technician assignment link (Nov 2026): jobs saved before assignments
+// existed are linked to a technician account when the typed name matches
+// exactly one active technician in the job's shop.
+const c = path.join(tmp, 'assign.db');
+boot(c, 'assign db, first boot');
+{
+  const d = new DatabaseSync(c);
+  d.exec(`INSERT INTO shops (id, name) VALUES (1, 'A'), (2, 'B');
+    INSERT INTO users (id, shop_id, username, password_hash, role, full_name, active) VALUES
+      (10, 1, 'a_tech', 'x', 'technician', 'Tech One', 1),
+      (11, 1, 'a_tech2', 'x', 'technician', 'Same Name', 1),
+      (12, 1, 'a_tech3', 'x', 'technician', 'Same Name', 1),
+      (13, 2, 'b_tech', 'x', 'technician', 'Other Shop', 1),
+      (14, 1, 'a_old', 'x', 'technician', 'Gone Tech', 0);
+    INSERT INTO jobs (jobId, shop_id, technicianName) VALUES ('J1', 1, 'tech one'), ('J2', 1, 'Same Name'), ('J3', 1, 'Other Shop'),
+      ('J4', 1, 'Gone Tech'), ('J5', 1, 'a_tech'), ('J6', 1, '');`);
+  d.close();
+}
+const l3 = boot(c, 'assign db, link boot');
+const l4 = boot(c, 'assign db, repeat boot');
+{
+  const d = new DatabaseSync(c, { readOnly: true });
+  const links = d.prepare('SELECT job_id, user_id FROM job_assignments ORDER BY job_id').all().map((x) => `${x.job_id}:${x.user_id}`).join(',');
+  check('jobs linked by exact name or username, case-insensitive, same shop, active only, unambiguous only', links === 'J1:10,J5:10', links);
+  check('link boot reports what it linked; repeat boot links nothing', /Linked 2 existing job/.test(l3) && !/Linked/.test(l4));
   d.close();
 }
 
