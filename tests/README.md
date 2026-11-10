@@ -23,7 +23,7 @@ Without npm: `node tests/run-all.js` from the repo root, or
 |---|---|
 | `run-suite.js` + `smoke.js` | Starts a seeded server and runs the end-to-end smoke and security checks: auth, CSRF, CSP, tenant isolation on every `:id` route, role matrix, uploads, share links, Stripe webhook, lapsed subscriptions, OEM API, logout |
 | `prod-boot-test.js` | Refuses to boot without `SESSION_SECRET` under `NODE_ENV=production` or on Railway; Secure cookies, HSTS, CSP; `seed-demo.js` refuses to run in production |
-| `migration-test.js` | Boot migrations run twice: `job_photos` rebuild and v1 `jobs` ADD COLUMN, idempotent, no data changes |
+| `migration-test.js` | Boot migrations run twice: `job_photos` rebuild and v1 `jobs` ADD COLUMN, idempotent, no data changes; one-time technician assignment link for older jobs (exact name/username, same shop, active, unambiguous) |
 | `bcrypt-compat-test.js` | Hashes made by bcrypt 5 still verify with the installed bcrypt |
 | `ford-rules-test.js` | Ford / Lincoln rules from Ford's own job aid (Sept 29, 2026) and position statements: every Ford and Lincoln covered, CCM / IPMA / HUD / corner radars / parking sensors / 360° and rear cameras, Ford's no-routine exception for an undisturbed radar, flags; I-CAR matrix removed; battery disconnect flag for all makes; Honda unchanged |
 | `gm-rules-test.js` | GM rules from GM's Sept 18, 2026 position statements: windshield camera calibration/learn for Chevrolet, Buick, GMC, Cadillac; partial coverage stated; fascia 13-mil, OE glass, genuine ADAS parts and modification flags |

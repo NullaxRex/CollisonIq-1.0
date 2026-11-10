@@ -185,7 +185,56 @@ db.exec(`
     FOREIGN KEY (job_id) REFERENCES jobs(jobId)
   );
   CREATE INDEX IF NOT EXISTS idx_job_signoffs_job ON job_signoffs(job_id);
+  -- Technicians assigned to a job (several allowed). A technician sees and works
+  -- only on jobs assigned to them. Unassigning keeps the row (removed_at).
+  CREATE TABLE IF NOT EXISTS job_assignments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    assigned_by INTEGER, assigned_at TEXT NOT NULL,
+    removed_by INTEGER, removed_at TEXT,
+    FOREIGN KEY (job_id) REFERENCES jobs(jobId),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_job_assignments_job ON job_assignments(job_id);
+  CREATE INDEX IF NOT EXISTS idx_job_assignments_user ON job_assignments(user_id);
+  -- Support access: the only way platform admin sees a shop's jobs. Granted by
+  -- the shop admin, time-limited, read-only, revocable; every view is logged.
+  CREATE TABLE IF NOT EXISTS support_grants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shop_id INTEGER NOT NULL,
+    granted_by INTEGER NOT NULL, reason TEXT NOT NULL,
+    granted_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+    revoked_by INTEGER, revoked_at TEXT,
+    FOREIGN KEY (shop_id) REFERENCES shops(id)
+  );
+  CREATE TABLE IF NOT EXISTS support_access_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    grant_id INTEGER NOT NULL, shop_id INTEGER NOT NULL, user_id INTEGER,
+    method TEXT, path TEXT, at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_support_access_log_shop ON support_access_log(shop_id, id);
 `);
+// One-time link for jobs saved before assignments existed: a job whose typed
+// technician name matches exactly one active technician in its shop (full name
+// or username) is assigned to that technician. Jobs that never had an
+// assignment row are the only ones touched.
+{
+  const unlinked = db.prepare(`SELECT jobId, shop_id, technicianName, assigned_tech FROM jobs
+    WHERE shop_id IS NOT NULL AND jobId NOT IN (SELECT job_id FROM job_assignments)`).all();
+  const findTech = db.prepare(`SELECT id FROM users WHERE shop_id=? AND role='technician' AND active=1
+    AND (lower(full_name)=lower(?) OR lower(username)=lower(?))`);
+  const add = db.prepare('INSERT INTO job_assignments (job_id,user_id,assigned_at) VALUES (?,?,?)');
+  const now = new Date().toISOString();
+  let linked = 0;
+  for (const j of unlinked) {
+    const name = String(j.assigned_tech || j.technicianName || '').trim();
+    if (!name) continue;
+    const hits = findTech.all(j.shop_id, name, name);
+    if (hits.length === 1) { add.run(j.jobId, hits[0].id, now); linked++; }
+  }
+  if (linked) console.log(`Linked ${linked} existing job(s) to technician accounts by name.`);
+}
 
 // job_photos may already exist from an earlier development pass with a different
 // column set. CREATE TABLE IF NOT EXISTS above is a no-op against an existing
@@ -400,9 +449,9 @@ function layout(title, content, activeNav='', user=null) {
   const logout = ctxReq ? `<form method="POST" action="/logout" class="nav-logout-form">${csrfField(ctxReq)}<button type="submit" class="nav-logout">Logout</button></form>` : '';
   let navLinks = '';
   if (role === 'platform_admin') {
-    navLinks = `${nav('/','list','Jobs')}${nav('/new','new','New Job')}${nav('/reference','reference','ADAS Reference')}${nav('/admin','admin','Admin')}${nav('/platform/shops','shops','Shops')}${nav('/platform/billing','billing','Billing')}${logout}`;
+    navLinks = `${nav('/','list','Support Access')}${nav('/reference','reference','ADAS Reference')}${nav('/platform/shops','shops','Shops')}${nav('/platform/billing','billing','Billing')}${logout}`;
   } else if (role === 'shop_admin') {
-    navLinks = `${nav('/','list','Jobs')}${nav('/new','new','New Job')}${nav('/reference','reference','ADAS Reference')}${nav('/admin','admin','Admin')}${nav('/admin/users','users','Users')}${logout}`;
+    navLinks = `${nav('/','list','Jobs')}${nav('/new','new','New Job')}${nav('/reference','reference','ADAS Reference')}${nav('/admin','admin','Admin')}${nav('/admin/users','users','Users')}${nav('/admin/support','support','Support Access')}${logout}`;
   } else if (role === 'technician') {
     navLinks = `${nav('/','list','My Jobs')}${nav('/reference','reference','ADAS Reference')}${logout}`;
   } else if (role) {
@@ -680,13 +729,40 @@ function requireRole(...roles) {
   };
 }
 // Who may create and edit jobs (matches the Edit button shown on the job page).
-const JOB_EDITORS = ['platform_admin', 'shop_admin', 'service_writer'];
+// Shop roles only: jobs and their records are the shop's data. Platform admin
+// can view every shop's jobs but never create, edit or document them.
+const JOB_EDITORS = ['shop_admin', 'service_writer'];
+const ASSIGNERS = ['shop_admin', 'qc_manager', 'service_writer'];
 const requireJobEditor = requireRole(...JOB_EDITORS);
 // Photo uploads: service writers are read-only, and a Closed job is locked for
 // everyone except platform_admin.
 function canUploadPhotos(user, job) {
-  if (user.role === 'service_writer') return false;
-  return job.status !== 'Closed' || user.role === 'platform_admin';
+  if (!['technician', 'qc_manager', 'shop_admin'].includes(user.role)) return false;
+  return job.status !== 'Closed';
+}
+function isAssigned(jobId, userId) {
+  return Boolean(db.prepare('SELECT 1 FROM job_assignments WHERE job_id=? AND user_id=? AND removed_at IS NULL').get(jobId, userId));
+}
+// ─── Support access (platform admin) ────────────────────────────────────────
+// Platform admin never sees a shop's jobs unless that shop's admin has granted
+// support access: read-only, time-limited, revocable, and every view is logged
+// for the shop to see.
+const SUPPORT_HOURS = [4, 24, 72];
+function activeGrant(shopId) {
+  if (shopId === null || shopId === undefined) return null;
+  return db.prepare('SELECT * FROM support_grants WHERE shop_id=? AND revoked_at IS NULL AND expires_at > ? ORDER BY id DESC LIMIT 1')
+    .get(shopId, new Date().toISOString()) || null;
+}
+function grantedShopIds() {
+  return db.prepare('SELECT DISTINCT shop_id FROM support_grants WHERE revoked_at IS NULL AND expires_at > ?').all(new Date().toISOString()).map((r) => r.shop_id);
+}
+function logSupportAccess(req, grant) {
+  db.prepare('INSERT INTO support_access_log (grant_id,shop_id,user_id,method,path,at) VALUES (?,?,?,?,?,?)')
+    .run(grant.id, grant.shop_id, req.session.user.id, req.method, String(req.originalUrl || '').slice(0, 300), new Date().toISOString());
+}
+function assignedTechs(jobId) {
+  return db.prepare(`SELECT u.id, u.full_name, u.username FROM job_assignments a JOIN users u ON u.id=a.user_id
+    WHERE a.job_id=? AND a.removed_at IS NULL ORDER BY u.full_name`).all(jobId);
 }
 function requireAdmin(req, res, next) {
   if (!req.session.user) return res.redirect('/login');
@@ -711,9 +787,16 @@ function requireSubscription(req, res, next) {
 function ownedJob(req) {
   const u = req.session.user;
   if (u.role === 'platform_admin') {
-    return db.prepare('SELECT * FROM jobs WHERE jobId=?').get(req.params.jobId);
+    const j = db.prepare('SELECT * FROM jobs WHERE jobId=?').get(req.params.jobId);
+    const grant = j ? activeGrant(j.shop_id) : null;
+    if (!grant) return undefined;
+    logSupportAccess(req, grant);
+    return j;
   }
-  return db.prepare('SELECT * FROM jobs WHERE jobId=? AND shop_id=?').get(req.params.jobId, u.shop_id);
+  const job = db.prepare('SELECT * FROM jobs WHERE jobId=? AND shop_id=?').get(req.params.jobId, u.shop_id);
+  // Technicians reach only the jobs assigned to them.
+  if (job && u.role === 'technician' && !isAssigned(job.jobId, u.id)) return undefined;
+  return job;
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────
@@ -943,6 +1026,12 @@ app.get('/', requireAuth, requireSubscription, (req, res) => {
       ? db.prepare('SELECT * FROM jobs WHERE shop_id=? ORDER BY last_changed DESC').all(shopId)
       : db.prepare('SELECT * FROM jobs ORDER BY last_changed DESC').all();
   }
+  if (user.role === 'technician') jobs = jobs.filter((j) => isAssigned(j.jobId, user.id));
+  if (user.role === 'platform_admin') {
+    const granted = new Set(grantedShopIds());
+    jobs = jobs.filter((j) => granted.has(j.shop_id));
+    for (const sid of granted) logSupportAccess(req, activeGrant(sid));
+  }
 
   const rows = jobs.map(j => `<tr>
     <td><a href="/jobs/${encodeURIComponent(j.jobId)}" style="font-family:monospace;font-weight:600;color:#1B3A6B;text-decoration:none">${escapeHtml(j.jobId)}</a></td>
@@ -956,6 +1045,8 @@ app.get('/', requireAuth, requireSubscription, (req, res) => {
 
   const content = `
     ${flash?`<div style="background:${flash.type==='success'?'#D6F0D6':'#FFD6D6'};color:${flash.type==='success'?'#1A6B1A':'#8B0000'};padding:.65rem 1rem;border-radius:6px;margin-bottom:1rem">${escapeHtml(flash.msg)}</div>`:''}
+    ${user.role === 'platform_admin' ? '<p class="adas-basis" style="margin-bottom:1rem">Shop jobs are private to each shop. This list shows only shops whose admin has granted read-only support access, and every view is logged for that shop.</p>' : ''}
+    ${user.role === 'technician' ? '<p class="adas-basis" style="margin-bottom:1rem">Jobs assigned to you.</p>' : ''}
     <div class="page-header"><h1>Jobs <span class="count-badge">${jobs.length}</span></h1>${JOB_EDITORS.includes(user.role) ? '<a href="/new" class="btn btn-primary">+ New Job</a>' : ''}</div>
     <div class="search-bar"><form method="GET" action="/"><input type="text" name="search" placeholder="Search by RO#, VIN, or Technician…" value="${escapeHtml(search)}"><button type="submit" class="btn">Search</button>${search?'<a href="/" class="btn btn-ghost">Clear</a>':''}</form></div>
     <div class="table-wrap"><table class="data-table"><thead><tr><th>Job ID</th><th>RO #</th><th>Vehicle</th><th>Status</th><th>Photos</th><th>Date</th><th></th></tr></thead><tbody>${rows||'<tr><td colspan="7" class="empty">No jobs found.</td></tr>'}</tbody></table></div>`;
@@ -1056,10 +1147,9 @@ app.post('/jobs', requireJobEditor, requireSubscription, (req, res) => {
 // ─── Job View ─────────────────────────────────────────────────────────────────
 app.get('/jobs/:jobId', requireAuth, requireSubscription, (req, res) => {
   const user = req.session.user;
-  const shopId = user.role === 'platform_admin' ? null : user.shop_id;
-  const job = shopId
-    ? db.prepare('SELECT * FROM jobs WHERE jobId=? AND shop_id=?').get(req.params.jobId, shopId)
-    : db.prepare('SELECT * FROM jobs WHERE jobId=?').get(req.params.jobId);
+  // Same rule as every other job route: own shop; technicians only when
+  // assigned; platform admin only under a shop's support grant (logged).
+  const job = ownedJob(req);
 
   if (!job) return res.status(404).send(layout('Not Found', '<div class="error-page"><h1>Job Not Found</h1><a href="/" class="btn btn-primary">Back to Jobs</a></div>', '', user));
 
@@ -1071,6 +1161,14 @@ app.get('/jobs/:jobId', requireAuth, requireSubscription, (req, res) => {
   const canRecord = canUploadPhotos(user, job);
   const flash = consumeFlash(req);
   const jobPath = `/jobs/${encodeURIComponent(job.jobId)}`;
+  const assigned = assignedTechs(job.jobId);
+  const canAssign = ASSIGNERS.includes(user.role) && job.status !== 'Closed';
+  const shopTechs = canAssign ? db.prepare("SELECT id, full_name, username FROM users WHERE shop_id=? AND role='technician' AND active=1 ORDER BY full_name").all(job.shop_id) : [];
+  const assignedIds = new Set(assigned.map((t) => t.id));
+  const assignHtml = `<section class="doc-section"><h2 class="doc-section-title">Assigned Technicians</h2>
+    <p class="adas-basis">${assigned.length ? assigned.map((t) => escapeHtml(t.full_name || t.username)).join(', ') : 'No technician assigned. Technicians only see jobs assigned to them.'}</p>
+    ${canAssign ? (shopTechs.length ? `<form method="POST" action="${jobPath}/assign" class="no-print assign-form">${csrfField(req)}<div class="checkbox-grid">${shopTechs.map((t) => `<label class="checkbox-label"><input type="checkbox" name="tech_ids" value="${t.id}"${assignedIds.has(t.id) ? ' checked' : ''}><span>${escapeHtml(t.full_name || t.username)}</span></label>`).join('')}</div><button class="btn btn-sm" style="margin-top:.5rem">Save assignment</button></form>` : '<p class="adas-basis no-print">This shop has no active technician accounts. Add them under Users.</p>') : ''}
+  </section>`;
   const signoffHtml = calRecord.renderSignoffs(rec.sign, rec.st.summary,
     job.status === 'Closed' ? {} : { forms: { csrf: csrfField(req), base: jobPath, user } });
   const recordHtml = calRecord.renderSection(rec.st, rec.files, {
@@ -1101,7 +1199,7 @@ app.get('/jobs/:jobId', requireAuth, requireSubscription, (req, res) => {
         <div class="doc-actions no-print">
           <button type="button" data-action="print" class="btn btn-white">&#128438; Print / Save PDF</button>
           <a href="/jobs/${encodeURIComponent(job.jobId)}/photos" class="btn btn-white">&#128247; Photos</a>
-          ${['platform_admin','shop_admin','service_writer'].includes(user.role) ? `<a href="/jobs/${encodeURIComponent(job.jobId)}/edit" class="btn btn-white">&#9998; Edit</a>` : ''}
+          ${JOB_EDITORS.includes(user.role) ? `<a href="/jobs/${encodeURIComponent(job.jobId)}/edit" class="btn btn-white">&#9998; Edit</a>` : ''}
           <a href="/" class="btn btn-ghost-white">Back</a>
         </div>
       </div>
@@ -1126,6 +1224,7 @@ app.get('/jobs/:jobId', requireAuth, requireSubscription, (req, res) => {
       </section>
       ${adasEval ? jobReport.renderSections(adasEval) : `<section class="doc-section adas-section"><h2 class="doc-section-title">ADAS Systems — Calibration Required</h2><p class="adas-basis no-print">Saved with the original engine. Open Edit and save to re-run this job through the current OEM and field rules.</p><ul class="adas-list">${adasItems}</ul></section>
       <section class="doc-section"><h2 class="doc-section-title">Rationale</h2><ul class="rationale-list">${rationaleList.map(r=>`<li>${escapeHtml(r)}</li>`).join('')||'<li>No rationale generated.</li>'}</ul></section>`}
+      ${assignHtml}
       ${recordHtml}
       ${signoffHtml}
       <section class="doc-section warning-section"><h2 class="doc-section-title">Liability Warning</h2><div class="warning-box"><span class="warning-icon">&#9888;</span><p>${escapeHtml(job.liabilityWarning)||'—'}</p></div></section>
@@ -1290,6 +1389,83 @@ app.get('/jobs/:jobId/photos/:photoId/file', requireAuth, requireSubscription, (
   });
 });
 
+// ─── Support access (shop admin controls) ───────────────────────────────────
+function requireShopAdmin(req, res, next) {
+  if (!req.session.user) return res.redirect('/login');
+  if (req.session.user.role !== 'shop_admin' || !req.session.user.shop_id) return res.status(403).send('Access denied.');
+  next();
+}
+app.get('/admin/support', requireShopAdmin, (req, res) => {
+  const user = req.session.user;
+  const flash = consumeFlash(req);
+  const g = activeGrant(user.shop_id);
+  const grants = db.prepare(`SELECT g.*, u.full_name AS by_name, r.full_name AS revoked_name FROM support_grants g
+    LEFT JOIN users u ON u.id=g.granted_by LEFT JOIN users r ON r.id=g.revoked_by WHERE g.shop_id=? ORDER BY g.id DESC LIMIT 50`).all(user.shop_id);
+  const log = db.prepare('SELECT * FROM support_access_log WHERE shop_id=? ORDER BY id DESC LIMIT 200').all(user.shop_id);
+  const t = (iso) => iso ? `${escapeHtml(iso.replace('T', ' ').slice(0, 16))} UTC` : '—';
+  const content = `${flash?`<div style="background:${flash.type==='success'?'#D6F0D6':'#FFD6D6'};color:${flash.type==='success'?'#1A6B1A':'#8B0000'};padding:.65rem 1rem;border-radius:6px;margin-bottom:1rem">${escapeHtml(flash.msg)}</div>`:''}
+    <div class="page-header"><h1>Support Access</h1></div>
+    <div class="doc-section"><p class="adas-basis">CollisionIQ staff cannot see your jobs, records, photos or files. If you need help, you can grant temporary, read-only support access here. You can end it at any time, and every page viewed is listed below.</p>
+    ${g ? `<p style="margin:.75rem 0"><span class="badge badge-orange">Support access is ON</span> until ${t(g.expires_at)}. Reason: ${escapeHtml(g.reason)}</p>
+      <form method="POST" action="/admin/support/revoke">${csrfField(req)}<button class="btn btn-primary">End support access now</button></form>`
+    : `<p style="margin:.75rem 0"><span class="badge badge-green">Support access is OFF</span></p>
+      <form method="POST" action="/admin/support/grant" style="display:grid;gap:.75rem;max-width:520px">${csrfField(req)}
+        <div class="form-group"><label>Reason (what you need help with)</label><input type="text" name="reason" maxlength="300" required minlength="10"></div>
+        <div class="form-group"><label>Length</label><select name="hours">${SUPPORT_HOURS.map((h) => `<option value="${h}"${h === 24 ? ' selected' : ''}>${h} hours</option>`).join('')}</select></div>
+        <button class="btn">Grant read-only support access</button></form>`}</div>
+    <div class="doc-section"><h2 class="doc-section-title">Grants</h2><div class="table-wrap"><table class="data-table"><thead><tr><th>Granted</th><th>By</th><th>Reason</th><th>Ends</th><th>Ended early</th></tr></thead><tbody>
+      ${grants.map((x) => `<tr><td>${t(x.granted_at)}</td><td>${escapeHtml(x.by_name || '—')}</td><td>${escapeHtml(x.reason)}</td><td>${t(x.expires_at)}</td><td>${x.revoked_at ? `${t(x.revoked_at)} by ${escapeHtml(x.revoked_name || '—')}` : '—'}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">Never granted.</td></tr>'}</tbody></table></div></div>
+    <div class="doc-section"><h2 class="doc-section-title">Pages viewed by CollisionIQ staff</h2><div class="table-wrap"><table class="data-table"><thead><tr><th>When</th><th>Page</th></tr></thead><tbody>
+      ${log.map((x) => `<tr><td>${t(x.at)}</td><td class="mono">${escapeHtml(x.method)} ${escapeHtml(x.path)}</td></tr>`).join('') || '<tr><td colspan="2" class="empty">No views.</td></tr>'}</tbody></table></div></div>`;
+  res.send(layout('Support Access', content, 'support', user));
+});
+app.post('/admin/support/grant', requireShopAdmin, (req, res) => {
+  const user = req.session.user;
+  const reason = str(req.body.reason, 300);
+  const hours = Number(req.body.hours);
+  if (reason.length < 10) { setFlash(req, 'error', 'Describe what you need help with (at least 10 characters).'); return res.redirect('/admin/support'); }
+  if (!SUPPORT_HOURS.includes(hours)) return res.status(400).send('Invalid length');
+  if (activeGrant(user.shop_id)) { setFlash(req, 'error', 'Support access is already on.'); return res.redirect('/admin/support'); }
+  const now = new Date();
+  db.prepare('INSERT INTO support_grants (shop_id,granted_by,reason,granted_at,expires_at) VALUES (?,?,?,?,?)')
+    .run(user.shop_id, user.id, reason, now.toISOString(), new Date(now.getTime() + hours * 3600 * 1000).toISOString());
+  setFlash(req, 'success', `Read-only support access granted for ${hours} hours.`);
+  res.redirect('/admin/support');
+});
+app.post('/admin/support/revoke', requireShopAdmin, (req, res) => {
+  const user = req.session.user;
+  db.prepare('UPDATE support_grants SET revoked_by=?, revoked_at=? WHERE shop_id=? AND revoked_at IS NULL AND expires_at > ?')
+    .run(user.id, new Date().toISOString(), user.shop_id, new Date().toISOString());
+  setFlash(req, 'success', 'Support access ended.');
+  res.redirect('/admin/support');
+});
+
+// ─── Technician assignment ──────────────────────────────────────────────────
+app.post('/jobs/:jobId/assign', requireAuth, requireSubscription, (req, res) => {
+  const user = req.session.user;
+  if (!ASSIGNERS.includes(user.role)) return res.status(403).send('Access denied.');
+  const job = ownedJob(req);
+  if (!job) return res.status(404).send('Not found');
+  if (job.status === 'Closed') return res.status(403).send('This job is closed.');
+  const jobPath = `/jobs/${encodeURIComponent(job.jobId)}`;
+  const wanted = new Set(strList(req.body.tech_ids, 50).map((x) => Number(x)).filter(Number.isInteger));
+  const techs = db.prepare("SELECT id, full_name, username FROM users WHERE shop_id=? AND role='technician' AND active=1").all(job.shop_id);
+  const valid = new Set(techs.map((t) => t.id));
+  for (const id of wanted) if (!valid.has(id)) { setFlash(req, 'error', 'Only active technicians in this shop can be assigned.'); return res.redirect(jobPath); }
+  const current = new Set(assignedTechs(job.jobId).map((t) => t.id));
+  const now = new Date().toISOString();
+  for (const id of wanted) if (!current.has(id)) {
+    db.prepare('INSERT INTO job_assignments (job_id,user_id,assigned_by,assigned_at) VALUES (?,?,?,?)').run(job.jobId, id, user.id, now);
+  }
+  for (const id of current) if (!wanted.has(id)) {
+    db.prepare('UPDATE job_assignments SET removed_by=?, removed_at=? WHERE job_id=? AND user_id=? AND removed_at IS NULL').run(user.id, now, job.jobId, id);
+  }
+  const names = assignedTechs(job.jobId).map((t) => t.full_name || t.username).join(', ');
+  db.prepare('UPDATE jobs SET technicianName=?, updatedAt=?, last_changed=? WHERE jobId=?').run(names || job.technicianName, now, now, job.jobId);
+  setFlash(req, 'success', names ? `Assigned: ${names}.` : 'No technicians assigned.');
+  res.redirect(jobPath);
+});
+
 // ─── Calibration Record ─────────────────────────────────────────────────────
 function loadCalibrationRecord(job, adasEval) {
   const items = calRecord.requiredItems(adasEval);
@@ -1443,6 +1619,7 @@ app.get('/share/:token/files/:fileId', (req, res) => {
 // Creating a link needs an active subscription; revoking does not, and links
 // that already exist keep working for insurers (see /share/:token).
 app.post('/jobs/:jobId/share', requireAuth, requireSubscription, (req, res) => {
+  if (req.session.user.role === 'platform_admin') return res.status(403).send('Share links belong to the shop.');
   const job = ownedJob(req);
   if (!job) return res.status(404).send('Not found');
   const token = crypto.randomUUID();
@@ -1450,6 +1627,7 @@ app.post('/jobs/:jobId/share', requireAuth, requireSubscription, (req, res) => {
   res.redirect(`/jobs/${encodeURIComponent(job.jobId)}`);
 });
 app.post('/jobs/:jobId/share/revoke', requireAuth, (req, res) => {
+  if (req.session.user.role === 'platform_admin') return res.status(403).send('Share links belong to the shop.');
   const job = ownedJob(req);
   if (!job) return res.status(404).send('Not found');
   db.prepare('UPDATE share_tokens SET revoked=1 WHERE job_id=? AND revoked=0').run(job.jobId);
@@ -1474,17 +1652,23 @@ app.get('/share/:token', (req, res) => {
 app.get('/admin', requireAdmin, (req, res) => {
   const user = req.session.user;
   const shopId = user.role === 'platform_admin' ? null : user.shop_id;
-  const jobs = shopId
+  let jobs = shopId
     ? db.prepare('SELECT * FROM jobs WHERE shop_id=? ORDER BY createdAt DESC').all(shopId)
     : db.prepare('SELECT * FROM jobs ORDER BY createdAt DESC').all();
+  if (user.role === 'platform_admin') {
+    const granted = new Set(grantedShopIds());
+    jobs = jobs.filter((j) => granted.has(j.shop_id));
+    for (const sid of granted) logSupportAccess(req, activeGrant(sid));
+  }
   const statusOptions = ['Created','In Progress','Calibration Complete','Closed'];
   const flash = consumeFlash(req);
-  const rows = jobs.map(j => `<tr><td><span class="job-id">${escapeHtml(j.jobId)}</span></td><td>${escapeHtml(j.ro)||'—'}</td><td>${escapeHtml(j.year)} ${escapeHtml(j.make)} ${escapeHtml(j.model)}</td><td>${escapeHtml(j.technicianName)||'—'}</td><td><form method="POST" action="/jobs/${encodeURIComponent(j.jobId)}/status" class="inline-form">${csrfField(req)}<select name="status" data-autosubmit class="status-select">${statusOptions.map(s=>`<option value="${s}"${j.status===s?' selected':''}>${s}</option>`).join('')}</select></form></td><td>${formatDate(j.createdAt)}</td><td><a href="/jobs/${encodeURIComponent(j.jobId)}" class="btn btn-sm">View</a></td></tr>`).join('');
+  const rows = jobs.map(j => `<tr><td><span class="job-id">${escapeHtml(j.jobId)}</span></td><td>${escapeHtml(j.ro)||'—'}</td><td>${escapeHtml(j.year)} ${escapeHtml(j.make)} ${escapeHtml(j.model)}</td><td>${escapeHtml(j.technicianName)||'—'}</td><td>${user.role === 'platform_admin' ? `<span class="badge badge-${statusClass(j.status)}">${escapeHtml(j.status)}</span>` : `<form method="POST" action="/jobs/${encodeURIComponent(j.jobId)}/status" class="inline-form">${csrfField(req)}<select name="status" data-autosubmit class="status-select">${statusOptions.map(s=>`<option value="${s}"${j.status===s?' selected':''}>${s}</option>`).join('')}</select></form>`}</td><td>${formatDate(j.createdAt)}</td><td><a href="/jobs/${encodeURIComponent(j.jobId)}" class="btn btn-sm">View</a></td></tr>`).join('');
   const content = `${flash?`<div style="background:${flash.type==='success'?'#D6F0D6':'#FFD6D6'};color:${flash.type==='success'?'#1A6B1A':'#8B0000'};padding:.65rem 1rem;border-radius:6px;margin-bottom:1rem">${escapeHtml(flash.msg)}</div>`:''}<div class="page-header"><h1>Admin — Job Management <span class="count-badge">${jobs.length}</span></h1></div><div class="table-wrap"><table class="data-table"><thead><tr><th>Job ID</th><th>RO #</th><th>Vehicle</th><th>Technician</th><th>Status</th><th>Date</th><th></th></tr></thead><tbody>${rows||'<tr><td colspan="7" class="empty">No jobs.</td></tr>'}</tbody></table></div>`;
   res.send(layout('Admin', content, 'admin', user));
 });
 
 app.post('/jobs/:jobId/status', requireAdmin, requireSubscription, (req, res) => {
+  if (req.session.user.role === 'platform_admin') return res.status(403).send("Job status belongs to the shop. Platform admin can view jobs but not change them.");
   const valid = ['Created','In Progress','Calibration Complete','Closed'];
   if (!valid.includes(req.body.status)) return res.status(400).send('Invalid status');
   const job = ownedJob(req);
@@ -1569,11 +1753,12 @@ app.get('/platform/shops', requirePlatformAdmin, (req, res) => {
   const rows = shops.map(s => {
     const uc = db.prepare('SELECT COUNT(*) as c FROM users WHERE shop_id=?').get(s.id);
     const jc = db.prepare('SELECT COUNT(*) as c FROM jobs WHERE shop_id=?').get(s.id);
-    return `<tr><td><strong>${escapeHtml(s.name)}</strong></td><td>${escapeHtml(s.subscription_status||'inactive')}</td><td>${uc.c}</td><td>${jc.c}</td><td>${formatDate(s.created_at)}</td></tr>`;
+    const g = activeGrant(s.id);
+    return `<tr><td><strong>${escapeHtml(s.name)}</strong></td><td>${escapeHtml(s.subscription_status||'inactive')}</td><td>${uc.c}</td><td>${jc.c}</td><td>${g ? `Granted until ${escapeHtml(g.expires_at.replace('T',' ').slice(0,16))} UTC` : '—'}</td><td>${formatDate(s.created_at)}</td></tr>`;
   }).join('');
   const content = `<div class="page-header"><h1>Shops <span class="count-badge">${shops.length}</span></h1></div>
     <div class="doc-section" style="margin-bottom:2rem"><h2 class="doc-section-title">Onboard New Shop</h2><form method="POST" action="/platform/shops/create" style="display:grid;gap:1rem;max-width:520px">${csrfField(req)}<div class="form-group"><label>Shop Name</label><input type="text" name="shop_name" required></div><div class="form-group"><label>Admin Full Name</label><input type="text" name="admin_full_name" required></div><div class="form-group"><label>Admin Username</label><input type="text" name="admin_username" required autocomplete="off"></div><div class="form-group"><label>Temporary Password</label><input type="password" name="admin_password" required autocomplete="new-password"></div><button type="submit" class="btn btn-primary">Create Shop</button></form></div>
-    <div class="table-wrap"><table class="data-table"><thead><tr><th>Shop</th><th>Status</th><th>Users</th><th>Jobs</th><th>Created</th></tr></thead><tbody>${rows||'<tr><td colspan="5" class="empty">No shops.</td></tr>'}</tbody></table></div>`;
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Shop</th><th>Status</th><th>Users</th><th>Jobs</th><th>Support access</th><th>Created</th></tr></thead><tbody>${rows||'<tr><td colspan="6" class="empty">No shops.</td></tr>'}</tbody></table></div>`;
   res.send(layout('Shops', content, 'shops', req.session.user));
 });
 

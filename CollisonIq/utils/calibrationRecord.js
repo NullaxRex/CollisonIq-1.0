@@ -251,8 +251,10 @@ const STATEMENTS = {
   qc: 'I reviewed the calibration record and its proof for this job and approve it.',
   override: 'I am closing this job with incomplete calibration documentation. This exception is permanent and appears on the job record.',
 };
-const QC_ROLES = ['qc_manager', 'shop_admin', 'platform_admin'];
-const SIGN_ROLES = ['technician', 'qc_manager', 'shop_admin', 'platform_admin'];
+// Shop roles only: the record is the shop's. QC and the shop owner are the only
+// approvers; platform admin can view shop jobs but never sign, approve or close.
+const QC_ROLES = ['qc_manager', 'shop_admin'];
+const SIGN_ROLES = ['technician', 'qc_manager', 'shop_admin'];
 const MIN_JUSTIFICATION = 20;
 
 function lastRecordChange(records) {
