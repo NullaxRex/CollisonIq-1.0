@@ -360,8 +360,87 @@ function renderSignoffs(state, summary, opts = {}) {
     <ul class="signoff-list">${lines.join('')}</ul>${forms}</section>`;
 }
 
+// ---------------------------------------------------------------------------
+// Record summary — the first block on the hard copy and the insurer view.
+// Answers in one look: is the documentation complete, what is still open, what
+// was not performed and why, what was documented without a proof file, and
+// who signed off. Built only from the record; nothing here is new data.
+// ---------------------------------------------------------------------------
+const GROUPS = [
+  { kinds: ['oem'], label: 'OEM requirements' },
+  { kinds: ['si_review', 'additional'], label: 'From OEM service information' },
+  { kinds: ['field'], label: 'CollisionIQ field rules' },
+  { kinds: ['scan'], label: 'Pre- and post-repair scans' },
+];
+
+/** Plain-data summary of a job's record and sign-off, for rendering and tests. */
+function recordSummary(st, files, sign, jobStatus) {
+  const all = [...st.rows, ...st.additional];
+  const proofIds = new Set((files || []).map((f) => f.calibration_id));
+  const groups = GROUPS.map((g) => {
+    const xs = all.filter((x) => g.kinds.includes(x.kind));
+    return {
+      label: g.label,
+      total: xs.length,
+      done: xs.filter((x) => x.state === 'done').length,
+      notPerformed: xs.filter((x) => x.state === 'not_performed').length,
+      open: xs.filter((x) => !CLOSED.has(x.state)).length,
+    };
+  }).filter((g) => g.total > 0);
+  const open = all.filter((x) => !CLOSED.has(x.state)).map((x) => ({ name: x.name, state: x.state }));
+  const notPerformed = all.filter((x) => x.state === 'not_performed').map((x) => ({ name: x.name, reason: x.record.reason }));
+  const noProof = all.filter((x) => x.state === 'done' && !proofIds.has(x.record.id)).map((x) => x.name);
+  const override = sign.overrides.length ? sign.overrides[sign.overrides.length - 1] : null;
+  let verdict;
+  if (override) verdict = 'override';
+  else if (open.length === 0 && sign.qcCurrent) verdict = 'complete';
+  else if (open.length === 0) verdict = 'awaiting_signoff';
+  else verdict = 'incomplete';
+  return {
+    verdict, jobStatus: jobStatus || '',
+    total: all.length,
+    done: all.filter((x) => x.state === 'done').length,
+    notPerformedCount: notPerformed.length,
+    openCount: open.length,
+    groups, open, notPerformed, noProof,
+    partialRules: st.rows.some((x) => x.kind === 'si_review'),
+    tech: sign.techCurrent, techStale: !sign.techCurrent && Boolean(sign.tech),
+    qc: sign.qcCurrent, qcStale: !sign.qcCurrent && Boolean(sign.qc),
+    override, samePerson: sign.samePerson,
+  };
+}
+
+const VERDICT = {
+  complete: { cls: 'complete', title: 'Documentation complete', text: 'Every required item is documented, the technician signed off, and QC approved the current record.' },
+  awaiting_signoff: { cls: 'pending', title: 'Documented — awaiting sign-off', text: 'Every required item is documented. The technician sign-off and QC approval of the current record are not both in place yet.' },
+  incomplete: { cls: 'open', title: 'Documentation incomplete', text: 'One or more required items are not documented or failed.' },
+  override: { cls: 'override', title: 'Closed under QC override', text: 'QC closed this job with documentation incomplete. The justification and the items open at the time are recorded below and cannot be removed.' },
+};
+
+/** Summary block HTML. Same block on the job page, the printed hard copy and the insurer view. */
+function renderSummary(sum) {
+  const v = VERDICT[sum.verdict];
+  const who = (x) => `${esc(x.user_name)}, ${esc(when(x.created_at))}`;
+  const signLine = (label, cur, stale) => `<div class="recsum-sign"><span class="calrec-label">${label}</span> ${cur ? who(cur) : `<span class="recsum-missing">${stale ? 'out of date (the record changed after it)' : 'not yet'}</span>`}</div>`;
+  const groupRows = sum.groups.map((g) => `<tr><td>${esc(g.label)}</td><td>${g.total}</td><td>${g.done}</td><td>${g.notPerformed}</td><td class="${g.open ? 'recsum-open-cell' : ''}">${g.open}</td></tr>`).join('');
+  const list = (title, cls, items) => (items.length ? `<div class="recsum-list ${cls}"><div class="calrec-label">${title}</div><ul>${items.join('')}</ul></div>` : '');
+  return `<section class="doc-section recsum recsum-${v.cls}"><h2 class="doc-section-title">Record Summary</h2>
+    <div class="recsum-verdict"><div class="recsum-title">${esc(v.title)}</div><div class="recsum-text">${esc(v.text)}</div>
+      <div class="recsum-counts">${sum.done} of ${sum.total} items done · ${sum.notPerformedCount} not performed (with reason) · ${sum.openCount} open${sum.jobStatus ? ` · Job status: ${esc(sum.jobStatus)}` : ''}</div></div>
+    <table class="recsum-table"><thead><tr><th>Source</th><th>Items</th><th>Done</th><th>Not performed</th><th>Open</th></tr></thead><tbody>${groupRows}</tbody></table>
+    ${sum.partialRules ? '<p class="calrec-detail recsum-note">CollisionIQ does not list every OEM calibration for this vehicle. The shop recorded the OEM service information it checked and each calibration that information required.</p>' : ''}
+    ${list('Open', 'recsum-list-open', sum.open.map((x) => `<li>${esc(x.name)} — ${esc(STATE_LABEL[x.state])}</li>`))}
+    ${list('Not performed', 'recsum-list-np', sum.notPerformed.map((x) => `<li>${esc(x.name)}<div class="recsum-reason">Reason: ${esc(x.reason || 'none recorded')}</div></li>`))}
+    ${list('Documented without a proof file', 'recsum-list-noproof', sum.noProof.map((n) => `<li>${esc(n)}</li>`))}
+    <div class="recsum-signs">${signLine('Technician sign-off', sum.tech, sum.techStale)}${signLine('QC approval', sum.qc, sum.qcStale)}
+      ${sum.override ? `<div class="recsum-sign recsum-override-line"><span class="calrec-label">QC override</span> ${who(sum.override)} — ${esc(sum.override.justification)}</div>` : ''}
+      ${sum.samePerson ? '<div class="calrec-detail signoff-note">Signed off and approved by the same person.</div>' : ''}</div>
+  </section>`;
+}
+
 module.exports = {
   RESULTS, METHODS, PROOF_EXT, MAX_PROOF_FILES, STATEMENTS, QC_ROLES, SIGN_ROLES, MIN_JUSTIFICATION,
   requiredItems, status, validateRecord, summaryBadge, renderSection, renderForm,
   lastRecordChange, signoffState, closeBlocker, validateOverride, renderSignoffs,
+  recordSummary, renderSummary,
 };

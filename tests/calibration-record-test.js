@@ -114,5 +114,62 @@ check('summary badge', /1\/3 documented · 2 open/.test(cr.summaryBadge(st.summa
     && /signoff\/override/.test(forms('qc_manager')) && !/<form/.test(forms('service_writer')));
 }
 
+// ─── Record summary (top of hard copy / insurer view) ────────────────────────
+{
+  const items = cr.requiredItems(evalFor('Ford', 'F-150', ['FRONT_RADAR', 'MIRROR_RI:L']));
+  const at = (m) => `2026-11-10T10:${String(m).padStart(2, '0')}:00.000Z`;
+  const so = (id, kind, t, user_id) => ({ id, kind, created_at: t, user_id, user_name: `U${user_id}`, role: kind === 'tech' ? 'technician' : 'qc_manager', statement: cr.STATEMENTS[kind] });
+  const sumOf = (records, signoffs, files = [], status = 'In Progress') => {
+    const st = cr.status(items, records);
+    return cr.recordSummary(st, files, cr.signoffState(records, signoffs, st.summary), status);
+  };
+  let sum = sumOf([], []);
+  check('summary, nothing recorded: incomplete, every item open, groups split by source',
+    sum.verdict === 'incomplete' && sum.openCount === items.length && sum.done === 0
+    && sum.groups.map((g) => g.label).join('|') === 'OEM requirements|CollisionIQ field rules|Pre- and post-repair scans'
+    && sum.groups.reduce((n, g) => n + g.total, 0) === items.length, sum.groups.map((g) => `${g.label}:${g.total}`).join());
+
+  const full = items.map((it, i) => (it.key.startsWith('FIELD:')
+    ? rec(it.key, 'not_performed', { reason: 'Mirror camera not equipped (VIN build)', created_at: at(i) })
+    : rec(it.key, 'pass', { created_at: at(i) })));
+  const withProof = full.filter((r) => r.result === 'pass').slice(1).map((r) => ({ calibration_id: r.id }));
+  sum = sumOf(full, [], withProof);
+  check('summary, all closed, no sign-off: awaiting sign-off; not performed listed with reason',
+    sum.verdict === 'awaiting_signoff' && sum.openCount === 0 && sum.notPerformed.length === items.filter((x) => x.kind === 'field').length
+    && sum.notPerformed.every((x) => /VIN build/.test(x.reason)));
+  check('summary flags a documented item with no proof file', sum.noProof.length === 1 && sum.noProof[0] === 'Pre-repair scan', sum.noProof.join());
+
+  sum = sumOf(full, [so(1, 'tech', at(58), 1), so(2, 'qc', at(59), 2)], withProof, 'Closed');
+  check('summary, tech + QC current: complete', sum.verdict === 'complete' && sum.tech && sum.qc && !sum.samePerson);
+  let html = cr.renderSummary(sum);
+  check('complete summary renders verdict, counts, sign-offs and job status',
+    /Documentation complete/.test(html) && /U1, 2026-11-10 10:58 UTC/.test(html) && /U2, 2026-11-10 10:59 UTC/.test(html)
+    && /Job status: Closed/.test(html) && /Not performed<\/div>/.test(html) && /Documented without a proof file/.test(html) && !/>Open<\/div>/.test(html));
+
+  const changed = [...full, rec(items[0].key, 'pass', { created_at: '2026-11-10T11:30:00.000Z' })];
+  sum = sumOf(changed, [so(1, 'tech', at(58), 1), so(2, 'qc', at(59), 2)]);
+  check('summary, record changed after approval: sign-offs shown out of date', sum.verdict === 'awaiting_signoff' && sum.techStale && sum.qcStale
+    && /out of date/.test(cr.renderSummary(sum)));
+
+  const failed = full.map((r) => (r.item_key === 'SCAN:POST' ? { ...r, result: 'fail' } : r));
+  sum = sumOf(failed, []);
+  html = cr.renderSummary(sum);
+  check('summary, a failed item: incomplete, listed as open', sum.verdict === 'incomplete' && sum.open.length === 1
+    && /Post-repair scan — Failed — open/.test(html) && /recsum-open-cell/.test(html));
+
+  const ov = { id: 9, kind: 'override', created_at: at(59), user_id: 2, user_name: 'Q<b>', role: 'qc_manager', justification: 'Released <script>', open_items: '[]' };
+  sum = sumOf(failed, [ov], [], 'Closed');
+  html = cr.renderSummary(sum);
+  check('summary, override: verdict is override with justification, escaped', sum.verdict === 'override'
+    && /Closed under QC override/.test(html) && /Released &lt;script&gt;/.test(html) && !/<script>|<b>/.test(html));
+
+  const toyota = cr.requiredItems(evalFor('Toyota', 'Camry', ['WINDSHIELD_REPLACED']));
+  const tst = cr.status(toyota, [rec('ADDITIONAL:FRONT_CAMERA', 'pass', { item_name: 'Front camera aiming' })]);
+  sum = cr.recordSummary(tst, [], cr.signoffState([], [], tst.summary), '');
+  check('summary, scan-policy brand: partial note; SI review and additional items grouped as OEM service information',
+    sum.partialRules && sum.groups.some((g) => g.label === 'From OEM service information' && g.total === 2 && g.done === 1)
+    && /does not list every OEM calibration/.test(cr.renderSummary(sum)));
+}
+
 console.log(rep.failures ? `\n${rep.failures} calibration record check(s) FAILED` : '\nall calibration record checks passed');
 process.exit(rep.failures ? 1 : 0);
