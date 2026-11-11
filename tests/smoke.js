@@ -352,6 +352,8 @@ const userId = (username) => DB.prepare('SELECT id FROM users WHERE username=?')
   await admin.freshToken(`/jobs/${jobA}`);
   r = await admin.req('GET', `/jobs/${jobA}`);
   check('job page shows the calibration record and the add form', /Calibration Record/.test(r.text) && /name="item_key"/.test(r.text) && /value="SCAN:PRE"/.test(r.text) && /documented/.test(r.text));
+  check('job page opens with the record summary before the vehicle section', /Record Summary/.test(r.text) && /Documentation incomplete/.test(r.text)
+    && r.text.indexOf('Record Summary') < r.text.indexOf('Vehicle Information'));
   r = await admin.req('POST', `/jobs/${jobA}/calibrations`, recordForm(admin, { item_key: 'SCAN:PRE', ...passFields }, [[PDF, 'application/pdf', 'prescan.pdf'], [PNG, 'image/png', 'screen.png']]));
   check('record with PDF + photo proof saved', r.status === 302 && /\/jobs\//.test(r.location), `status ${r.status}`);
   const recRow = DB ? DB.prepare("SELECT * FROM job_calibrations WHERE job_id=? AND item_key='SCAN:PRE'").get(jobA) : null;
@@ -369,6 +371,7 @@ const userId = (username) => DB.prepare('SELECT id FROM users WHERE username=?')
     check('other shop cannot fetch proof file', r.status === 404);
     r = await anon.req('GET', `/share/${liveToken}`);
     check('insurer view shows the calibration record with proof links', r.status === 200 && /Calibration Record/.test(r.text) && new RegExp(`/share/${liveToken}/files/${pdfId}`).test(r.text) && !/name="item_key"/.test(r.text));
+    check('insurer view opens with the record summary', /Record Summary/.test(r.text) && r.text.indexOf('Record Summary') < r.text.indexOf('>Vehicle<'));
     r = await anon.req('GET', `/share/${liveToken}/files/${pdfId}`);
     check('insurer can open proof file via share link', r.status === 200 && /application\/pdf/.test(r.headers.get('content-type')));
     r = await anon.req('GET', `/share/${crypto.randomUUID()}/files/${pdfId}`);
@@ -489,6 +492,7 @@ const userId = (username) => DB.prepare('SELECT id FROM users WHERE username=?')
     && ov && /dealer/.test(ov.justification) && ['Technician sign-off', 'QC approval'].every((x) => JSON.parse(ov.open_items).includes(x)) && JSON.parse(ov.open_items).length > 2, ov && ov.open_items);
   r = await anon.req('GET', `/share/${liveToken}`);
   check('insurer view shows the override, justification and what was open', /Closed under QC override/.test(r.text) && /calibration scheduled at the dealer/.test(r.text) && /Incomplete at override<\/span> [^<]*QC approval/.test(r.text));
+  check('insurer summary verdict shows the override', /recsum-override/.test(r.text) && /QC override<\/span>[^<]*dealer/.test(r.text));
   r = await admin.req('GET', `/jobs/${jobA}`);
   check('closed job page shows no sign-off or record forms', !/signoff\/(tech|qc|close|override)/.test(r.text) && !/name="item_key"/.test(r.text));
   await admin.freshToken(`/jobs/${jobA}`);
