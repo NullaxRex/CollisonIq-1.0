@@ -310,6 +310,16 @@ for (const [col, def] of [
 ]) {
   try { db.exec(`ALTER TABLE shops ADD COLUMN ${col} ${def}`); } catch(e) {}
 }
+// Set when a shop is removed, so restoring the shop brings back exactly the
+// accounts the removal turned off (not ones deactivated on their own before).
+try { db.exec('ALTER TABLE users ADD COLUMN off_with_shop INTEGER DEFAULT 0'); } catch(e) {}
+
+// The guest login was removed in Aug 2026, but its account rows stayed behind
+// and the normal sign-in form would still accept them. Turn them off for good.
+{
+  const r = db.prepare("UPDATE users SET active=0 WHERE role='guest' AND active=1").run();
+  if (r.changes) console.log(`Deactivated ${r.changes} leftover guest account(s).`);
+}
 
 // ─── Legacy ADAS Engine ───────────────────────────────────────────────────────
 // Keyword engine from the first build. Jobs no longer use it: the job form and
@@ -449,7 +459,7 @@ function layout(title, content, activeNav='', user=null) {
   const logout = ctxReq ? `<form method="POST" action="/logout" class="nav-logout-form">${csrfField(ctxReq)}<button type="submit" class="nav-logout">Logout</button></form>` : '';
   let navLinks = '';
   if (role === 'platform_admin') {
-    navLinks = `${nav('/','list','Jobs')}${nav('/reference','reference','ADAS Reference')}${nav('/platform/shops','shops','Shops')}${nav('/platform/access','access','Access Log')}${nav('/platform/billing','billing','Billing')}${logout}`;
+    navLinks = `${nav('/','list','Jobs')}${nav('/reference','reference','ADAS Reference')}${nav('/platform/shops','shops','Shops')}${nav('/platform/accounts','accounts','Accounts')}${nav('/platform/access','access','Access Log')}${nav('/platform/billing','billing','Billing')}${logout}`;
   } else if (role === 'shop_admin') {
     navLinks = `${nav('/','list','Jobs')}${nav('/new','new','New Job')}${nav('/reference','reference','ADAS Reference')}${nav('/admin','admin','Admin')}${nav('/admin/users','users','Users')}${logout}`;
   } else if (role === 'technician') {
@@ -536,15 +546,16 @@ app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), asyn
   if (event.type === 'customer.subscription.created' || event.type === 'customer.subscription.updated') {
     const sub = event.data.object;
     const status = ['active','trialing'].includes(sub.status) ? sub.status : sub.status === 'past_due' ? 'past_due' : 'inactive';
+    // A shop platform admin removed stays removed whatever Stripe sends.
     // node:sqlite throws when binding undefined. Newer Stripe API versions moved
     // current_period_end off the subscription object, so default it to null.
-    db.prepare(`UPDATE shops SET subscription_status=?, stripe_subscription_id=?, subscription_current_period_end=? WHERE stripe_customer_id=?`)
+    db.prepare(`UPDATE shops SET subscription_status=?, stripe_subscription_id=?, subscription_current_period_end=? WHERE stripe_customer_id=? AND subscription_status IS NOT 'removed'`)
       .run(status, sub.id ?? null, sub.current_period_end ?? null, sub.customer ?? null);
   }
 
   if (event.type === 'customer.subscription.deleted') {
     const sub = event.data.object;
-    db.prepare(`UPDATE shops SET subscription_status='cancelled' WHERE stripe_customer_id=?`).run(sub.customer ?? null);
+    db.prepare(`UPDATE shops SET subscription_status='cancelled' WHERE stripe_customer_id=? AND subscription_status IS NOT 'removed'`).run(sub.customer ?? null);
   }
 
   res.json({ received: true });
@@ -774,12 +785,15 @@ function requirePlatformAdmin(req, res, next) {
   if (!req.session.user || req.session.user.role !== 'platform_admin') return res.status(403).send('Access denied.');
   next();
 }
+// 'comp' is complimentary access set by platform admin (test shops, pilots).
+// Stripe never writes it: webhooks only update shops that have a Stripe customer.
+const SHOP_ACCESS_STATUSES = ['active', 'trialing', 'comp'];
 function requireSubscription(req, res, next) {
   if (!req.session.user) return res.redirect('/login');
   // Platform admin bypasses subscription check
   if (req.session.user.role === 'platform_admin') return next();
   const shop = db.prepare('SELECT subscription_status FROM shops WHERE id=?').get(req.session.user.shop_id);
-  if (!shop || !['active','trialing'].includes(shop.subscription_status)) return res.redirect('/billing/inactive');
+  if (!shop || !SHOP_ACCESS_STATUSES.includes(shop.subscription_status)) return res.redirect('/billing/inactive');
   next();
 }
 
@@ -1707,11 +1721,12 @@ app.get('/platform/shops', requirePlatformAdmin, (req, res) => {
     const accessCell = a
       ? `Open until ${escapeHtml(a.expires_at.replace('T',' ').slice(0,16))} UTC (${escapeHtml(ACCESS_REASONS[a.reason_type] || a.reason_type)})<form method="POST" action="/platform/access/${a.id}/close" class="inline-form">${csrfField(req)}<button class="btn btn-sm">Close</button></form>`
       : `<form method="POST" action="/platform/shops/${s.id}/access" class="inline-form access-open-form">${csrfField(req)}<select name="reason_type" required><option value="">Reason…</option>${Object.entries(ACCESS_REASONS).map(([k, v]) => `<option value="${k}">${escapeHtml(v)}</option>`).join('')}</select><input type="text" name="note" maxlength="300" minlength="10" required placeholder="What and why (ticket, matter)"><button class="btn btn-sm">Open read-only</button></form>`;
-    return `<tr><td><strong>${escapeHtml(s.name)}</strong></td><td>${escapeHtml(s.subscription_status||'inactive')}</td><td>${uc.c}</td><td>${jc.c}</td><td>${accessCell}</td><td>${formatDate(s.created_at)}</td></tr>`;
+    return `<tr><td><strong>${escapeHtml(s.name)}</strong></td><td>${escapeHtml(SHOP_STATUS_LABELS[s.subscription_status] || s.subscription_status || 'inactive')}</td><td>${uc.c}</td><td>${jc.c}</td><td>${s.subscription_status === 'removed' ? '<span style="color:#999">—</span>' : accessCell}</td><td>${formatDate(s.created_at)}</td><td>${shopActions(req, s)}</td></tr>`;
   }).join('');
-  const content = `<div class="page-header"><h1>Shops <span class="count-badge">${shops.length}</span></h1></div>
+  const flash = consumeFlash(req);
+  const content = `${flashHtml(flash)}<div class="page-header"><h1>Shops <span class="count-badge">${shops.length}</span></h1></div>
     <div class="doc-section" style="margin-bottom:2rem"><h2 class="doc-section-title">Onboard New Shop</h2><form method="POST" action="/platform/shops/create" style="display:grid;gap:1rem;max-width:520px">${csrfField(req)}<div class="form-group"><label>Shop Name</label><input type="text" name="shop_name" required></div><div class="form-group"><label>Admin Full Name</label><input type="text" name="admin_full_name" required></div><div class="form-group"><label>Admin Username</label><input type="text" name="admin_username" required autocomplete="off"></div><div class="form-group"><label>Temporary Password</label><input type="password" name="admin_password" required autocomplete="new-password"></div><button type="submit" class="btn btn-primary">Create Shop</button></form></div>
-    <div class="table-wrap"><table class="data-table"><thead><tr><th>Shop</th><th>Status</th><th>Users</th><th>Jobs</th><th>Job access</th><th>Created</th></tr></thead><tbody>${rows||'<tr><td colspan="6" class="empty">No shops.</td></tr>'}</tbody></table></div>`;
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Shop</th><th>Status</th><th>Users</th><th>Jobs</th><th>Job access</th><th>Created</th><th>Account</th></tr></thead><tbody>${rows||'<tr><td colspan="7" class="empty">No shops.</td></tr>'}</tbody></table></div>`;
   res.send(layout('Shops', content, 'shops', req.session.user));
 });
 
@@ -1770,6 +1785,184 @@ app.post('/platform/shops/create', requirePlatformAdmin, asyncRoute(async (req, 
   }
   res.redirect('/platform/shops');
 }));
+
+// ─── Platform Admin: account removal ─────────────────────────────────────────
+// Removing an account turns its sign-in off; it is reversible. Permanent delete
+// is allowed only for accounts that never touched a job, because a user's name
+// on a calibration record, sign-off, photo or assignment is part of that shop's
+// paperwork and must keep pointing at a real account.
+const SHOP_STATUS_LABELS = { active: 'active (Stripe)', trialing: 'trialing (Stripe)', comp: 'complimentary', removed: 'removed', inactive: 'inactive' };
+const USER_HISTORY_CHECKS = [
+  'SELECT 1 FROM jobs WHERE created_by=?',
+  'SELECT 1 FROM job_photos WHERE uploaded_by=?',
+  'SELECT 1 FROM job_calibrations WHERE created_by=? OR voided_by=?',
+  'SELECT 1 FROM job_calibration_files WHERE uploaded_by=?',
+  'SELECT 1 FROM job_signoffs WHERE user_id=?',
+  'SELECT 1 FROM job_assignments WHERE user_id=? OR assigned_by=? OR removed_by=?',
+  'SELECT 1 FROM platform_access WHERE opened_by=?',
+  'SELECT 1 FROM platform_access_log WHERE user_id=?',
+].map((sql) => ({ stmt: db.prepare(sql + ' LIMIT 1'), n: (sql.match(/\?/g) || []).length }));
+function userHasHistory(id) {
+  return USER_HISTORY_CHECKS.some(({ stmt, n }) => Boolean(stmt.get(...Array(n).fill(id))));
+}
+function shopDeleteBlocker(shopId) {
+  if (db.prepare('SELECT 1 FROM jobs WHERE shop_id=? LIMIT 1').get(shopId)) return 'it has jobs';
+  if (db.prepare('SELECT 1 FROM platform_access WHERE shop_id=? LIMIT 1').get(shopId)) return 'the access log references it';
+  const users = db.prepare('SELECT id FROM users WHERE shop_id=?').all(shopId);
+  if (users.some((u) => userHasHistory(u.id))) return 'one of its users has job history';
+  return null;
+}
+function flashHtml(flash) {
+  if (!flash) return '';
+  const ok = flash.type === 'success';
+  return `<div style="background:${ok ? '#D6F0D6' : '#FFD6D6'};color:${ok ? '#1A6B1A' : '#8B0000'};padding:.65rem 1rem;border-radius:6px;margin-bottom:1rem">${escapeHtml(flash.msg)}</div>`;
+}
+function postButton(req, action, label, confirmText, cls = 'btn btn-sm') {
+  return `<form method="POST" action="${action}" class="inline-form"${confirmText ? ` data-confirm="${escapeHtml(confirmText)}"` : ''}>${csrfField(req)}<button class="${cls}">${label}</button></form>`;
+}
+function shopActions(req, s) {
+  const base = `/platform/shops/${s.id}`;
+  if (s.subscription_status === 'removed') {
+    const del = shopDeleteBlocker(s.id) ? '' : postButton(req, `${base}/delete`, 'Delete permanently', `Permanently delete ${s.name} and its user accounts? This cannot be undone.`, 'btn btn-sm btn-ghost');
+    return postButton(req, `${base}/restore`, 'Restore') + del;
+  }
+  let out = '';
+  if (s.subscription_status === 'comp') out += postButton(req, `${base}/comp/end`, 'End complimentary');
+  else if (!s.stripe_customer_id && !['active', 'trialing'].includes(s.subscription_status)) out += postButton(req, `${base}/comp`, 'Give complimentary access');
+  out += postButton(req, `${base}/remove`, 'Remove shop', `Remove ${s.name}? Every user in this shop is signed out and can no longer sign in. Their records are kept, and you can restore the shop later.`, 'btn btn-sm btn-ghost');
+  return out;
+}
+function platformShop(req, res) {
+  const shop = db.prepare('SELECT * FROM shops WHERE id=?').get(Number.parseInt(req.params.id, 10));
+  if (!shop) { res.status(404).send('Not found'); return null; }
+  return shop;
+}
+
+app.post('/platform/shops/:id/comp', requirePlatformAdmin, (req, res) => {
+  const shop = platformShop(req, res); if (!shop) return;
+  if (shop.stripe_customer_id || ['active', 'trialing', 'removed'].includes(shop.subscription_status)) {
+    setFlash(req, 'error', `${shop.name} is billed through Stripe or removed; complimentary access is for shops without a subscription.`);
+  } else {
+    db.prepare("UPDATE shops SET subscription_status='comp' WHERE id=?").run(shop.id);
+    setFlash(req, 'success', `${shop.name} now has complimentary access.`);
+  }
+  res.redirect('/platform/shops');
+});
+app.post('/platform/shops/:id/comp/end', requirePlatformAdmin, (req, res) => {
+  const shop = platformShop(req, res); if (!shop) return;
+  if (shop.subscription_status === 'comp') {
+    db.prepare("UPDATE shops SET subscription_status='inactive' WHERE id=?").run(shop.id);
+    setFlash(req, 'success', `Complimentary access ended for ${shop.name}.`);
+  }
+  res.redirect('/platform/shops');
+});
+app.post('/platform/shops/:id/remove', requirePlatformAdmin, (req, res) => {
+  const shop = platformShop(req, res); if (!shop) return;
+  if (shop.subscription_status !== 'removed') {
+    db.exec('BEGIN');
+    try {
+      const off = db.prepare("UPDATE users SET active=0, off_with_shop=1 WHERE shop_id=? AND active=1 AND role!='platform_admin'").run(shop.id).changes;
+      db.prepare("UPDATE shops SET subscription_status='removed' WHERE id=?").run(shop.id);
+      db.prepare('UPDATE platform_access SET closed_at=? WHERE shop_id=? AND closed_at IS NULL').run(new Date().toISOString(), shop.id);
+      db.exec('COMMIT');
+      setFlash(req, 'success', `${shop.name} removed. ${off} user account(s) turned off.${shop.stripe_customer_id ? ' Cancel its Stripe subscription in Stripe as well.' : ''}`);
+    } catch (err) {
+      db.exec('ROLLBACK');
+      console.error('[platform/shops/remove]', err.message);
+      setFlash(req, 'error', `Could not remove ${shop.name}.`);
+    }
+  }
+  res.redirect('/platform/shops');
+});
+app.post('/platform/shops/:id/restore', requirePlatformAdmin, (req, res) => {
+  const shop = platformShop(req, res); if (!shop) return;
+  if (shop.subscription_status === 'removed') {
+    db.exec('BEGIN');
+    try {
+      const on = db.prepare('UPDATE users SET active=1, off_with_shop=0 WHERE shop_id=? AND off_with_shop=1').run(shop.id).changes;
+      db.prepare("UPDATE shops SET subscription_status='inactive' WHERE id=?").run(shop.id);
+      db.exec('COMMIT');
+      setFlash(req, 'success', `${shop.name} restored with ${on} user account(s). Its status is inactive until it subscribes or you give complimentary access.`);
+    } catch (err) {
+      db.exec('ROLLBACK');
+      console.error('[platform/shops/restore]', err.message);
+      setFlash(req, 'error', `Could not restore ${shop.name}.`);
+    }
+  }
+  res.redirect('/platform/shops');
+});
+app.post('/platform/shops/:id/delete', requirePlatformAdmin, (req, res) => {
+  const shop = platformShop(req, res); if (!shop) return;
+  const blocker = shop.subscription_status !== 'removed' ? 'remove it first' : shopDeleteBlocker(shop.id);
+  if (blocker) {
+    setFlash(req, 'error', `${shop.name} cannot be deleted: ${blocker}. It stays removed.`);
+    return res.redirect('/platform/shops');
+  }
+  db.exec('BEGIN');
+  try {
+    const users = db.prepare('DELETE FROM users WHERE shop_id=?').run(shop.id).changes;
+    db.prepare('DELETE FROM shops WHERE id=?').run(shop.id);
+    db.exec('COMMIT');
+    setFlash(req, 'success', `${shop.name} and ${users} user account(s) deleted.`);
+  } catch (err) {
+    db.exec('ROLLBACK');
+    console.error('[platform/shops/delete]', err.message);
+    setFlash(req, 'error', `Could not delete ${shop.name}.`);
+  }
+  res.redirect('/platform/shops');
+});
+
+app.get('/platform/accounts', requirePlatformAdmin, (req, res) => {
+  const users = db.prepare(`SELECT u.id, u.full_name, u.username, u.email, u.role, u.active, u.created_at, s.name AS shop_name, s.subscription_status AS shop_status
+    FROM users u LEFT JOIN shops s ON s.id=u.shop_id ORDER BY (s.name IS NULL) DESC, s.name, u.role, u.username`).all();
+  const rows = users.map((u) => {
+    let actions = '<span style="color:#999">—</span>';
+    if (u.role !== 'platform_admin') {
+      const who = `${u.username}${u.shop_name ? ` (${u.shop_name})` : ''}`;
+      const toggle = u.active
+        ? postButton(req, `/platform/accounts/${u.id}/deactivate`, 'Deactivate', `Turn off ${who}? They are signed out right away.`)
+        : (u.shop_status === 'removed' ? '<span class="adas-basis">Restore the shop first</span>' : u.role === 'guest' ? '' : postButton(req, `/platform/accounts/${u.id}/reactivate`, 'Reactivate'));
+      const del = userHasHistory(u.id)
+        ? '<span class="adas-basis" title="Their name is on job records, so the account is kept.">Has job history</span>'
+        : postButton(req, `/platform/accounts/${u.id}/delete`, 'Delete', `Permanently delete ${who}? This cannot be undone.`, 'btn btn-sm btn-ghost');
+      actions = toggle + del;
+    }
+    return `<tr><td>${escapeHtml(u.shop_name || '—')}</td><td>${escapeHtml(u.full_name || '—')}</td><td class="mono">${escapeHtml(u.username)}</td><td><span class="badge badge-blue">${escapeHtml(u.role)}</span></td><td><span class="badge badge-${u.active ? 'green' : 'gray'}">${u.active ? 'Active' : 'Inactive'}</span></td><td>${formatDate(u.created_at)}</td><td>${actions}</td></tr>`;
+  }).join('');
+  const content = `${flashHtml(consumeFlash(req))}<div class="page-header"><h1>Accounts <span class="count-badge">${users.length}</span></h1></div>
+    <p class="adas-basis" style="margin-bottom:1rem">Every sign-in on the platform. Deactivate turns an account off and signs it out; it can be turned back on. Delete is only offered for accounts that never worked on a job; anyone whose name is on a record stays, deactivated, so the shop's paperwork still shows who did the work. To take a whole shop off the platform, use Remove on the Shops page.</p>
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Shop</th><th>Name</th><th>Username</th><th>Role</th><th>Status</th><th>Created</th><th>Actions</th></tr></thead><tbody>${rows || '<tr><td colspan="7" class="empty">No accounts.</td></tr>'}</tbody></table></div>`;
+  res.send(layout('Accounts', content, 'accounts', req.session.user));
+});
+function platformTargetUser(req, res) {
+  const u = db.prepare('SELECT u.*, s.subscription_status AS shop_status FROM users u LEFT JOIN shops s ON s.id=u.shop_id WHERE u.id=?').get(Number.parseInt(req.params.id, 10));
+  if (!u) { res.status(404).send('Not found'); return null; }
+  if (u.role === 'platform_admin') { res.status(403).send('Access denied.'); return null; }
+  return u;
+}
+app.post('/platform/accounts/:id/deactivate', requirePlatformAdmin, (req, res) => {
+  const u = platformTargetUser(req, res); if (!u) return;
+  db.prepare('UPDATE users SET active=0, off_with_shop=0 WHERE id=?').run(u.id);
+  setFlash(req, 'success', `${u.username} deactivated and signed out.`);
+  res.redirect('/platform/accounts');
+});
+app.post('/platform/accounts/:id/reactivate', requirePlatformAdmin, (req, res) => {
+  const u = platformTargetUser(req, res); if (!u) return;
+  if (u.role === 'guest') setFlash(req, 'error', 'Guest accounts stay off; guest login was removed.');
+  else if (u.shop_status === 'removed') setFlash(req, 'error', `${u.username}'s shop is removed. Restore the shop first.`);
+  else { db.prepare('UPDATE users SET active=1, off_with_shop=0 WHERE id=?').run(u.id); setFlash(req, 'success', `${u.username} reactivated.`); }
+  res.redirect('/platform/accounts');
+});
+app.post('/platform/accounts/:id/delete', requirePlatformAdmin, (req, res) => {
+  const u = platformTargetUser(req, res); if (!u) return;
+  if (userHasHistory(u.id)) {
+    setFlash(req, 'error', `${u.username} has job history, so the account is kept. Deactivate it instead.`);
+  } else {
+    db.prepare('DELETE FROM users WHERE id=?').run(u.id);
+    setFlash(req, 'success', `${u.username} deleted.`);
+  }
+  res.redirect('/platform/accounts');
+});
 
 app.get('/platform/billing', requirePlatformAdmin, (req, res) => {
   const shops = db.prepare('SELECT * FROM shops ORDER BY name ASC').all();
