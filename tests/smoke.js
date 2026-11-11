@@ -168,6 +168,13 @@ const userId = (username) => DB.prepare('SELECT id FROM users WHERE username=?')
   r = await admin.post('/jobs', { ...jobForm, ro: 'RO-SMOKE2' });
   const jobB = (r.location.match(/\/jobs\/(CIQ-[\w-]+)/) || [])[1];
   check('second job created', !!jobB);
+  if (DB) {
+    check('new job starts as Created', DB.prepare('SELECT status FROM jobs WHERE jobId=?').get(jobB).status === 'Created');
+    r = await admin.post('/jobs', { ...jobForm, ro: 'RO-SMOKE-MAKE', make: 'toyota', model: 'Camry' });
+    const jm = (r.location.match(/\/jobs\/(CIQ-[\w-]+)/) || [])[1];
+    check('make typed in lower case is saved as "Toyota"', DB.prepare('SELECT make FROM jobs WHERE jobId=?').get(jm).make === 'Toyota');
+    DB.prepare('DELETE FROM job_photos WHERE job_id=?').run(jm); DB.prepare('DELETE FROM jobs WHERE jobId=?').run(jm);
+  }
   r = await admin.req('POST', '/jobs', { _csrf: admin.token, 'ro[]': 'x', 'make[a]': 'b' });
   check('POST /jobs with array/object fields → handled', r.status === 400 || r.status === 302, `status ${r.status}`);
   for (const p of [`/jobs/${jobA}`, `/jobs/${jobA}/edit`, `/jobs/${jobA}/photos`]) {
@@ -422,9 +429,13 @@ const userId = (username) => DB.prepare('SELECT id FROM users WHERE username=?')
   r = await admin.req('GET', '/admin');
   check('admin page explains what is open', /cannot be marked Calibration Complete: 3 calibration record item\(s\) open/.test(r.text) && /Pre-repair scan/.test(r.text));
   await admin.freshToken(`/jobs/${jobB}`);
+  r = await admin.req('POST', `/jobs/${jobB}/calibrations`, recordForm(admin, { item_key: 'SI:REVIEW', ...passFields, si_reference: 'scan' }));
+  check('placeholder OEM service information ("scan") rejected', !DB || !DB.prepare("SELECT 1 FROM job_calibrations WHERE job_id=? AND item_key='SI:REVIEW'").get(jobB));
+  check('job stays Created while nothing is recorded', !DB || DB.prepare('SELECT status FROM jobs WHERE jobId=?').get(jobB).status === 'Created');
   for (const key of ['SCAN:PRE', 'SI:REVIEW', 'SCAN:POST']) {
     await admin.req('POST', `/jobs/${jobB}/calibrations`, recordForm(admin, { item_key: key, ...passFields }));
   }
+  check('first record moves the job to In Progress', !DB || DB.prepare('SELECT status FROM jobs WHERE jobId=?').get(jobB).status === 'In Progress');
   r = await admin.req('POST', `/jobs/${jobB}/calibrations`, recordForm(admin, { item_key: 'ADDITIONAL', item_name: 'Front camera aiming', ...passFields, result: 'fail' }));
   await admin.freshToken('/admin');
   r = await admin.post(`/jobs/${jobB}/status`, { status: 'Closed' });
@@ -468,6 +479,7 @@ const userId = (username) => DB.prepare('SELECT id FROM users WHERE username=?')
   await admin.freshToken(`/jobs/${jobB}`);
   await new Promise((res) => setTimeout(res, 5));
   r = await admin.post(`/jobs/${jobB}/signoff/qc`);
+  check('QC approval moves the job to Calibration Complete', statusOf(jobB) === 'Calibration Complete');
   check('QC approves the current record', r.status === 302 && signoffs(jobB).some((x) => x.kind === 'qc' && x.role === 'shop_admin'));
   r = await admin.req('GET', `/jobs/${jobB}`);
   check('job page shows approval and a Close job button', /QC approval:<\/strong> /.test(r.text) && /signoff\/close/.test(r.text) && !/signoff\/override/.test(r.text));

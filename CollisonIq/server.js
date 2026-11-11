@@ -1156,7 +1156,7 @@ app.get('/new', requireJobEditor, requireSubscription, (req, res) => {
 
 app.post('/jobs', requireJobEditor, requireSubscription, (req, res) => {
   const ro = str(req.body.ro, 50), vin = str(req.body.vin, 17), year = str(req.body.year, 4);
-  const make = str(req.body.make, 50), model = str(req.body.model, 50), trim = str(req.body.trim, 50);
+  const make = displayMake(str(req.body.make, 50)), model = str(req.body.model, 50), trim = str(req.body.trim, 50);
   const technicianName = str(req.body.technicianName, 100), otherRepairs = str(req.body.otherRepairs, 300);
   if (!ro) return res.status(400).send('RO number is required.');
   const impactZones = strList(req.body.impact_zones, 50).filter(z => Object.prototype.hasOwnProperty.call(ZONE_DISPLAY, z));
@@ -1321,7 +1321,7 @@ app.post('/jobs/:jobId/edit', requireJobEditor, requireSubscription, (req, res) 
   const job = ownedJob(req);
   if (!job) return res.status(404).send('Not found');
   const ro = str(req.body.ro, 50), vin = str(req.body.vin, 17), year = str(req.body.year, 4);
-  const make = str(req.body.make, 50), model = str(req.body.model, 50), trim = str(req.body.trim, 50);
+  const make = displayMake(str(req.body.make, 50)), model = str(req.body.model, 50), trim = str(req.body.trim, 50);
   const technicianName = str(req.body.technicianName, 100), otherRepairs = str(req.body.otherRepairs, 300);
   const adas = jobAdasColumns({ make, model, year, values: strList(req.body.repairs, 100), other: otherRepairs });
   const now = new Date().toISOString();
@@ -1471,6 +1471,24 @@ function loadCalibrationRecord(job, adasEval) {
   return { items, records, files, st, signoffs, sign: calRecord.signoffState(records, signoffs, st.summary) };
 }
 
+// ─── Make as printed on the job ─────────────────────────────────────────────
+// Typed makes are saved in their usual written form ("toyota" → "Toyota",
+// "gmc" → "GMC"). A make typed in mixed case is kept as typed.
+const MAKE_NAMES = ['Acura', 'Alfa Romeo', 'Aston Martin', 'Audi', 'Bentley', 'BMW', 'Buick', 'Cadillac', 'Chevrolet', 'Chrysler', 'Dodge',
+  'Ferrari', 'Fiat', 'Fisker', 'Ford', 'Genesis', 'GMC', 'Honda', 'Hummer', 'Hyundai', 'Infiniti', 'Jaguar', 'Jeep', 'Kia', 'Lamborghini',
+  'Land Rover', 'Lexus', 'Lincoln', 'Lucid', 'Maserati', 'Mazda', 'McLaren', 'Mercedes-Benz', 'Mini', 'Mitsubishi', 'Nissan', 'Polestar',
+  'Porsche', 'Ram', 'Rivian', 'Rolls-Royce', 'Scion', 'Subaru', 'Tesla', 'Toyota', 'VinFast', 'Volkswagen', 'Volvo'];
+const MAKE_BY_KEY = new Map(MAKE_NAMES.map((m) => [m.toLowerCase().replace(/[^a-z]/g, ''), m]));
+for (const [alias, m] of [['chevy', 'Chevrolet'], ['vw', 'Volkswagen'], ['mercedes', 'Mercedes-Benz'], ['benz', 'Mercedes-Benz'], ['landrover', 'Land Rover']]) MAKE_BY_KEY.set(alias, m);
+function displayMake(make) {
+  const m = String(make || '').trim().replace(/\s+/g, ' ');
+  if (!m) return '';
+  const known = MAKE_BY_KEY.get(m.toLowerCase().replace(/[^a-z]/g, ''));
+  if (known) return known;
+  if (m === m.toLowerCase() || m === m.toUpperCase()) return m.toLowerCase().replace(/(^|[\s-])([a-z])/g, (_, a, b) => a + b.toUpperCase());
+  return m;
+}
+
 // ─── Sign-off, QC approval, QC override ─────────────────────────────────────
 function signoffGuard(req, res, roles) {
   const job = ownedJob(req);
@@ -1483,6 +1501,22 @@ function addSignoff(job, user, kind, extra = {}) {
   db.prepare('INSERT INTO job_signoffs (job_id,kind,user_id,user_name,role,statement,justification,open_items,created_at) VALUES (?,?,?,?,?,?,?,?,?)')
     .run(job.jobId, kind, user.id, user.full_name || user.username, user.role, calRecord.STATEMENTS[kind], extra.justification || null, extra.open_items || null, new Date().toISOString());
 }
+// Job status follows the record: Created until the first record, In Progress
+// while it is being documented, Calibration Complete once QC approves the
+// current record, Closed only through close or QC override. A change after
+// approval (new or voided record) makes the approval stale and moves the job
+// back to In Progress. Closed jobs never change here.
+function syncJobStatus(jobId) {
+  const job = db.prepare('SELECT * FROM jobs WHERE jobId=?').get(jobId);
+  if (!job || job.status === 'Closed') return job && job.status;
+  const { records, sign } = loadCalibrationRecord(job, jobReport.parseStored(job.adas_eval));
+  const next = sign.qcCurrent ? 'Calibration Complete' : records.length ? 'In Progress' : 'Created';
+  if (next !== job.status) {
+    const now = new Date().toISOString();
+    db.prepare('UPDATE jobs SET status=?, updatedAt=?, last_changed=? WHERE jobId=?').run(next, now, now, job.jobId);
+  }
+  return next;
+}
 function closeJob(job) {
   const now = new Date().toISOString();
   db.prepare("UPDATE jobs SET status='Closed', updatedAt=?, last_changed=? WHERE jobId=?").run(now, now, job.jobId);
@@ -1493,6 +1527,7 @@ app.post('/jobs/:jobId/signoff/tech', requireAuth, requireSubscription, (req, re
   const { sign } = loadCalibrationRecord(job, jobReport.parseStored(job.adas_eval));
   if (!sign.canTechSign) { setFlash(req, 'error', 'Document every record item before signing off.'); return res.redirect(jobPath); }
   addSignoff(job, req.session.user, 'tech');
+  syncJobStatus(job.jobId);
   setFlash(req, 'success', 'Technician sign-off recorded.');
   res.redirect(jobPath);
 });
@@ -1502,7 +1537,8 @@ app.post('/jobs/:jobId/signoff/qc', requireAuth, requireSubscription, (req, res)
   const { sign } = loadCalibrationRecord(job, jobReport.parseStored(job.adas_eval));
   if (!sign.canApprove) { setFlash(req, 'error', `QC approval needs: ${sign.approveBlockers.join('; ')}.`); return res.redirect(jobPath); }
   addSignoff(job, req.session.user, 'qc');
-  setFlash(req, 'success', 'QC approval recorded. The job can now be closed.');
+  syncJobStatus(job.jobId);
+  setFlash(req, 'success', 'QC approval recorded: Calibration Complete. The job can now be closed.');
   res.redirect(jobPath);
 });
 app.post('/jobs/:jobId/signoff/close', requireAuth, requireSubscription, (req, res) => {
@@ -1563,6 +1599,7 @@ app.post('/jobs/:jobId/calibrations', requireAuth, requireSubscription, (req, re
   const addFile = db.prepare('INSERT INTO job_calibration_files (calibration_id,job_id,file_path,original_name,mime_type,size_bytes,uploaded_by,uploaded_at) VALUES (?,?,?,?,?,?,?,?)');
   for (const f of req.files || []) addFile.run(info.lastInsertRowid, job.jobId, f.filename, (f.originalname || '').slice(0, 200), f.mimetype, f.size, req.session.user.id, now);
   db.prepare('UPDATE jobs SET updatedAt=?, last_changed=? WHERE jobId=?').run(now, now, job.jobId);
+  syncJobStatus(job.jobId);
   setFlash(req, 'success', `Recorded: ${r.item_name}.`);
   res.redirect(jobPath);
 });
@@ -1579,6 +1616,7 @@ app.post('/jobs/:jobId/calibrations/:id/void', requireAuth, requireSubscription,
   const now = new Date().toISOString();
   db.prepare('UPDATE job_calibrations SET voided_at=?, voided_by=?, void_reason=? WHERE id=?').run(now, req.session.user.id, reason, row.id);
   db.prepare('UPDATE jobs SET updatedAt=?, last_changed=? WHERE jobId=?').run(now, now, job.jobId);
+  syncJobStatus(job.jobId);
   setFlash(req, 'success', `Voided record for ${row.item_name}.`);
   res.redirect(jobPath);
 });
@@ -1672,8 +1710,11 @@ app.post('/jobs/:jobId/status', requireAdmin, requireSubscription, (req, res) =>
   // technician sign-off and QC approval (or the QC override on the job page).
   if (['Calibration Complete', 'Closed'].includes(req.body.status)) {
     const { st, sign } = loadCalibrationRecord(job, jobReport.parseStored(job.adas_eval));
+    // Calibration Complete means QC approved the current record, the same
+    // point at which the job moves there on its own.
     const blocker = req.body.status === 'Closed' ? calRecord.closeBlocker(sign, st.summary)
-      : (st.summary.complete ? null : `${st.summary.open} calibration record item(s) open — ${st.summary.openNames.join('; ')}`);
+      : (!st.summary.complete ? `${st.summary.open} calibration record item(s) open — ${st.summary.openNames.join('; ')}`
+        : sign.qcCurrent ? null : 'QC has not approved the current record');
     if (blocker) {
       setFlash(req, 'error', `${job.jobId} cannot be marked ${req.body.status}: ${blocker}.${req.body.status === 'Closed' ? ' Approve or override on the job page.' : ''}`);
       return res.redirect('/admin');

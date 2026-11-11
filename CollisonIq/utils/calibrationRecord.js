@@ -116,6 +116,17 @@ function status(items, records) {
   };
 }
 
+// An OEM service information reference has to say where the procedure came
+// from: at least two words, and either a document number ("WSM 419-03") or
+// enough text to name the source ("Honda ADAS job aid"). "scan" and "FR set
+// up" are rejected. It cannot check the document exists; it stops placeholders.
+const MIN_SI_REFERENCE = 12;
+function siReferenceOk(v) {
+  const t = String(v || '').trim();
+  const words = t.split(/\s+/).filter((w) => /[a-z0-9]/i.test(w));
+  return words.length >= 2 && (/\d/.test(t) || t.length >= MIN_SI_REFERENCE);
+}
+
 /**
  * Validate a submitted record. `item` is the required item, or null for an
  * additional calibration. Returns { errors: [], record } with cleaned fields.
@@ -146,8 +157,10 @@ function validateRecord(input, item, today = new Date()) {
   else if (d.getTime() > today.getTime() + 36 * 3600 * 1000) errors.push('The date cannot be in the future.');
   if (rec.result === 'not_performed' && rec.reason.length < 5) errors.push('Explain why it was not performed.');
   if (rec.result !== 'not_performed') {
-    if (['oem', 'additional', 'si_review'].includes(kind) && !rec.si_reference) {
-      errors.push('Enter the OEM service information used (procedure or document name, ID and date).');
+    if (['oem', 'additional', 'si_review'].includes(kind) && !siReferenceOk(rec.si_reference)) {
+      errors.push(rec.si_reference
+        ? `"${rec.si_reference}" does not identify the OEM service information. Name the source and the procedure or document, e.g. "Toyota TIS — Front camera calibration, RM12345".`
+        : 'Enter the OEM service information used (procedure or document name, ID and date).');
     }
     if (kind === 'scan' && !rec.tool) errors.push('Enter the scan tool used.');
   }
@@ -226,7 +239,7 @@ function renderForm({ action, csrf, items, defaults }) {
         <div class="form-group"><label>Result</label><select name="result" required><option value="">Choose…</option>${Object.entries(RESULTS).map(([k, v]) => `<option value="${k}">${esc(v)}</option>`).join('')}</select></div>
         <div class="form-group"><label>Method</label><select name="method"><option value="">—</option>${METHODS.map((m) => `<option>${esc(m)}</option>`).join('')}</select></div>
       </div>
-      <div class="form-group"><label>OEM service information used</label><input type="text" name="si_reference" maxlength="300" placeholder="Procedure or document name, ID and date"></div>
+      <div class="form-group"><label>OEM service information used</label><input type="text" name="si_reference" maxlength="300" placeholder="e.g. Toyota TIS — Front camera calibration, RM12345, 2026-03"></div>
       <div class="form-row-2">
         <div class="form-group"><label>Tool</label><input type="text" name="tool" maxlength="150" placeholder="Scan tool / calibration system"></div>
         <div class="form-group"><label>Date performed</label><input type="date" name="performed_on" value="${esc(defaults.date)}" required></div>
@@ -439,7 +452,7 @@ function renderSummary(sum) {
 }
 
 module.exports = {
-  RESULTS, METHODS, PROOF_EXT, MAX_PROOF_FILES, STATEMENTS, QC_ROLES, SIGN_ROLES, MIN_JUSTIFICATION,
+  RESULTS, METHODS, PROOF_EXT, MAX_PROOF_FILES, MIN_SI_REFERENCE, siReferenceOk, STATEMENTS, QC_ROLES, SIGN_ROLES, MIN_JUSTIFICATION,
   requiredItems, status, validateRecord, summaryBadge, renderSection, renderForm,
   lastRecordChange, signoffState, closeBlocker, validateOverride, renderSignoffs,
   recordSummary, renderSummary,

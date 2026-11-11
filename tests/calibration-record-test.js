@@ -114,6 +114,15 @@ check('summary badge', /1\/3 documented · 2 open/.test(cr.summaryBadge(st.summa
     && /signoff\/override/.test(forms('qc_manager')) && !/<form/.test(forms('service_writer')));
 }
 
+// ─── OEM service information reference ──────────────────────────────────────
+check('SI reference: placeholders rejected', ['', 'scan', 'FR set up', 'oem', 'see SI', 'BS set up'].every((v) => !cr.siReferenceOk(v)));
+check('SI reference: real references accepted', ['WSM 419-03', 'Honda ADAS job aid', 'Toyota TIS — Front camera calibration, RM12345', 'SI 555'].every((v) => cr.siReferenceOk(v)));
+{
+  const oemItem = cr.requiredItems(evalFor('Ford', 'F-150', ['FRONT_RADAR'])).find((x) => x.kind === 'oem');
+  const e = cr.validateRecord({ result: 'pass', performed_by_name: 'T', performed_on: '2026-11-10', si_reference: 'scan' }, oemItem, new Date('2026-11-11')).errors.join(' ');
+  check('SI reference: placeholder gets an example of what to enter', /"scan" does not identify/.test(e) && /RM12345/.test(e));
+}
+
 // ─── Record summary (top of hard copy / insurer view) ────────────────────────
 {
   const items = cr.requiredItems(evalFor('Ford', 'F-150', ['FRONT_RADAR', 'MIRROR_RI:L']));
