@@ -13,6 +13,8 @@ const CSRF_EXEMPT_PATHS = new Set(['/api/billing/webhook']);
 // csrfTokenValid(req) manually, immediately after their upload middleware.
 const CSRF_EXEMPT_PATTERNS = [
   /^\/jobs\/[^/]+\/photos\/[^/]+$/,
+  // Calibration record: multipart (proof files); the route checks CSRF after multer.
+  /^\/jobs\/[^/]+\/calibrations$/,
 ];
 
 /**

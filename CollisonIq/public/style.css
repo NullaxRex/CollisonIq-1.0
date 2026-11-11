@@ -2096,3 +2096,52 @@ a:hover {
   .adas-section, .field-rules-section { page-break-inside: auto; }
   .adas-item-rich { page-break-inside: avoid; }
 }
+
+/* ─── Calibration record (Nov 2026) ──────────────────────────────────────── */
+.calrec-list { list-style: none; padding: 0; margin: 0.75rem 0 0; }
+.calrec-item { border: 1px solid #e0e8f0; border-left: 4px solid #c0392b; border-radius: 5px; padding: 0.6rem 0.8rem; margin-bottom: 0.6rem; page-break-inside: avoid; }
+.calrec-item.calrec-done { border-left-color: #27ae60; }
+.calrec-item.calrec-not_performed { border-left-color: #b8860b; }
+.calrec-item.calrec-failed { border-left-color: #8B0000; background: #fff5f5; }
+.calrec-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem; }
+.calrec-state { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #8B0000; }
+.calrec-done .calrec-state { color: #1A6B1A; }
+.calrec-not_performed .calrec-state { color: #8B5A00; }
+.calrec-name { font-weight: 600; color: #1a3a5c; }
+.calrec-kind { font-size: 0.75rem; color: #5a7a96; }
+.calrec-detail { font-size: 0.82rem; color: #4a5568; line-height: 1.55; margin-top: 0.2rem; overflow-wrap: anywhere; }
+.calrec-label { font-weight: 600; color: #2c3e50; }
+.calrec-hint { font-style: italic; }
+.calrec-noproof { color: #8B5A00; }
+.calrec-voided { color: #888; }
+.calrec-subtitle { font-size: 0.9rem; margin: 1rem 0 0.25rem; color: #1a3a5c; }
+.calrec-void { display: flex; gap: 0.4rem; margin-top: 0.4rem; flex-wrap: wrap; }
+.calrec-void input { flex: 1; min-width: 160px; font-size: 0.8rem; padding: 0.3rem 0.5rem; }
+.calrec-form { margin-top: 1rem; }
+.calrec-form > summary { list-style: none; display: inline-block; cursor: pointer; }
+.calrec-form > summary::-webkit-details-marker { display: none; }
+.calrec-form-body { margin-top: 0.75rem; padding: 1rem; border: 1px solid #e0e8f0; border-radius: 6px; background: #f7f9fc; }
+.calrec-opt { font-weight: 400; color: #888; font-size: 0.8rem; }
+
+@media print {
+  .calrec-item { border-left-width: 4px; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .calrec-detail a { color: #2c3e50 !important; text-decoration: none; }
+}
+
+/* ─── Sign-off (Nov 2026) ────────────────────────────────────────────────── */
+.signoff-list { list-style: none; padding: 0; margin: 0.5rem 0 0; }
+.signoff-list li { border-left: 4px solid #c0392b; padding: 0.45rem 0.75rem; margin-bottom: 0.5rem; background: #fafbfc; font-size: 0.88rem; page-break-inside: avoid; }
+.signoff-list li.signoff-ok { border-left-color: #27ae60; }
+.signoff-list li.signoff-override { border-left-color: #8B0000; background: #fff5f5; }
+.signoff-note { color: #8B5A00; }
+.signoff-actions { margin-top: 0.75rem; display: grid; gap: 0.75rem; }
+.signoff-step { border: 1px solid #e0e8f0; border-radius: 6px; padding: 0.6rem 0.8rem; }
+.signoff-form { display: inline-block; margin-top: 0.4rem; }
+.signoff-override-form > summary { list-style: none; display: inline-block; cursor: pointer; }
+.signoff-override-form > summary::-webkit-details-marker { display: none; }
+.signoff-danger { border-color: #8B0000; color: #8B0000; }
+@media print {
+  .signoff-list li { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+}
+.access-open-form { display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center; }
+.access-open-form select, .access-open-form input { font-size: 0.8rem; padding: 0.25rem 0.4rem; max-width: 220px; }

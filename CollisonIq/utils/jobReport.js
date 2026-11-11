@@ -3,7 +3,7 @@
  * CollisionIQ — Job ADAS report (job form → rules engine → hard copy)
  * -----------------------------------------------------------------------------
  * buildJobAdas() runs the job's repairs through oemCalibrationRules.evaluate()
- * (Honda/Acura job aid, covered Fords from the I-CAR matrix, scan policy for
+ * (Honda/Acura and Ford/Lincoln OEM job aids, scan policy for
  * every other make, plus the CollisionIQ universal field rules). The full result
  * is stored on the job as JSON (jobs.adas_eval) and printed by renderSections().
  *
@@ -49,19 +49,78 @@ function scanText(value, policy) {
 }
 
 function ruleBasis(result, make) {
-  if (result.ruleDepth === 'VEHICLE_MATRIX') {
+  if (result.ruleDepth === 'OEM_JOB_AID' || result.ruleDepth === 'OEM_POSITION_STATEMENT') {
     const s = result.source;
-    return { kind: 'oem', text: `${s.title} — ${s.provider}, captured ${s.captured}. ${s.basis}.`, url: s.url };
+    const related = (s.related || []).map((r) => `${r.title} (${r.date})`).join('; ');
+    return {
+      kind: result.coverage === 'PARTIAL' ? 'partial' : 'oem',
+      text: `${s.publisher}: ${s.title} (${s.date}), with ${related}. Procedures: ${s.procedures}.${result.coverage === 'PARTIAL' ? ' These statements cover only part of the vehicle\'s ADAS; other calibrations come from the OEM service information for this VIN.' : ''}`,
+      url: (s.related || []).map((r) => r.url).find(Boolean) || null,
+    };
   }
   if (result.ruleDepth === 'FULL_TRIGGER_RULES') {
     const s = result.source || {};
-    return { kind: 'oem', text: `${s.oem} ${s.title}, version ${s.version} (${s.published}), via ${s.via}.`, url: null };
+    return { kind: 'oem', text: `${s.publisher || s.oem}: ${s.oem} ${s.title}, version ${s.version} (${s.published}).`, url: null };
   }
   return {
     kind: 'none',
     text: `No OEM calibration trigger rules are encoded for ${make || 'this make'}${result.vehicle && result.vehicle.model ? ` ${result.vehicle.model}` : ''}. Determine required calibrations from the VIN-specific OEM repair manual. Scan policy and the CollisionIQ field rules below still apply.`,
     url: null,
   };
+}
+
+// ---- OEM documents relevant to the repair (from the OEM source register) -----
+// Category → which repair events make a document relevant. Pre/post scan
+// statements are already the scan policy source and are not repeated.
+const DOC_RULES = [
+  { category: /glass|forward camera/i, events: /WINDSHIELD|FRONT_CAMERA|^CAMERA_/ },
+  { category: /bumper|radar|sonar/i, events: /BUMPER|FASCIA|GRILLE|RADAR|PARKING_SENSOR|CORNER_SENSOR|BLIND_SPOT|BSI_|COLLISION_DAMAGE/ },
+  { category: /surround-view/i, events: /MIRROR|SIDE_CAMERA|MVCS|PARKING_CAMERA|REAR_CAMERA|REARVIEW|DOOR|FENDER/ },
+  { category: /post collision/i, collision: true },
+  { category: /adas \/ calibration|diagnostics/i, any: true },
+];
+
+// Documents that apply to one model only; shown only when the job's model matches.
+const MODEL_SPECIFIC = [
+  [/\bARIYA\b/i, /ariya/i],
+  [/Eclipse Cross/i, /eclipse\s*cross/i],
+  [/\bR1\b/, /\br1[st]?\b/i],
+  [/\bR2\b/, /\br2\b/i],
+  [/\bEDV\b/, /\bedv\b|delivery van|commercial van/i],
+];
+const normBrand = (s) => String(s || '').toLowerCase().replace(/[^a-z]/g, '');
+
+function relevantDocuments(scan, events, collisionRelated, scanPolicyOnly, vehicle = {}) {
+  const docs = (scan && scan.documents) || [];
+  const scanUrl = scan && scan.source && scan.source.url;
+  const brands = String((scan && scan.brands) || '').split('/').map(normBrand).filter(Boolean);
+  const make = normBrand(vehicle.make);
+  const out = [];
+  for (const d of docs) {
+    if (!d.url || d.url === scanUrl || /pre\/post scan/i.test(d.category)) continue;
+    // A single-brand document from a shared group (e.g. Infiniti on a Nissan job) is skipped.
+    const mfr = normBrand(d.manufacturer);
+    if (!String(d.manufacturer).includes('/') && brands.length > 1 && brands.includes(mfr) && mfr !== make) continue;
+    const specific = MODEL_SPECIFIC.find(([t]) => t.test(d.title));
+    if (specific && !specific[1].test(String(vehicle.model || ''))) continue;
+    const libraryHit = /oem library/i.test(d.category) && scanPolicyOnly && events.length > 0;
+    const hit = libraryHit || DOC_RULES.some((r) => r.category.test(d.category) && (
+      (r.any && events.length > 0) || (r.collision && collisionRelated) || (r.events && events.some((e) => r.events.test(e)))));
+    if (hit) out.push({ title: d.title, issued: d.issued, category: d.category, whyItMatters: d.whyItMatters, url: d.url, notes: d.notes || null });
+  }
+  return out;
+}
+
+// ---- High-voltage vehicles detected from make/model --------------------------
+// Carried over from the July 2026 engine (adasEngine.js): EV makes and model
+// keywords. Detection only adds the register's HV post-crash review item.
+const EV_MAKES = ['tesla', 'rivian', 'lucid', 'polestar'];
+const EV_MODEL_WORDS = ['lightning', 'bolt', 'volt', 'ioniq', 'ev6', 'ev9', 'leaf', 'ariya', 'mach-e', 'id.4', 'bz4x', 'prius prime',
+  'rav4 prime', 'silverado ev', 'sierra ev', 'hummer ev', 'equinox ev', 'blazer ev', 'lyriq', 'hybrid', 'plug-in', 'phev'];
+function isHighVoltage(make, model) {
+  const mk = String(make || '').toLowerCase();
+  const md = String(model || '').toLowerCase();
+  return EV_MAKES.some((m) => mk.includes(m)) || EV_MODEL_WORDS.some((w) => md.includes(w));
 }
 
 const uniq = (a) => [...new Set(a)];
@@ -89,8 +148,11 @@ function buildJobAdas({ make, model, year, repairValues }) {
       };
 
   result.input = { repairValues: values, repairLabels: values.map(repairs.valueLabel), events, collisionRelated, family };
-  result.reviewItems = reviewItems(reviewEvents);
+  const evDetected = !reviewEvents.includes('HV EV post-crash') && isHighVoltage(make, model);
+  result.reviewItems = reviewItems(evDetected ? [...reviewEvents, 'HV EV post-crash'] : reviewEvents)
+    .map((r) => (evDetected && r.event === 'HV EV post-crash' ? { ...r, detected: 'Detected from the vehicle make/model' } : r));
   result.basis = ruleBasis(result, make);
+  result.oemDocuments = relevantDocuments(result.scanPolicy, events, collisionRelated, result.ruleDepth === 'SCAN_POLICY_ONLY', { make, model });
 
   const cals = result.calibrations || [];
   const ops = result.operationChecks || [];
@@ -102,6 +164,9 @@ function buildJobAdas({ make, model, year, repairValues }) {
       ? [`[OEM] Calibrations not encoded for ${make || 'this make'} — determine from VIN-specific OEM service information`]
       : []),
     ...cals.map((c) => `[OEM] ${c.systemName}${c.location ? ` — ${c.location}` : ''}`),
+    ...(result.coverage === 'PARTIAL'
+      ? [`[OEM] Other ${make} calibrations are vehicle-specific — determine from OEM service information for this VIN`]
+      : []),
     ...ops.map((o) => `[OEM operation check] ${o.systemName} — ${o.checks.join(', ')}`),
     ...vers.map((v) => `[CollisionIQ field rule] ${v.name}`),
   ];
@@ -143,14 +208,17 @@ const safeUrl = (u) => (/^https:\/\//i.test(String(u || '')) ? u : null);
 const link = (u) => (safeUrl(u) ? ` <a class="adas-src-link" href="${esc(u)}" rel="noopener noreferrer" target="_blank">${esc(u)}</a>` : '');
 const detail = (label, value) => (value ? `<div class="adas-detail"><span class="adas-detail-label">${esc(label)}</span> ${value}</div>` : '');
 const list = (a) => a.map(esc).join('; ');
-const SHOWN_ELSEWHERE = new Set(['FIELD_RULES_APPLIED', 'CAL_RULES_NOT_ENCODED']);
+const SHOWN_ELSEWHERE = new Set(['FIELD_RULES_APPLIED', 'CAL_RULES_NOT_ENCODED', 'GM_OTHER_CALIBRATIONS_IN_SI']);
 
 function renderCalibration(c) {
   const head = `${esc(c.systemName)}${c.location ? ` <span class="adas-loc">— ${esc(c.location)}</span>` : ''}`;
   return `<li class="adas-item adas-item-rich"><span class="adas-flag">&#9888;</span><div class="adas-body">
     <div class="adas-name">${head}</div>
     ${detail('Triggered by', list(reasonLabels(c)))}
-    ${detail('Method', c.method ? esc(c.method) : '')}
+    ${detail('Why', c.reasons && c.reasons.some((r) => r.why) ? list(c.reasons.filter((r) => r.why).map((r) => r.why)) : '')}
+    ${detail('Procedure', c.method ? esc(c.method) : '')}
+    ${detail('Workshop manual section', c.wsmSection ? esc(c.wsmSection) : '')}
+    ${detail('Applies', c.whereEquipped ? 'Where the vehicle is equipped with this sensor' : '')}
     ${detail('OEM trigger wording', c.sourceEvents ? list(c.sourceEvents) : '')}
     ${detail('Note', c.note ? esc(c.note) : '')}
     ${detail('Prerequisites', c.prerequisites && c.prerequisites.length ? list(c.prerequisites.map((p) => p.text)) : '')}
@@ -191,8 +259,11 @@ function renderSections(result, opts = {}) {
   const scanSource = scan.source || {};
   const flags = (result.flags || []).filter((f) => !SHOWN_ELSEWHERE.has(f.code));
 
-  const oemItems = cals.length
-    ? cals.map(renderCalibration).join('')
+  const partialNote = basis.kind === 'partial'
+    ? `<li class="adas-item adas-none-rich"><span class="adas-flag">&#9888;</span><span>Other calibrations for this vehicle are vehicle-specific: determine them from the OEM service information for this VIN.</span></li>`
+    : '';
+  const oemItems = cals.length || partialNote
+    ? cals.map(renderCalibration).join('') + partialNote
     : `<li class="adas-item adas-none-rich"><span class="adas-flag">${basis.kind === 'none' ? '&#9888;' : '&#10003;'}</span><span>${
         basis.kind === 'none'
           ? 'OEM calibrations for this vehicle come from the VIN-specific OEM service information (not encoded in CollisionIQ).'
@@ -215,6 +286,13 @@ function renderSections(result, opts = {}) {
     parts.push(`<section class="doc-section adas-section"><h2 class="doc-section-title">OEM Operation Checks</h2><ul class="adas-list">${ops.map(renderOperationCheck).join('')}</ul></section>`);
   }
 
+  const docs = result.oemDocuments || [];
+  if (docs.length) {
+    parts.push(`<section class="doc-section"><h2 class="doc-section-title">OEM Documents for This Repair</h2>
+      <p class="adas-basis">From the CollisionIQ OEM source register. Consult each one for this vehicle; they are OEM property and are linked, not reproduced.</p>
+      <ul class="rationale-list">${docs.map((d) => `<li><strong>${esc(d.title)}</strong>${d.issued ? ` (${esc(d.issued)})` : ''} — ${esc(d.whyItMatters || d.category)}.${d.notes ? ` ${esc(d.notes)}.` : ''}${link(d.url)}</li>`).join('')}</ul></section>`);
+  }
+
   if (vers.length) {
     parts.push(`<section class="doc-section field-rules-section"><h2 class="doc-section-title">CollisionIQ Field Rules — Not OEM Requirements</h2>
       <p class="adas-basis">${esc(vers[0].basis)} Body work in an ADAS area calls for a calibration or, at a minimum, an extensive in-shop and on-road test and verification, because impact energy does not stop at the damaged panels.</p>
@@ -231,6 +309,7 @@ function renderSections(result, opts = {}) {
   if (flags.length || reviews.length) {
     const flagItems = flags.map((f) => `<li class="review-${esc(f.level)}"><strong>${esc(f.level === 'critical' ? 'CRITICAL' : f.level === 'warning' ? 'Review' : 'Note')}:</strong> ${esc(f.text)}</li>`);
     const reviewLis = reviews.map((r) => `<li class="review-warning"><strong>${esc(r.event)}:</strong> ${[
+      r.detected && `${r.detected}.`,
       r.subsystem && `Affects ${r.subsystem}.`,
       r.checks && `${r.checks}.`,
       r.sourceToConsult && `Consult: ${r.sourceToConsult}.`,
@@ -268,4 +347,4 @@ function parseStored(json) {
   }
 }
 
-module.exports = { LIABILITY, buildJobAdas, renderSections, parseStored };
+module.exports = { LIABILITY, buildJobAdas, renderSections, parseStored, isHighVoltage, relevantDocuments };

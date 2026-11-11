@@ -5,7 +5,7 @@
  * Each checkbox on the job form maps to the repair event IDs that
  * oemCalibrationRules.evaluate() understands. Most IDs are common to every make
  * (utils/fieldRules.js EVENTS / ALIASES). Where Honda/Acura (job aid) or a
- * covered Ford (I-CAR matrix) uses its own ID for the same work, `honda` / `ford`
+ * Ford / Lincoln (Ford job aid) uses its own ID for the same work, `honda` / `ford`
  * override the default list.
  *
  * Form values: "KEY" for one-sided items, "KEY:L" / "KEY:R" for sided ones.
@@ -14,7 +14,6 @@
  * Jobs saved before Nov 2026 stored only the old checkbox labels; LEGACY maps
  * those labels to the closest current options so the job can be re-evaluated.
  */
-const ford = require('./oemFordRules');
 
 const GROUPS = [
   {
@@ -29,6 +28,7 @@ const GROUPS = [
       { key: 'FRONT_GRILLE', label: 'Grille R&I / replaced', events: ['FRONT_GRILLE_RI'] },
       { key: 'FRONT_RADAR', label: 'Front radar R&I / replaced', events: ['FRONT_RADAR_RI'], honda: ['RADAR_RI'] },
       { key: 'FRONT_RADAR_BRACKET', label: 'Front radar bracket R&I / replaced', events: ['FRONT_RADAR_BRACKET_RI'] },
+      { key: 'FRONT_BEAM', label: 'Front bumper reinforcement (beam) R&I / replaced', events: ['FRONT_BUMPER_BEAM_RI'] },
       { key: 'FRONT_PARKING_CAMERA', label: 'Front (grille / bumper) camera R&I / replaced', events: [], honda: ['MVCS_FRONT_CAMERA_RI'], ford: ['FRONT_PARKING_CAMERA_RI'] },
       { key: 'FRONT_PARKING_SENSOR', label: 'Front parking sensor R&I / replaced', events: ['FRONT_PARKING_SENSOR_RI'] },
       { key: 'FRONT_CORNER_SENSOR', label: 'Front corner sensor R&I / replaced', events: ['FRONT_CORNER_SENSOR_RI'] },
@@ -56,6 +56,7 @@ const GROUPS = [
       { key: 'SIDE_CAMERA', label: 'Side (mirror) camera R&I / replaced', sided: true, events: ['SIDE_CAMERA_{S}_RI'], honda: ['MVCS_SIDE_CAMERA_{S}_RI'] },
       { key: 'FENDER', label: 'Fender repaired / replaced / pulled', sided: true, events: ['FENDER_{S}_REPAIR'] },
       { key: 'SIDE_PANEL', label: 'Quarter panel / rocker repaired or replaced', sided: true, events: ['SIDE_PANEL_{S}_REPAIR'] },
+      { key: 'TAIL_LAMP', label: 'Tail lamp R&I / replaced', sided: true, events: ['TAIL_LAMP_{S}_RI'] },
       { key: 'BLIND_SPOT_SENSOR', label: 'Rear blind spot sensor R&I / replaced', events: ['BLIND_SPOT_SENSOR_RI'], honda: ['BSI_RI'] },
     ],
   },
@@ -66,11 +67,12 @@ const GROUPS = [
       { key: 'REAR_DAMAGE', label: 'Rear collision damage (any)', events: ['REAR_COLLISION_DAMAGE'], collision: true },
       { key: 'REAR_BUMPER_RI', label: 'Rear bumper cover R&I / replaced', events: ['REAR_BUMPER_RI'] },
       { key: 'REAR_BUMPER_REPAIR', label: 'Rear bumper repaired / refinished on car', events: ['REAR_BUMPER_REPAIR'] },
+      { key: 'REAR_BEAM', label: 'Rear bumper reinforcement (beam) R&I / replaced', events: ['REAR_BUMPER_BEAM_RI'] },
       { key: 'LIFTGATE_RI', label: 'Liftgate / tailgate R&I / replaced', events: ['REAR_GATE_RI'], honda: ['TAILGATE_RI'] },
       { key: 'LIFTGATE_ADJUST', label: 'Liftgate / tailgate adjusted', events: ['REAR_GATE_ADJUST'], honda: ['TAILGATE_ADJUST'] },
       { key: 'TRUNK_RI', label: 'Trunk lid R&I / replaced', events: ['REAR_GATE_RI'], honda: ['TRUNK_RI'] },
       { key: 'TRUNK_ADJUST', label: 'Trunk lid adjusted', events: ['REAR_GATE_ADJUST'], honda: ['TRUNK_ADJUST'] },
-      { key: 'REAR_HANDLE_LATCH', label: 'Liftgate / tailgate / trunk handle or latch R&I', events: ['REAR_GATE_HANDLE_LATCH_RI'], ford: ['LIFTGATE_HANDLE_LATCH_RI', 'TAILGATE_HANDLE_RI'] },
+      { key: 'REAR_HANDLE_LATCH', label: 'Liftgate / tailgate / trunk handle or latch R&I', events: ['REAR_GATE_HANDLE_LATCH_RI'] },
       { key: 'REAR_CAMERA', label: 'Rear camera R&I / replaced', events: ['REAR_CAMERA_RI'], honda: ['REARVIEW_CAMERA_RI'] },
       { key: 'REAR_PARKING_SENSOR', label: 'Rear parking sensor R&I / replaced', events: ['REAR_PARKING_SENSOR_RI'] },
       { key: 'CHMSL', label: 'Third brake light (CHMSL) R&I / replaced', events: [], ford: ['CHMSL_RI'] },
@@ -83,9 +85,11 @@ const GROUPS = [
       { key: 'STRUCTURAL_FRONT', label: 'Structural repair — front', events: [], honda: ['STRUCTURAL_REPAIR'], collision: true, review: 'Structural / frame straightening' },
       { key: 'STRUCTURAL_REAR', label: 'Structural repair — rear', events: [], honda: ['STRUCTURAL_REPAIR_REAR'], collision: true, review: 'Structural / frame straightening' },
       { key: 'SRS', label: 'Airbag / SRS deployment', events: [], honda: ['SRS_DEPLOYMENT'], ford: ['FRONT_AIRBAG_DEPLOYMENT'], collision: true, review: 'Airbag/SRS deployment' },
-      { key: 'ALIGNMENT', label: 'Wheel alignment', events: [], honda: ['WHEEL_ALIGNMENT'], ford: ['WHEEL_ALIGNMENT'] },
-      { key: 'SUSPENSION', label: 'Suspension repair', events: [], ford: ['SUSPENSION_REPAIR'] },
-      { key: 'TIRE_SIZE', label: 'Tire size changed', events: [], ford: ['TIRE_SIZE_CHANGE'] },
+      { key: 'HUD', label: 'Head-up display R&I / replaced', events: [], ford: ['HUD_RI'] },
+      { key: 'INSTRUMENT_PANEL', label: 'Instrument panel R&I / replaced', events: [], ford: ['INSTRUMENT_PANEL_RI'] },
+      { key: 'ALIGNMENT', label: 'Wheel alignment', events: [], honda: ['WHEEL_ALIGNMENT'], ford: ['WHEEL_ALIGNMENT'], gm: ['WHEEL_ALIGNMENT'] },
+      { key: 'SUSPENSION', label: 'Suspension repair', events: [], ford: ['SUSPENSION_REPAIR'], gm: ['SUSPENSION_REPAIR'] },
+      { key: 'TIRE_SIZE', label: 'Tire size changed', events: [], ford: ['TIRE_SIZE_CHANGE'], gm: ['TIRE_SIZE_CHANGE'] },
       { key: 'BATTERY', label: '12V battery disconnected', events: ['BATTERY_DISCONNECT'] },
       { key: 'EV_HYBRID', label: 'EV / hybrid vehicle', events: [], review: 'HV EV post-crash' },
       { key: 'OTHER', label: 'Other', events: [] },
@@ -144,11 +148,12 @@ function normalizeValues(values) {
   return out.sort((a, b) => order.indexOf(a) - order.indexOf(b));
 }
 
-/** Rule family for the vehicle: 'honda', 'ford' (covered models only) or 'default'. */
+/** Rule family for the vehicle: 'honda', 'ford', 'gm' or 'default'. */
 function family(make, model, year) {
   const m = String(make || '').toLowerCase().replace(/[^a-z]/g, '');
   if (m === 'honda' || m === 'acura') return 'honda';
-  if ((m === 'ford' || m === 'lincoln') && ford.findVehicle(model, year)) return 'ford';
+  if (m === 'ford' || m === 'lincoln') return 'ford';
+  if (['chevrolet', 'chevy', 'gmc', 'buick', 'cadillac'].includes(m)) return 'gm';
   return 'default';
 }
 

@@ -1,13 +1,16 @@
 'use strict';
 const register = require('./oemSourceRegister');
-const ford = require('./oemFordRules');
+const fordPosition = require('./oemFordPosition'); // Ford / Lincoln: Ford's own job aid and position statements
+const gmPosition = require('./oemGmPosition'); // Chevrolet / Buick / GMC / Cadillac: GM position statements
 const fieldRules = require('./fieldRules');
 /**
  * CollisionIQ — OEM Calibration Trigger Rules: Honda & Acura
- * (All other makes: scan policy + sources from oemSourceRegister.js)
+ * Ford / Lincoln: utils/oemFordPosition.js (Ford's job aid and statements).
+ * GM: utils/oemGmPosition.js (GM position statements; windshield camera only).
+ * All other makes: scan policy + sources from oemSourceRegister.js.
  * -----------------------------------------------------------------------------
  * Facts abstracted (paraphrased, not reproduced) from American Honda job aids
- * "Aiming Driving Support Systems", accessed via I-CAR RTS:
+ * "Aiming Driving Support Systems" (American Honda Motor Co., Inc.):
  *   Honda v12 (Aug 2025, supersedes v11 Nov 2022)
  *   Acura v7  (Aug 2025, supersedes v6  Mar 2021)
  * Model-specific OEM service information always governs. This module tells a
@@ -37,7 +40,7 @@ const SOURCES = {
     version: '12',
     published: '2025-08',
     supersedes: 'v11 (2022-11)',
-    via: 'I-CAR RTS',
+    publisher: 'American Honda Motor Co., Inc.',
   },
   Acura: {
     id: 'ACURA-JA-ADSS-v7',
@@ -46,7 +49,7 @@ const SOURCES = {
     version: '7',
     published: '2025-08',
     supersedes: 'v6 (2021-03)',
-    via: 'I-CAR RTS',
+    publisher: 'American Honda Motor Co., Inc.',
   },
 };
 
@@ -420,7 +423,8 @@ const isFord = (make) => ['ford', 'lincoln'].includes(norm(make));
 function makeKnows(input, e) {
   const make = normalizeMake(input.make);
   if (make) return Boolean(EVENTS[e]);
-  if (isFord(input.make) && ford.findVehicle(input.model, input.year)) return Boolean(ford.EVENTS[e]);
+  if (isFord(input.make)) return Boolean(fordPosition.EVENTS[e]);
+  if (gmPosition.isGm(input.make)) return Boolean(gmPosition.EVENTS[e]);
   return false;
 }
 
@@ -443,10 +447,8 @@ function evaluateMake(input) {
   const make = normalizeMake(input.make);
   const scan = register.scanPolicy(input.make);
 
-  if (!make && isFord(input.make)) {
-    const fordResult = ford.evaluateFord(input, scan);
-    if (fordResult) return fordResult;
-  }
+  if (!make && isFord(input.make)) return fordPosition.evaluateFordPosition(input, scan);
+  if (!make && gmPosition.isGm(input.make)) return gmPosition.evaluateGmPosition(input, scan);
 
   if (!make) {
     // No encoded calibration rules: return scan policy, OEM sources and the
@@ -465,13 +467,6 @@ function evaluateMake(input) {
           code: 'CAL_RULES_NOT_ENCODED',
           text: `Calibration trigger rules for ${input.make} are not encoded yet. Determine required calibrations from the VIN-specific OEM repair manual.`,
         },
-        ...(isFord(input.make)
-          ? [{
-              level: 'info',
-              code: 'FORD_MODEL_NOT_COVERED',
-              text: `Ford trigger rules cover only: ${ford.coverageText()}. This vehicle is not one of them.`,
-            }]
-          : []),
         ...(scan.flags || []),
       ],
       disclaimer:
@@ -642,5 +637,5 @@ module.exports = {
   COMMON_EVENTS,
   evaluate,
   listEvents: () => Object.entries(EVENTS).map(([id, label]) => ({ id, label })),
-  listFordEvents: ford.listEvents,
+  listFordEvents: () => Object.entries(fordPosition.EVENTS).map(([id, label]) => ({ id, label })),
 };

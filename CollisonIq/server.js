@@ -20,6 +20,7 @@ const { calculatePhotoStatus, updateJobPhotoStatus } = require('./utils/photoSta
 const oemRules   = require('./utils/oemCalibrationRules'); // loads ./utils/oemSourceRegister
 const jobRepairs = require('./utils/jobRepairs');
 const jobReport  = require('./utils/jobReport');
+const calRecord  = require('./utils/calibrationRecord');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -143,6 +144,96 @@ const JOBS_COLUMNS = [
   const missing = JOBS_COLUMNS.filter(([col]) => !present.has(col));
   for (const [col, def] of missing) db.exec(`ALTER TABLE jobs ADD COLUMN ${col} ${def}`);
   if (missing.length) console.log(`[migration] jobs: added missing column(s) ${missing.map(([c]) => c).join(', ')}`);
+}
+
+// Calibration record (Nov 2026): what was actually done against each required
+// item, with proof files. Records are never deleted; a mistake is voided with a reason.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS job_calibrations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    item_key TEXT NOT NULL,
+    item_name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    result TEXT NOT NULL,
+    method TEXT, si_reference TEXT, tool TEXT,
+    performed_by_name TEXT, performed_on TEXT,
+    reason TEXT, notes TEXT,
+    created_by INTEGER, created_at TEXT,
+    voided_at TEXT, voided_by INTEGER, void_reason TEXT,
+    FOREIGN KEY (job_id) REFERENCES jobs(jobId)
+  );
+  CREATE INDEX IF NOT EXISTS idx_job_calibrations_job ON job_calibrations(job_id);
+  CREATE TABLE IF NOT EXISTS job_calibration_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    calibration_id INTEGER NOT NULL,
+    job_id TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    original_name TEXT, mime_type TEXT, size_bytes INTEGER,
+    uploaded_by INTEGER, uploaded_at TEXT,
+    FOREIGN KEY (calibration_id) REFERENCES job_calibrations(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_job_calibration_files_job ON job_calibration_files(job_id);
+  -- Technician sign-off, QC approval and QC override (exception record). Never deleted.
+  CREATE TABLE IF NOT EXISTS job_signoffs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    user_id INTEGER, user_name TEXT, role TEXT,
+    statement TEXT, justification TEXT, open_items TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (job_id) REFERENCES jobs(jobId)
+  );
+  CREATE INDEX IF NOT EXISTS idx_job_signoffs_job ON job_signoffs(job_id);
+  -- Technicians assigned to a job (several allowed). A technician sees and works
+  -- only on jobs assigned to them. Unassigning keeps the row (removed_at).
+  CREATE TABLE IF NOT EXISTS job_assignments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    assigned_by INTEGER, assigned_at TEXT NOT NULL,
+    removed_by INTEGER, removed_at TEXT,
+    FOREIGN KEY (job_id) REFERENCES jobs(jobId),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_job_assignments_job ON job_assignments(job_id);
+  CREATE INDEX IF NOT EXISTS idx_job_assignments_user ON job_assignments(user_id);
+  -- Platform access: how platform admin opens a shop's jobs, read-only, for a
+  -- reason the terms of service allow. Private to the platform (shops don't see
+  -- it); every view is logged as the platform's own record of staying in terms.
+  CREATE TABLE IF NOT EXISTS platform_access (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shop_id INTEGER NOT NULL,
+    opened_by INTEGER NOT NULL, reason_type TEXT NOT NULL, note TEXT NOT NULL,
+    opened_at TEXT NOT NULL, expires_at TEXT NOT NULL, closed_at TEXT,
+    FOREIGN KEY (shop_id) REFERENCES shops(id)
+  );
+  CREATE TABLE IF NOT EXISTS platform_access_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    access_id INTEGER NOT NULL, shop_id INTEGER NOT NULL, user_id INTEGER,
+    method TEXT, path TEXT, at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_platform_access_log_shop ON platform_access_log(shop_id, id);
+`);
+// One-time link for jobs saved before assignments existed: a job whose typed
+// technician name matches exactly one active technician in its shop (full name
+// or username) is assigned to that technician. Jobs that never had an
+// assignment row are the only ones touched.
+{
+  const unlinked = db.prepare(`SELECT jobId, shop_id, technicianName, assigned_tech FROM jobs
+    WHERE shop_id IS NOT NULL AND jobId NOT IN (SELECT job_id FROM job_assignments)`).all();
+  const findTech = db.prepare(`SELECT id FROM users WHERE shop_id=? AND role='technician' AND active=1
+    AND (lower(full_name)=lower(?) OR lower(username)=lower(?))`);
+  const add = db.prepare('INSERT INTO job_assignments (job_id,user_id,assigned_at) VALUES (?,?,?)');
+  const now = new Date().toISOString();
+  let linked = 0;
+  for (const j of unlinked) {
+    const name = String(j.assigned_tech || j.technicianName || '').trim();
+    if (!name) continue;
+    const hits = findTech.all(j.shop_id, name, name);
+    if (hits.length === 1) { add.run(j.jobId, hits[0].id, now); linked++; }
+  }
+  if (linked) console.log(`Linked ${linked} existing job(s) to technician accounts by name.`);
 }
 
 // job_photos may already exist from an earlier development pass with a different
@@ -358,7 +449,7 @@ function layout(title, content, activeNav='', user=null) {
   const logout = ctxReq ? `<form method="POST" action="/logout" class="nav-logout-form">${csrfField(ctxReq)}<button type="submit" class="nav-logout">Logout</button></form>` : '';
   let navLinks = '';
   if (role === 'platform_admin') {
-    navLinks = `${nav('/','list','Jobs')}${nav('/new','new','New Job')}${nav('/reference','reference','ADAS Reference')}${nav('/admin','admin','Admin')}${nav('/platform/shops','shops','Shops')}${nav('/platform/billing','billing','Billing')}${logout}`;
+    navLinks = `${nav('/','list','Jobs')}${nav('/reference','reference','ADAS Reference')}${nav('/platform/shops','shops','Shops')}${nav('/platform/access','access','Access Log')}${nav('/platform/billing','billing','Billing')}${logout}`;
   } else if (role === 'shop_admin') {
     navLinks = `${nav('/','list','Jobs')}${nav('/new','new','New Job')}${nav('/reference','reference','ADAS Reference')}${nav('/admin','admin','Admin')}${nav('/admin/users','users','Users')}${logout}`;
   } else if (role === 'technician') {
@@ -584,6 +675,28 @@ const upload = multer({
   },
 });
 
+// Calibration proof: scan reports (PDF) and photos, up to 5 files per record.
+const proofUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, uploadsDir),
+    filename: (req, file, cb) => cb(null, `${crypto.randomUUID()}${calRecord.PROOF_EXT[file.mimetype]}`),
+  }),
+  limits: { fileSize: 10 * 1024 * 1024, files: calRecord.MAX_PROOF_FILES, fields: 20 },
+  fileFilter: (req, file, cb) => {
+    if (!calRecord.PROOF_EXT[file.mimetype]) return cb(new Error('Proof files must be PDF, JPEG, PNG, WEBP or HEIC/HEIF.'));
+    cb(null, true);
+  },
+});
+function proofSignatureMatches(filePath, mimetype) {
+  if (mimetype !== 'application/pdf') return imageSignatureMatches(filePath, mimetype);
+  const buf = Buffer.alloc(5);
+  let fd;
+  try { fd = fs.openSync(filePath, 'r'); fs.readSync(fd, buf, 0, 5, 0); }
+  catch { return false; }
+  finally { if (fd !== undefined) fs.closeSync(fd); }
+  return buf.toString('latin1') === '%PDF-';
+}
+
 // The MIME type above is whatever the browser claimed. Confirm the bytes on disk
 // really are that image format before accepting the upload.
 function imageSignatureMatches(filePath, mimetype) {
@@ -616,13 +729,41 @@ function requireRole(...roles) {
   };
 }
 // Who may create and edit jobs (matches the Edit button shown on the job page).
-const JOB_EDITORS = ['platform_admin', 'shop_admin', 'service_writer'];
+// Shop roles only: jobs and their records are the shop's data. Platform admin
+// can view every shop's jobs but never create, edit or document them.
+const JOB_EDITORS = ['shop_admin', 'service_writer'];
+const ASSIGNERS = ['shop_admin', 'qc_manager', 'service_writer'];
 const requireJobEditor = requireRole(...JOB_EDITORS);
 // Photo uploads: service writers are read-only, and a Closed job is locked for
 // everyone except platform_admin.
 function canUploadPhotos(user, job) {
-  if (user.role === 'service_writer') return false;
-  return job.status !== 'Closed' || user.role === 'platform_admin';
+  if (!['technician', 'qc_manager', 'shop_admin'].includes(user.role)) return false;
+  return job.status !== 'Closed';
+}
+function isAssigned(jobId, userId) {
+  return Boolean(db.prepare('SELECT 1 FROM job_assignments WHERE job_id=? AND user_id=? AND removed_at IS NULL').get(jobId, userId));
+}
+// ─── Platform access (platform admin) ───────────────────────────────────────
+// Platform admin sees a shop's jobs only after opening access to that shop for
+// a reason the terms of service allow. Read-only; 4-hour window; every view is
+// logged. The log is the platform's own record and is not shown to shops.
+const ACCESS_REASONS = { legal: 'Legal matter involving the shop and the platform', support: 'Technical support', update: 'Platform update or maintenance' };
+const ACCESS_HOURS = 4;
+function activeAccess(shopId) {
+  if (shopId === null || shopId === undefined) return null;
+  return db.prepare('SELECT * FROM platform_access WHERE shop_id=? AND closed_at IS NULL AND expires_at > ? ORDER BY id DESC LIMIT 1')
+    .get(shopId, new Date().toISOString()) || null;
+}
+function openShopIds() {
+  return db.prepare('SELECT DISTINCT shop_id FROM platform_access WHERE closed_at IS NULL AND expires_at > ?').all(new Date().toISOString()).map((r) => r.shop_id);
+}
+function logPlatformAccess(req, access) {
+  db.prepare('INSERT INTO platform_access_log (access_id,shop_id,user_id,method,path,at) VALUES (?,?,?,?,?,?)')
+    .run(access.id, access.shop_id, req.session.user.id, req.method, String(req.originalUrl || '').slice(0, 300), new Date().toISOString());
+}
+function assignedTechs(jobId) {
+  return db.prepare(`SELECT u.id, u.full_name, u.username FROM job_assignments a JOIN users u ON u.id=a.user_id
+    WHERE a.job_id=? AND a.removed_at IS NULL ORDER BY u.full_name`).all(jobId);
 }
 function requireAdmin(req, res, next) {
   if (!req.session.user) return res.redirect('/login');
@@ -647,9 +788,16 @@ function requireSubscription(req, res, next) {
 function ownedJob(req) {
   const u = req.session.user;
   if (u.role === 'platform_admin') {
-    return db.prepare('SELECT * FROM jobs WHERE jobId=?').get(req.params.jobId);
+    const j = db.prepare('SELECT * FROM jobs WHERE jobId=?').get(req.params.jobId);
+    const access = j ? activeAccess(j.shop_id) : null;
+    if (!access) return undefined;
+    logPlatformAccess(req, access);
+    return j;
   }
-  return db.prepare('SELECT * FROM jobs WHERE jobId=? AND shop_id=?').get(req.params.jobId, u.shop_id);
+  const job = db.prepare('SELECT * FROM jobs WHERE jobId=? AND shop_id=?').get(req.params.jobId, u.shop_id);
+  // Technicians reach only the jobs assigned to them.
+  if (job && u.role === 'technician' && !isAssigned(job.jobId, u.id)) return undefined;
+  return job;
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────
@@ -879,6 +1027,12 @@ app.get('/', requireAuth, requireSubscription, (req, res) => {
       ? db.prepare('SELECT * FROM jobs WHERE shop_id=? ORDER BY last_changed DESC').all(shopId)
       : db.prepare('SELECT * FROM jobs ORDER BY last_changed DESC').all();
   }
+  if (user.role === 'technician') jobs = jobs.filter((j) => isAssigned(j.jobId, user.id));
+  if (user.role === 'platform_admin') {
+    const open = new Set(openShopIds());
+    jobs = jobs.filter((j) => open.has(j.shop_id));
+    for (const sid of open) logPlatformAccess(req, activeAccess(sid));
+  }
 
   const rows = jobs.map(j => `<tr>
     <td><a href="/jobs/${encodeURIComponent(j.jobId)}" style="font-family:monospace;font-weight:600;color:#1B3A6B;text-decoration:none">${escapeHtml(j.jobId)}</a></td>
@@ -892,6 +1046,8 @@ app.get('/', requireAuth, requireSubscription, (req, res) => {
 
   const content = `
     ${flash?`<div style="background:${flash.type==='success'?'#D6F0D6':'#FFD6D6'};color:${flash.type==='success'?'#1A6B1A':'#8B0000'};padding:.65rem 1rem;border-radius:6px;margin-bottom:1rem">${escapeHtml(flash.msg)}</div>`:''}
+    ${user.role === 'platform_admin' ? '<p class="adas-basis" style="margin-bottom:1rem">Shop jobs are the shops\' records. This list shows only shops you have opened under Shops for a reason the terms allow (legal, technical support, update). Access is read-only and every view is in your Access Log.</p>' : ''}
+    ${user.role === 'technician' ? '<p class="adas-basis" style="margin-bottom:1rem">Jobs assigned to you.</p>' : ''}
     <div class="page-header"><h1>Jobs <span class="count-badge">${jobs.length}</span></h1>${JOB_EDITORS.includes(user.role) ? '<a href="/new" class="btn btn-primary">+ New Job</a>' : ''}</div>
     <div class="search-bar"><form method="GET" action="/"><input type="text" name="search" placeholder="Search by RO#, VIN, or Technician…" value="${escapeHtml(search)}"><button type="submit" class="btn">Search</button>${search?'<a href="/" class="btn btn-ghost">Clear</a>':''}</form></div>
     <div class="table-wrap"><table class="data-table"><thead><tr><th>Job ID</th><th>RO #</th><th>Vehicle</th><th>Status</th><th>Photos</th><th>Date</th><th></th></tr></thead><tbody>${rows||'<tr><td colspan="7" class="empty">No jobs found.</td></tr>'}</tbody></table></div>`;
@@ -992,10 +1148,9 @@ app.post('/jobs', requireJobEditor, requireSubscription, (req, res) => {
 // ─── Job View ─────────────────────────────────────────────────────────────────
 app.get('/jobs/:jobId', requireAuth, requireSubscription, (req, res) => {
   const user = req.session.user;
-  const shopId = user.role === 'platform_admin' ? null : user.shop_id;
-  const job = shopId
-    ? db.prepare('SELECT * FROM jobs WHERE jobId=? AND shop_id=?').get(req.params.jobId, shopId)
-    : db.prepare('SELECT * FROM jobs WHERE jobId=?').get(req.params.jobId);
+  // Same rule as every other job route: own shop; technicians only when
+  // assigned; platform admin only under a shop's support grant (logged).
+  const job = ownedJob(req);
 
   if (!job) return res.status(404).send(layout('Not Found', '<div class="error-page"><h1>Job Not Found</h1><a href="/" class="btn btn-primary">Back to Jobs</a></div>', '', user));
 
@@ -1003,12 +1158,35 @@ app.get('/jobs/:jobId', requireAuth, requireSubscription, (req, res) => {
   const rationaleList = job.rationale ? job.rationale.split('\n').filter(Boolean) : [];
   const activeToken = db.prepare('SELECT token FROM share_tokens WHERE job_id=? AND revoked=0 ORDER BY id DESC LIMIT 1').get(job.jobId);
   const adasEval = jobReport.parseStored(job.adas_eval);
+  const rec = loadCalibrationRecord(job, adasEval);
+  const canRecord = canUploadPhotos(user, job);
+  const flash = consumeFlash(req);
+  const jobPath = `/jobs/${encodeURIComponent(job.jobId)}`;
+  const assigned = assignedTechs(job.jobId);
+  const canAssign = ASSIGNERS.includes(user.role) && job.status !== 'Closed';
+  const shopTechs = canAssign ? db.prepare("SELECT id, full_name, username FROM users WHERE shop_id=? AND role='technician' AND active=1 ORDER BY full_name").all(job.shop_id) : [];
+  const assignedIds = new Set(assigned.map((t) => t.id));
+  const assignHtml = `<section class="doc-section"><h2 class="doc-section-title">Assigned Technicians</h2>
+    <p class="adas-basis">${assigned.length ? assigned.map((t) => escapeHtml(t.full_name || t.username)).join(', ') : 'No technician assigned. Technicians only see jobs assigned to them.'}</p>
+    ${canAssign ? (shopTechs.length ? `<form method="POST" action="${jobPath}/assign" class="no-print assign-form">${csrfField(req)}<div class="checkbox-grid">${shopTechs.map((t) => `<label class="checkbox-label"><input type="checkbox" name="tech_ids" value="${t.id}"${assignedIds.has(t.id) ? ' checked' : ''}><span>${escapeHtml(t.full_name || t.username)}</span></label>`).join('')}</div><button class="btn btn-sm" style="margin-top:.5rem">Save assignment</button></form>` : '<p class="adas-basis no-print">This shop has no active technician accounts. Add them under Users.</p>') : ''}
+  </section>`;
+  const signoffHtml = calRecord.renderSignoffs(rec.sign, rec.st.summary,
+    job.status === 'Closed' ? {} : { forms: { csrf: csrfField(req), base: jobPath, user } });
+  const recordHtml = calRecord.renderSection(rec.st, rec.files, {
+    fileUrl: (f) => `${jobPath}/calibrations/files/${f.id}`,
+    voidForm: canRecord ? (r) => `<form method="POST" action="${jobPath}/calibrations/${r.id}/void" class="calrec-void no-print">${csrfField(req)}<input type="text" name="void_reason" maxlength="300" placeholder="Reason to void this record" required><button class="btn btn-sm">Void</button></form>` : null,
+    formHtml: canRecord ? calRecord.renderForm({
+      action: `${jobPath}/calibrations`, csrf: csrfField(req), items: rec.st.rows,
+      defaults: { date: new Date().toISOString().slice(0, 10), name: user.full_name || user.username || '', open: false },
+    }) : '',
+  });
 
   const adasItems = adasList.length > 0
     ? adasList.map(s => `<li class="adas-item"><span class="adas-flag">&#9888;</span><span>${escapeHtml(s)}</span></li>`).join('')
     : `<li class="adas-item adas-none"><span class="adas-flag adas-ok">&#10003;</span><span>No ADAS calibration flagged for the reported repairs on this vehicle.</span></li>`;
 
   const content = `
+    ${flash?`<div class="no-print" style="background:${flash.type==='success'?'#D6F0D6':'#FFD6D6'};color:${flash.type==='success'?'#1A6B1A':'#8B0000'};padding:.65rem 1rem;border-radius:6px;margin-bottom:1rem">${escapeHtml(flash.msg)}</div>`:''}
     <div class="job-doc">
       <div class="job-doc-header">
         <div><div class="doc-brand">CollisionIQ</div><div class="doc-owner">ADAS Calibration Documentation</div></div>
@@ -1017,11 +1195,12 @@ app.get('/jobs/:jobId', requireAuth, requireSubscription, (req, res) => {
           <div><span class="meta-label">Date</span> ${formatDate(job.createdAt)}</div>
           <div><span class="meta-label">Status</span> <span class="badge badge-${statusClass(job.status)}">${escapeHtml(job.status)}</span></div>
           <div><span class="meta-label">Photos</span> ${photoStatusBadge(job.photo_status || 'red')}</div>
+          <div><span class="meta-label">Record</span> ${calRecord.summaryBadge(rec.st.summary)}</div>
         </div>
         <div class="doc-actions no-print">
           <button type="button" data-action="print" class="btn btn-white">&#128438; Print / Save PDF</button>
           <a href="/jobs/${encodeURIComponent(job.jobId)}/photos" class="btn btn-white">&#128247; Photos</a>
-          ${['platform_admin','shop_admin','service_writer'].includes(user.role) ? `<a href="/jobs/${encodeURIComponent(job.jobId)}/edit" class="btn btn-white">&#9998; Edit</a>` : ''}
+          ${JOB_EDITORS.includes(user.role) ? `<a href="/jobs/${encodeURIComponent(job.jobId)}/edit" class="btn btn-white">&#9998; Edit</a>` : ''}
           <a href="/" class="btn btn-ghost-white">Back</a>
         </div>
       </div>
@@ -1046,6 +1225,9 @@ app.get('/jobs/:jobId', requireAuth, requireSubscription, (req, res) => {
       </section>
       ${adasEval ? jobReport.renderSections(adasEval) : `<section class="doc-section adas-section"><h2 class="doc-section-title">ADAS Systems — Calibration Required</h2><p class="adas-basis no-print">Saved with the original engine. Open Edit and save to re-run this job through the current OEM and field rules.</p><ul class="adas-list">${adasItems}</ul></section>
       <section class="doc-section"><h2 class="doc-section-title">Rationale</h2><ul class="rationale-list">${rationaleList.map(r=>`<li>${escapeHtml(r)}</li>`).join('')||'<li>No rationale generated.</li>'}</ul></section>`}
+      ${assignHtml}
+      ${recordHtml}
+      ${signoffHtml}
       <section class="doc-section warning-section"><h2 class="doc-section-title">Liability Warning</h2><div class="warning-box"><span class="warning-icon">&#9888;</span><p>${escapeHtml(job.liabilityWarning)||'—'}</p></div></section>
       ${adasEval ? '' : `<section class="doc-section"><h2 class="doc-section-title">Make-Specific Notes</h2><div class="notes-box"><p>${escapeHtml(job.makeSpecificNotes)||'—'}</p></div></section>`}
       <section class="doc-section no-print"><h2 class="doc-section-title">Insurer Link</h2>
@@ -1208,10 +1390,186 @@ app.get('/jobs/:jobId/photos/:photoId/file', requireAuth, requireSubscription, (
   });
 });
 
+// ─── Technician assignment ──────────────────────────────────────────────────
+app.post('/jobs/:jobId/assign', requireAuth, requireSubscription, (req, res) => {
+  const user = req.session.user;
+  if (!ASSIGNERS.includes(user.role)) return res.status(403).send('Access denied.');
+  const job = ownedJob(req);
+  if (!job) return res.status(404).send('Not found');
+  if (job.status === 'Closed') return res.status(403).send('This job is closed.');
+  const jobPath = `/jobs/${encodeURIComponent(job.jobId)}`;
+  const wanted = new Set(strList(req.body.tech_ids, 50).map((x) => Number(x)).filter(Number.isInteger));
+  const techs = db.prepare("SELECT id, full_name, username FROM users WHERE shop_id=? AND role='technician' AND active=1").all(job.shop_id);
+  const valid = new Set(techs.map((t) => t.id));
+  for (const id of wanted) if (!valid.has(id)) { setFlash(req, 'error', 'Only active technicians in this shop can be assigned.'); return res.redirect(jobPath); }
+  const current = new Set(assignedTechs(job.jobId).map((t) => t.id));
+  const now = new Date().toISOString();
+  for (const id of wanted) if (!current.has(id)) {
+    db.prepare('INSERT INTO job_assignments (job_id,user_id,assigned_by,assigned_at) VALUES (?,?,?,?)').run(job.jobId, id, user.id, now);
+  }
+  for (const id of current) if (!wanted.has(id)) {
+    db.prepare('UPDATE job_assignments SET removed_by=?, removed_at=? WHERE job_id=? AND user_id=? AND removed_at IS NULL').run(user.id, now, job.jobId, id);
+  }
+  const names = assignedTechs(job.jobId).map((t) => t.full_name || t.username).join(', ');
+  db.prepare('UPDATE jobs SET technicianName=?, updatedAt=?, last_changed=? WHERE jobId=?').run(names || job.technicianName, now, now, job.jobId);
+  setFlash(req, 'success', names ? `Assigned: ${names}.` : 'No technicians assigned.');
+  res.redirect(jobPath);
+});
+
+// ─── Calibration Record ─────────────────────────────────────────────────────
+function loadCalibrationRecord(job, adasEval) {
+  const items = calRecord.requiredItems(adasEval);
+  const records = db.prepare('SELECT * FROM job_calibrations WHERE job_id=? ORDER BY id').all(job.jobId);
+  const files = db.prepare('SELECT f.* FROM job_calibration_files f JOIN job_calibrations c ON c.id=f.calibration_id WHERE f.job_id=? AND c.voided_at IS NULL ORDER BY f.id').all(job.jobId);
+  const st = calRecord.status(items, records);
+  const signoffs = db.prepare('SELECT * FROM job_signoffs WHERE job_id=? ORDER BY id').all(job.jobId);
+  return { items, records, files, st, signoffs, sign: calRecord.signoffState(records, signoffs, st.summary) };
+}
+
+// ─── Sign-off, QC approval, QC override ─────────────────────────────────────
+function signoffGuard(req, res, roles) {
+  const job = ownedJob(req);
+  if (!job) { res.status(404).send('Not found'); return null; }
+  if (!roles.includes(req.session.user.role)) { res.status(403).send('Access denied.'); return null; }
+  if (job.status === 'Closed') { res.status(403).send('This job is closed.'); return null; }
+  return job;
+}
+function addSignoff(job, user, kind, extra = {}) {
+  db.prepare('INSERT INTO job_signoffs (job_id,kind,user_id,user_name,role,statement,justification,open_items,created_at) VALUES (?,?,?,?,?,?,?,?,?)')
+    .run(job.jobId, kind, user.id, user.full_name || user.username, user.role, calRecord.STATEMENTS[kind], extra.justification || null, extra.open_items || null, new Date().toISOString());
+}
+function closeJob(job) {
+  const now = new Date().toISOString();
+  db.prepare("UPDATE jobs SET status='Closed', updatedAt=?, last_changed=? WHERE jobId=?").run(now, now, job.jobId);
+}
+app.post('/jobs/:jobId/signoff/tech', requireAuth, requireSubscription, (req, res) => {
+  const job = signoffGuard(req, res, calRecord.SIGN_ROLES); if (!job) return;
+  const jobPath = `/jobs/${encodeURIComponent(job.jobId)}`;
+  const { sign } = loadCalibrationRecord(job, jobReport.parseStored(job.adas_eval));
+  if (!sign.canTechSign) { setFlash(req, 'error', 'Document every record item before signing off.'); return res.redirect(jobPath); }
+  addSignoff(job, req.session.user, 'tech');
+  setFlash(req, 'success', 'Technician sign-off recorded.');
+  res.redirect(jobPath);
+});
+app.post('/jobs/:jobId/signoff/qc', requireAuth, requireSubscription, (req, res) => {
+  const job = signoffGuard(req, res, calRecord.QC_ROLES); if (!job) return;
+  const jobPath = `/jobs/${encodeURIComponent(job.jobId)}`;
+  const { sign } = loadCalibrationRecord(job, jobReport.parseStored(job.adas_eval));
+  if (!sign.canApprove) { setFlash(req, 'error', `QC approval needs: ${sign.approveBlockers.join('; ')}.`); return res.redirect(jobPath); }
+  addSignoff(job, req.session.user, 'qc');
+  setFlash(req, 'success', 'QC approval recorded. The job can now be closed.');
+  res.redirect(jobPath);
+});
+app.post('/jobs/:jobId/signoff/close', requireAuth, requireSubscription, (req, res) => {
+  const job = signoffGuard(req, res, calRecord.QC_ROLES); if (!job) return;
+  const jobPath = `/jobs/${encodeURIComponent(job.jobId)}`;
+  const { st, sign } = loadCalibrationRecord(job, jobReport.parseStored(job.adas_eval));
+  const blocker = calRecord.closeBlocker(sign, st.summary);
+  if (blocker) { setFlash(req, 'error', `Job not closed: ${blocker}.`); return res.redirect(jobPath); }
+  closeJob(job);
+  setFlash(req, 'success', 'Job closed.');
+  res.redirect(jobPath);
+});
+app.post('/jobs/:jobId/signoff/override', requireAuth, requireSubscription, (req, res) => {
+  const job = signoffGuard(req, res, calRecord.QC_ROLES); if (!job) return;
+  const jobPath = `/jobs/${encodeURIComponent(job.jobId)}`;
+  const { st, sign } = loadCalibrationRecord(job, jobReport.parseStored(job.adas_eval));
+  if (sign.canClose) { setFlash(req, 'error', 'The record is approved; close the job normally.'); return res.redirect(jobPath); }
+  const { errors, justification } = calRecord.validateOverride(req.body);
+  if (errors.length) { setFlash(req, 'error', `Override not saved: ${errors.join(' ')}`); return res.redirect(jobPath); }
+  const open = [...st.summary.openNames, ...(sign.techCurrent ? [] : ['Technician sign-off']), ...(sign.qcCurrent ? [] : ['QC approval'])];
+  addSignoff(job, req.session.user, 'override', { justification, open_items: JSON.stringify(open) });
+  closeJob(job);
+  setFlash(req, 'success', 'Job closed under QC override. The exception is on the job record.');
+  res.redirect(jobPath);
+});
+
+app.post('/jobs/:jobId/calibrations', requireAuth, requireSubscription, (req, res, next) => {
+  proofUpload.array('proof', calRecord.MAX_PROOF_FILES)(req, res, (err) => {
+    if (err) {
+      for (const f of req.files || []) fs.unlink(f.path, () => {});
+      return res.status(400).send(escapeHtml(err.code === 'LIMIT_FILE_COUNT' ? `Attach at most ${calRecord.MAX_PROOF_FILES} files.` : err.message || 'Upload failed.'));
+    }
+    next();
+  });
+}, (req, res) => {
+  const discard = () => { for (const f of req.files || []) fs.unlink(f.path, () => {}); };
+  if (!csrfTokenValid(req)) { discard(); return res.status(403).send('Invalid or expired form token. Please go back, refresh the page, and try again.'); }
+  const job = ownedJob(req);
+  if (!job) { discard(); return res.status(404).send('Not found'); }
+  if (!canUploadPhotos(req.session.user, job)) {
+    discard();
+    return res.status(403).send(job.status === 'Closed' ? 'This job is closed. The calibration record cannot be changed.' : 'Your role cannot record calibrations.');
+  }
+  const jobPath = `/jobs/${encodeURIComponent(job.jobId)}`;
+  for (const f of req.files || []) {
+    if (!proofSignatureMatches(f.path, f.mimetype)) { discard(); return res.status(400).send('A proof file is not a valid PDF or image.'); }
+  }
+  const { items } = loadCalibrationRecord(job, jobReport.parseStored(job.adas_eval));
+  const key = str(req.body.item_key, 100);
+  const item = key === 'ADDITIONAL' ? null : items.find((x) => x.key === key);
+  if (key !== 'ADDITIONAL' && !item) { discard(); setFlash(req, 'error', 'That requirement is not on this job.'); return res.redirect(jobPath); }
+  const { errors, record: r } = calRecord.validateRecord(req.body, item);
+  if (errors.length) { discard(); setFlash(req, 'error', `Record not saved: ${errors.join(' ')}`); return res.redirect(jobPath); }
+  const now = new Date().toISOString();
+  const info = db.prepare(`INSERT INTO job_calibrations (job_id,item_key,item_name,kind,result,method,si_reference,tool,performed_by_name,performed_on,reason,notes,created_by,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(job.jobId, r.item_key, r.item_name, r.kind, r.result, r.method, r.si_reference, r.tool,
+    r.performed_by_name, r.performed_on, r.reason, r.notes, req.session.user.id, now);
+  const addFile = db.prepare('INSERT INTO job_calibration_files (calibration_id,job_id,file_path,original_name,mime_type,size_bytes,uploaded_by,uploaded_at) VALUES (?,?,?,?,?,?,?,?)');
+  for (const f of req.files || []) addFile.run(info.lastInsertRowid, job.jobId, f.filename, (f.originalname || '').slice(0, 200), f.mimetype, f.size, req.session.user.id, now);
+  db.prepare('UPDATE jobs SET updatedAt=?, last_changed=? WHERE jobId=?').run(now, now, job.jobId);
+  setFlash(req, 'success', `Recorded: ${r.item_name}.`);
+  res.redirect(jobPath);
+});
+
+app.post('/jobs/:jobId/calibrations/:id/void', requireAuth, requireSubscription, (req, res) => {
+  const job = ownedJob(req);
+  if (!job) return res.status(404).send('Not found');
+  if (!canUploadPhotos(req.session.user, job)) return res.status(403).send(job.status === 'Closed' ? 'This job is closed. The calibration record cannot be changed.' : 'Your role cannot change the calibration record.');
+  const jobPath = `/jobs/${encodeURIComponent(job.jobId)}`;
+  const reason = str(req.body.void_reason, 300);
+  const row = db.prepare('SELECT * FROM job_calibrations WHERE id=? AND job_id=? AND voided_at IS NULL').get(req.params.id, job.jobId);
+  if (!row) return res.status(404).send('Record not found');
+  if (reason.length < 3) { setFlash(req, 'error', 'Give a reason to void the record.'); return res.redirect(jobPath); }
+  const now = new Date().toISOString();
+  db.prepare('UPDATE job_calibrations SET voided_at=?, voided_by=?, void_reason=? WHERE id=?').run(now, req.session.user.id, reason, row.id);
+  db.prepare('UPDATE jobs SET updatedAt=?, last_changed=? WHERE jobId=?').run(now, now, job.jobId);
+  setFlash(req, 'success', `Voided record for ${row.item_name}.`);
+  res.redirect(jobPath);
+});
+
+function sendProofFile(res, f) {
+  const root = path.resolve(uploadsDir);
+  const filePath = path.resolve(root, f.file_path);
+  if (!filePath.startsWith(root + path.sep)) return res.status(400).send('Invalid path');
+  res.type(calRecord.PROOF_EXT[f.mime_type] ? f.mime_type : 'application/octet-stream');
+  res.set('Cache-Control', 'private, max-age=0');
+  res.set('Content-Disposition', `inline; filename="proof-${f.id}${calRecord.PROOF_EXT[f.mime_type] || ''}"`);
+  res.sendFile(filePath, (err) => { if (err && !res.headersSent) res.status(404).send('File not found'); });
+}
+const PROOF_FILE_SQL = 'SELECT f.* FROM job_calibration_files f JOIN job_calibrations c ON c.id=f.calibration_id WHERE f.id=? AND f.job_id=? AND c.voided_at IS NULL';
+app.get('/jobs/:jobId/calibrations/files/:fileId', requireAuth, requireSubscription, (req, res) => {
+  const job = ownedJob(req);
+  if (!job) return res.status(404).send('Not found');
+  const f = db.prepare(PROOF_FILE_SQL).get(req.params.fileId, job.jobId);
+  if (!f) return res.status(404).send('Not found');
+  sendProofFile(res, f);
+});
+app.get('/share/:token/files/:fileId', (req, res) => {
+  res.set('Referrer-Policy', 'no-referrer');
+  res.set('X-Robots-Tag', 'noindex');
+  const row = db.prepare('SELECT * FROM share_tokens WHERE token=? AND revoked=0').get(req.params.token);
+  if (!row) return res.status(404).send('Not found');
+  const f = db.prepare(PROOF_FILE_SQL).get(req.params.fileId, row.job_id);
+  if (!f) return res.status(404).send('Not found');
+  sendProofFile(res, f);
+});
+
 // ─── Share Link ───────────────────────────────────────────────────────────────
 // Creating a link needs an active subscription; revoking does not, and links
 // that already exist keep working for insurers (see /share/:token).
 app.post('/jobs/:jobId/share', requireAuth, requireSubscription, (req, res) => {
+  if (req.session.user.role === 'platform_admin') return res.status(403).send('Share links belong to the shop.');
   const job = ownedJob(req);
   if (!job) return res.status(404).send('Not found');
   const token = crypto.randomUUID();
@@ -1219,6 +1577,7 @@ app.post('/jobs/:jobId/share', requireAuth, requireSubscription, (req, res) => {
   res.redirect(`/jobs/${encodeURIComponent(job.jobId)}`);
 });
 app.post('/jobs/:jobId/share/revoke', requireAuth, (req, res) => {
+  if (req.session.user.role === 'platform_admin') return res.status(403).send('Share links belong to the shop.');
   const job = ownedJob(req);
   if (!job) return res.status(404).send('Not found');
   db.prepare('UPDATE share_tokens SET revoked=1 WHERE job_id=? AND revoked=0').run(job.jobId);
@@ -1233,7 +1592,9 @@ app.get('/share/:token', (req, res) => {
   if (!job) return res.status(404).send('Not found');
   const adasList = job.adasSystems ? job.adasSystems.split('\n').filter(Boolean) : [];
   const adasEval = jobReport.parseStored(job.adas_eval);
-  const content = `<div class="job-doc"><div class="job-doc-header"><div><div class="doc-brand">CollisionIQ — Insurer View</div><div class="doc-owner">ADAS Calibration Documentation</div></div><div class="doc-meta"><div><span class="meta-label">Job ID</span> ${escapeHtml(job.jobId)}</div><div><span class="meta-label">Date</span> ${formatDate(job.createdAt)}</div></div></div><section class="doc-section"><h2 class="doc-section-title">Vehicle</h2><div class="info-grid"><div class="info-row"><span class="info-label">VIN</span><span class="info-val mono">${escapeHtml(job.vin)||'—'}</span></div><div class="info-row"><span class="info-label">Vehicle</span><span class="info-val">${escapeHtml(job.year)} ${escapeHtml(job.make)} ${escapeHtml(job.model)}</span></div><div class="info-row info-row-full"><span class="info-label">Repairs</span><span class="info-val">${escapeHtml(job.repairsPerformed)||'—'}</span></div></div></section>${adasEval ? jobReport.renderSections(adasEval, { insurer: true }) : `<section class="doc-section adas-section"><h2 class="doc-section-title">ADAS Requirements</h2><ul class="adas-list">${adasList.map(s=>`<li class="adas-item"><span class="adas-flag">&#9888;</span><span>${escapeHtml(s)}</span></li>`).join('')||'<li>No ADAS flagged.</li>'}</ul></section>`}<div class="doc-footer"><p>CollisionIQ — Insurer Read-Only View</p></div></div>`;
+  const rec = loadCalibrationRecord(job, adasEval);
+  const recordHtml = calRecord.renderSection(rec.st, rec.files, { fileUrl: (f) => `/share/${encodeURIComponent(req.params.token)}/files/${f.id}` });
+  const content = `<div class="job-doc"><div class="job-doc-header"><div><div class="doc-brand">CollisionIQ — Insurer View</div><div class="doc-owner">ADAS Calibration Documentation</div></div><div class="doc-meta"><div><span class="meta-label">Job ID</span> ${escapeHtml(job.jobId)}</div><div><span class="meta-label">Date</span> ${formatDate(job.createdAt)}</div></div></div><section class="doc-section"><h2 class="doc-section-title">Vehicle</h2><div class="info-grid"><div class="info-row"><span class="info-label">VIN</span><span class="info-val mono">${escapeHtml(job.vin)||'—'}</span></div><div class="info-row"><span class="info-label">Vehicle</span><span class="info-val">${escapeHtml(job.year)} ${escapeHtml(job.make)} ${escapeHtml(job.model)}</span></div><div class="info-row info-row-full"><span class="info-label">Repairs</span><span class="info-val">${escapeHtml(job.repairsPerformed)||'—'}</span></div></div></section>${adasEval ? jobReport.renderSections(adasEval, { insurer: true }) : `<section class="doc-section adas-section"><h2 class="doc-section-title">ADAS Requirements</h2><ul class="adas-list">${adasList.map(s=>`<li class="adas-item"><span class="adas-flag">&#9888;</span><span>${escapeHtml(s)}</span></li>`).join('')||'<li>No ADAS flagged.</li>'}</ul></section>`}${recordHtml}${calRecord.renderSignoffs(rec.sign, rec.st.summary)}<div class="doc-footer"><p>CollisionIQ — Insurer Read-Only View</p></div></div>`;
   res.send(layout(`Insurer View — ${job.jobId}`, content));
 });
 
@@ -1241,20 +1602,38 @@ app.get('/share/:token', (req, res) => {
 app.get('/admin', requireAdmin, (req, res) => {
   const user = req.session.user;
   const shopId = user.role === 'platform_admin' ? null : user.shop_id;
-  const jobs = shopId
+  let jobs = shopId
     ? db.prepare('SELECT * FROM jobs WHERE shop_id=? ORDER BY createdAt DESC').all(shopId)
     : db.prepare('SELECT * FROM jobs ORDER BY createdAt DESC').all();
+  if (user.role === 'platform_admin') {
+    const open = new Set(openShopIds());
+    jobs = jobs.filter((j) => open.has(j.shop_id));
+    for (const sid of open) logPlatformAccess(req, activeAccess(sid));
+  }
   const statusOptions = ['Created','In Progress','Calibration Complete','Closed'];
-  const rows = jobs.map(j => `<tr><td><span class="job-id">${escapeHtml(j.jobId)}</span></td><td>${escapeHtml(j.ro)||'—'}</td><td>${escapeHtml(j.year)} ${escapeHtml(j.make)} ${escapeHtml(j.model)}</td><td>${escapeHtml(j.technicianName)||'—'}</td><td><form method="POST" action="/jobs/${encodeURIComponent(j.jobId)}/status" class="inline-form">${csrfField(req)}<select name="status" data-autosubmit class="status-select">${statusOptions.map(s=>`<option value="${s}"${j.status===s?' selected':''}>${s}</option>`).join('')}</select></form></td><td>${formatDate(j.createdAt)}</td><td><a href="/jobs/${encodeURIComponent(j.jobId)}" class="btn btn-sm">View</a></td></tr>`).join('');
-  const content = `<div class="page-header"><h1>Admin — Job Management <span class="count-badge">${jobs.length}</span></h1></div><div class="table-wrap"><table class="data-table"><thead><tr><th>Job ID</th><th>RO #</th><th>Vehicle</th><th>Technician</th><th>Status</th><th>Date</th><th></th></tr></thead><tbody>${rows||'<tr><td colspan="7" class="empty">No jobs.</td></tr>'}</tbody></table></div>`;
+  const flash = consumeFlash(req);
+  const rows = jobs.map(j => `<tr><td><span class="job-id">${escapeHtml(j.jobId)}</span></td><td>${escapeHtml(j.ro)||'—'}</td><td>${escapeHtml(j.year)} ${escapeHtml(j.make)} ${escapeHtml(j.model)}</td><td>${escapeHtml(j.technicianName)||'—'}</td><td>${user.role === 'platform_admin' ? `<span class="badge badge-${statusClass(j.status)}">${escapeHtml(j.status)}</span>` : `<form method="POST" action="/jobs/${encodeURIComponent(j.jobId)}/status" class="inline-form">${csrfField(req)}<select name="status" data-autosubmit class="status-select">${statusOptions.map(s=>`<option value="${s}"${j.status===s?' selected':''}>${s}</option>`).join('')}</select></form>`}</td><td>${formatDate(j.createdAt)}</td><td><a href="/jobs/${encodeURIComponent(j.jobId)}" class="btn btn-sm">View</a></td></tr>`).join('');
+  const content = `${flash?`<div style="background:${flash.type==='success'?'#D6F0D6':'#FFD6D6'};color:${flash.type==='success'?'#1A6B1A':'#8B0000'};padding:.65rem 1rem;border-radius:6px;margin-bottom:1rem">${escapeHtml(flash.msg)}</div>`:''}<div class="page-header"><h1>Admin — Job Management <span class="count-badge">${jobs.length}</span></h1></div><div class="table-wrap"><table class="data-table"><thead><tr><th>Job ID</th><th>RO #</th><th>Vehicle</th><th>Technician</th><th>Status</th><th>Date</th><th></th></tr></thead><tbody>${rows||'<tr><td colspan="7" class="empty">No jobs.</td></tr>'}</tbody></table></div>`;
   res.send(layout('Admin', content, 'admin', user));
 });
 
 app.post('/jobs/:jobId/status', requireAdmin, requireSubscription, (req, res) => {
+  if (req.session.user.role === 'platform_admin') return res.status(403).send("Job status belongs to the shop. Platform admin can view jobs but not change them.");
   const valid = ['Created','In Progress','Calibration Complete','Closed'];
   if (!valid.includes(req.body.status)) return res.status(400).send('Invalid status');
   const job = ownedJob(req);
   if (!job) return res.status(404).send('Not found');
+  // Calibration Complete needs a complete record; Closed also needs a current
+  // technician sign-off and QC approval (or the QC override on the job page).
+  if (['Calibration Complete', 'Closed'].includes(req.body.status)) {
+    const { st, sign } = loadCalibrationRecord(job, jobReport.parseStored(job.adas_eval));
+    const blocker = req.body.status === 'Closed' ? calRecord.closeBlocker(sign, st.summary)
+      : (st.summary.complete ? null : `${st.summary.open} calibration record item(s) open — ${st.summary.openNames.join('; ')}`);
+    if (blocker) {
+      setFlash(req, 'error', `${job.jobId} cannot be marked ${req.body.status}: ${blocker}.${req.body.status === 'Closed' ? ' Approve or override on the job page.' : ''}`);
+      return res.redirect('/admin');
+    }
+  }
   const now = new Date().toISOString();
   db.prepare('UPDATE jobs SET status=?, updatedAt=?, last_changed=? WHERE jobId=?').run(req.body.status, now, now, job.jobId);
   res.redirect('/admin');
@@ -1324,12 +1703,48 @@ app.get('/platform/shops', requirePlatformAdmin, (req, res) => {
   const rows = shops.map(s => {
     const uc = db.prepare('SELECT COUNT(*) as c FROM users WHERE shop_id=?').get(s.id);
     const jc = db.prepare('SELECT COUNT(*) as c FROM jobs WHERE shop_id=?').get(s.id);
-    return `<tr><td><strong>${escapeHtml(s.name)}</strong></td><td>${escapeHtml(s.subscription_status||'inactive')}</td><td>${uc.c}</td><td>${jc.c}</td><td>${formatDate(s.created_at)}</td></tr>`;
+    const a = activeAccess(s.id);
+    const accessCell = a
+      ? `Open until ${escapeHtml(a.expires_at.replace('T',' ').slice(0,16))} UTC (${escapeHtml(ACCESS_REASONS[a.reason_type] || a.reason_type)})<form method="POST" action="/platform/access/${a.id}/close" class="inline-form">${csrfField(req)}<button class="btn btn-sm">Close</button></form>`
+      : `<form method="POST" action="/platform/shops/${s.id}/access" class="inline-form access-open-form">${csrfField(req)}<select name="reason_type" required><option value="">Reason…</option>${Object.entries(ACCESS_REASONS).map(([k, v]) => `<option value="${k}">${escapeHtml(v)}</option>`).join('')}</select><input type="text" name="note" maxlength="300" minlength="10" required placeholder="What and why (ticket, matter)"><button class="btn btn-sm">Open read-only</button></form>`;
+    return `<tr><td><strong>${escapeHtml(s.name)}</strong></td><td>${escapeHtml(s.subscription_status||'inactive')}</td><td>${uc.c}</td><td>${jc.c}</td><td>${accessCell}</td><td>${formatDate(s.created_at)}</td></tr>`;
   }).join('');
   const content = `<div class="page-header"><h1>Shops <span class="count-badge">${shops.length}</span></h1></div>
     <div class="doc-section" style="margin-bottom:2rem"><h2 class="doc-section-title">Onboard New Shop</h2><form method="POST" action="/platform/shops/create" style="display:grid;gap:1rem;max-width:520px">${csrfField(req)}<div class="form-group"><label>Shop Name</label><input type="text" name="shop_name" required></div><div class="form-group"><label>Admin Full Name</label><input type="text" name="admin_full_name" required></div><div class="form-group"><label>Admin Username</label><input type="text" name="admin_username" required autocomplete="off"></div><div class="form-group"><label>Temporary Password</label><input type="password" name="admin_password" required autocomplete="new-password"></div><button type="submit" class="btn btn-primary">Create Shop</button></form></div>
-    <div class="table-wrap"><table class="data-table"><thead><tr><th>Shop</th><th>Status</th><th>Users</th><th>Jobs</th><th>Created</th></tr></thead><tbody>${rows||'<tr><td colspan="5" class="empty">No shops.</td></tr>'}</tbody></table></div>`;
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Shop</th><th>Status</th><th>Users</th><th>Jobs</th><th>Job access</th><th>Created</th></tr></thead><tbody>${rows||'<tr><td colspan="6" class="empty">No shops.</td></tr>'}</tbody></table></div>`;
   res.send(layout('Shops', content, 'shops', req.session.user));
+});
+
+app.post('/platform/shops/:id/access', requirePlatformAdmin, (req, res) => {
+  const shop = db.prepare('SELECT id, name FROM shops WHERE id=?').get(req.params.id);
+  if (!shop) return res.status(404).send('Not found');
+  const reasonType = str(req.body.reason_type, 20);
+  const note = str(req.body.note, 300);
+  if (!ACCESS_REASONS[reasonType]) return res.status(400).send('Choose a reason the terms of service allow.');
+  if (note.length < 10) return res.status(400).send('Describe the matter (at least 10 characters).');
+  if (!activeAccess(shop.id)) {
+    const now = new Date();
+    db.prepare('INSERT INTO platform_access (shop_id,opened_by,reason_type,note,opened_at,expires_at) VALUES (?,?,?,?,?,?)')
+      .run(shop.id, req.session.user.id, reasonType, note, now.toISOString(), new Date(now.getTime() + ACCESS_HOURS * 3600 * 1000).toISOString());
+  }
+  res.redirect('/');
+});
+app.post('/platform/access/:id/close', requirePlatformAdmin, (req, res) => {
+  db.prepare('UPDATE platform_access SET closed_at=? WHERE id=? AND closed_at IS NULL').run(new Date().toISOString(), req.params.id);
+  res.redirect('/platform/shops');
+});
+app.get('/platform/access', requirePlatformAdmin, (req, res) => {
+  const t = (iso) => iso ? `${escapeHtml(iso.replace('T', ' ').slice(0, 16))} UTC` : '—';
+  const sessions = db.prepare(`SELECT a.*, s.name AS shop_name, u.username FROM platform_access a JOIN shops s ON s.id=a.shop_id
+    LEFT JOIN users u ON u.id=a.opened_by ORDER BY a.id DESC LIMIT 100`).all();
+  const views = db.prepare(`SELECT l.*, s.name AS shop_name FROM platform_access_log l JOIN shops s ON s.id=l.shop_id ORDER BY l.id DESC LIMIT 300`).all();
+  const content = `<div class="page-header"><h1>Access Log</h1></div>
+    <p class="adas-basis" style="margin-bottom:1rem">Your record of every time shop jobs were opened and every page viewed. It is private to the platform and kept as evidence that access stayed within the terms of service.</p>
+    <div class="doc-section"><h2 class="doc-section-title">Access sessions</h2><div class="table-wrap"><table class="data-table"><thead><tr><th>Opened</th><th>Shop</th><th>By</th><th>Reason</th><th>Note</th><th>Ends</th><th>Closed</th></tr></thead><tbody>
+      ${sessions.map((x) => `<tr><td>${t(x.opened_at)}</td><td>${escapeHtml(x.shop_name)}</td><td>${escapeHtml(x.username || '—')}</td><td>${escapeHtml(ACCESS_REASONS[x.reason_type] || x.reason_type)}</td><td>${escapeHtml(x.note)}</td><td>${t(x.expires_at)}</td><td>${t(x.closed_at)}</td></tr>`).join('') || '<tr><td colspan="7" class="empty">None.</td></tr>'}</tbody></table></div></div>
+    <div class="doc-section"><h2 class="doc-section-title">Pages viewed</h2><div class="table-wrap"><table class="data-table"><thead><tr><th>When</th><th>Shop</th><th>Page</th></tr></thead><tbody>
+      ${views.map((x) => `<tr><td>${t(x.at)}</td><td>${escapeHtml(x.shop_name)}</td><td class="mono">${escapeHtml(x.method)} ${escapeHtml(x.path)}</td></tr>`).join('') || '<tr><td colspan="3" class="empty">None.</td></tr>'}</tbody></table></div></div>`;
+  res.send(layout('Access Log', content, 'access', req.session.user));
 });
 
 app.post('/platform/shops/create', requirePlatformAdmin, asyncRoute(async (req, res) => {
@@ -1407,7 +1822,7 @@ app.get('/reference/lookup', requireAuth, requireSubscription, (req, res) => {
 // JSON body: { _csrf, make, model, year, lineItems: [eventId...], dtcs: [code...],
 //             collisionRelated?: boolean, equipped?: { SYSTEM_ID: boolean } }
 // lineItems are repair event IDs: oemCalibrationRules.EVENTS (Honda/Acura),
-// oemFordRules.EVENTS (covered Fords) or COMMON_EVENTS (all makes).
+// oemFordPosition.EVENTS (all Ford / Lincoln) or COMMON_EVENTS (all makes).
 // CSRF is enforced by the global verifyCsrf middleware via the _csrf body field.
 const OEM_MAX_ITEMS = 100;
 function oemStringList(value, field) {

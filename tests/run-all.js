@@ -14,7 +14,9 @@ const SUITES = [
   ['login failure diagnostics', 'login-diagnostics-test.js'],
   ['Ford calibration rules', 'ford-rules-test.js'],
   ['universal field rules', 'field-rules-test.js'],
+  ['GM calibration rules', 'gm-rules-test.js'],
   ['job form → hard copy', 'job-report-test.js'],
+  ['calibration record', 'calibration-record-test.js'],
 ];
 
 console.log(`Node ${process.version}`);
