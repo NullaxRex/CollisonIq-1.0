@@ -4,6 +4,7 @@
 //   data-action="print"          → window.print()
 //   data-copy-target="<elementId>" → copy that element's text to the clipboard
 //   <select data-autosubmit>      → submit the parent form on change
+//   <form data-confirm="question"> → ask before submitting
 
 document.addEventListener('click', (event) => {
   const print = event.target.closest('[data-action="print"]');
@@ -27,4 +28,9 @@ document.addEventListener('click', (event) => {
 document.addEventListener('change', (event) => {
   const select = event.target.closest('select[data-autosubmit]');
   if (select && select.form) select.form.submit();
+});
+
+document.addEventListener('submit', (event) => {
+  const form = event.target.closest('form[data-confirm]');
+  if (form && !window.confirm(form.dataset.confirm)) event.preventDefault();
 });

@@ -3,7 +3,8 @@
 //  (a) a database whose job_photos.shop_id is NOT NULL (needs the one-time rebuild)
 //  (b) a v1-schema database (jobs table without shop_id etc.; needs ADD COLUMN only)
 // and checks schema, idempotency, and that no rows or values change.
-// Also (c): the one-time technician assignment link for older jobs.
+// Also (c): the one-time technician assignment link for older jobs,
+// and (d): leftover guest accounts are turned off at boot.
 // Usage: node tests/migration-test.js
 const { spawnSync } = require('child_process');
 const { DatabaseSync } = require('node:sqlite');
@@ -112,6 +113,27 @@ const l4 = boot(c, 'assign db, repeat boot');
   const links = d.prepare('SELECT job_id, user_id FROM job_assignments ORDER BY job_id').all().map((x) => `${x.job_id}:${x.user_id}`).join(',');
   check('jobs linked by exact name or username, case-insensitive, same shop, active only, unambiguous only', links === 'J1:10,J5:10', links);
   check('link boot reports what it linked; repeat boot links nothing', /Linked 2 existing job/.test(l3) && !/Linked/.test(l4));
+  d.close();
+}
+
+// (d) leftover guest account from the removed guest login: turned off at boot.
+const g = path.join(tmp, 'guest.db');
+boot(g, 'guest db, first boot');
+{
+  const d = new DatabaseSync(g);
+  d.exec(`INSERT INTO shops (id, name, subscription_status) VALUES (50, 'Guest Shop', 'active');
+    INSERT INTO users (shop_id, username, password_hash, role, full_name, active) VALUES (50, 'guest', 'x', 'guest', 'Guest', 1),
+      (50, 'keep_tech', 'x', 'technician', 'Keep', 1);`);
+  d.close();
+}
+const g1 = boot(g, 'guest db, cleanup boot');
+const g2 = boot(g, 'guest db, repeat boot');
+{
+  const d = new DatabaseSync(g, { readOnly: true });
+  check('leftover guest account deactivated at boot', d.prepare("SELECT active FROM users WHERE username='guest'").get().active === 0);
+  check('other accounts untouched by guest cleanup', d.prepare("SELECT active FROM users WHERE username='keep_tech'").get().active === 1);
+  check('guest cleanup logs once', /Deactivated 1 leftover guest/.test(g1) && !/leftover guest/.test(g2));
+  check('users.off_with_shop column added', d.prepare('PRAGMA table_info(users)').all().some((c) => c.name === 'off_with_shop'));
   d.close();
 }
 

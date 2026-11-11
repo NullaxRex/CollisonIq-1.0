@@ -597,6 +597,92 @@ const userId = (username) => DB.prepare('SELECT id FROM users WHERE username=?')
   r = await pa.post('/platform/shops/create', { shop_name: 'New Shop', admin_full_name: 'N', admin_username: 'newshop_admin', admin_password: 'longenough1' });
   check('shops/create happy path', r.status === 302);
 
+  // ─── Platform admin: complimentary access, removal, accounts ──────────────
+  heading('Platform admin: accounts and shop removal');
+  if (DB) {
+    const newShop = DB.prepare("SELECT id FROM shops WHERE name='New Shop'").get().id;
+    const ns = new Client('newshop_admin');
+    r = await ns.login('newshop_admin', 'longenough1');
+    r = await ns.req('GET', '/new'); check('new onboarded shop starts without access', r.status === 302 && r.location === '/billing/inactive', `${r.status} ${r.location}`);
+    await pa.freshToken('/platform/shops');
+    r = await pa.post(`/platform/shops/${newShop}/comp`);
+    check('platform_admin gives complimentary access', r.status === 302 && DB.prepare('SELECT subscription_status s FROM shops WHERE id=?').get(newShop).s === 'comp');
+    r = await ns.req('GET', '/new'); check('complimentary shop can open the job form', r.status === 200, `status ${r.status}`);
+    r = await pa.req('GET', '/platform/accounts'); check('Accounts page lists users with shop names', r.status === 200 && r.text.includes('newshop_admin') && r.text.includes('New Shop'));
+    check('Accounts link in platform_admin nav', r.text.includes('href="/platform/accounts"'));
+    check('jobs history blocks delete on Accounts page', r.text.includes('Has job history'));
+    for (const p of ['/platform/accounts']) { r = await admin.req('GET', p); check(`shop_admin blocked from ${p}`, denied(r), `status ${r.status}`); }
+    await admin.freshToken('/');
+    r = await admin.post(`/platform/accounts/${userId('newshop_admin')}/deactivate`); check('shop_admin cannot deactivate via platform route', denied(r), `status ${r.status}`);
+    r = await admin.post(`/platform/shops/${newShop}/remove`); check('shop_admin cannot remove a shop', denied(r), `status ${r.status}`);
+    // Stripe-billed shops cannot be given complimentary access.
+    const metroId = DB.prepare("SELECT id FROM shops WHERE name='Metro Collision Center'").get().id;
+    DB.prepare("UPDATE shops SET stripe_customer_id='cus_comp_probe' WHERE id=?").run(metroId);
+    await pa.freshToken('/platform/shops');
+    const metroStatus = DB.prepare('SELECT subscription_status s FROM shops WHERE id=?').get(metroId).s;
+    r = await pa.post(`/platform/shops/${metroId}/comp`);
+    check('no complimentary access for a Stripe-billed shop', DB.prepare('SELECT subscription_status s FROM shops WHERE id=?').get(metroId).s === metroStatus);
+    DB.prepare('UPDATE shops SET stripe_customer_id=NULL WHERE id=?').run(metroId);
+    // Throwaway account with no history: deactivate signs it out, reactivate, delete.
+    await ns.freshToken('/admin/users');
+    r = await ns.post('/admin/users/create', { full_name: 'Temp Tech', username: 'temp_tech', password: 'longenough1', role: 'technician' });
+    const temp = new Client('temp_tech');
+    r = await temp.login('temp_tech', 'longenough1'); check('temp account signs in', r.status === 302 && r.location === '/');
+    await pa.freshToken('/platform/accounts');
+    r = await pa.post(`/platform/accounts/${userId('temp_tech')}/deactivate`);
+    check('platform_admin deactivates an account', DB.prepare("SELECT active FROM users WHERE username='temp_tech'").get().active === 0);
+    r = await temp.req('GET', '/'); check('deactivated account is signed out immediately', r.status === 302 && r.location === '/login', `${r.status} ${r.location}`);
+    r = await temp.login('temp_tech', 'longenough1'); check('deactivated account cannot sign in', r.location.includes('error=1'), r.location);
+    await pa.freshToken('/platform/accounts');
+    r = await pa.post(`/platform/accounts/${userId('temp_tech')}/reactivate`);
+    r = await temp.login('temp_tech', 'longenough1'); check('reactivated account signs in again', r.status === 302 && r.location === '/');
+    await pa.freshToken('/platform/accounts');
+    r = await pa.post(`/platform/accounts/${userId('temp_tech')}/delete`);
+    check('account with no job history is deleted', !DB.prepare("SELECT 1 FROM users WHERE username='temp_tech'").get());
+    r = await temp.req('GET', '/'); check('deleted account is signed out', r.status === 302 && r.location === '/login');
+    // An account whose name is on job records cannot be deleted.
+    await pa.freshToken('/platform/accounts');
+    r = await pa.post(`/platform/accounts/${userId('metro_admin')}/delete`);
+    check('account with job history is kept', Boolean(DB.prepare("SELECT 1 FROM users WHERE username='metro_admin'").get()));
+    r = await pa.post(`/platform/accounts/${userId('platform_admin')}/deactivate`); check('platform_admin account is protected', denied(r), `status ${r.status}`);
+    // Remove, Stripe can't revive, restore, then delete an empty shop.
+    await ns.freshToken('/admin/users');
+    r = await ns.post('/admin/users/create', { full_name: 'Gone', username: 'ns_off_before', password: 'longenough1', role: 'technician' });
+    r = await ns.post(`/admin/users/${userId('ns_off_before')}/deactivate`);
+    await pa.freshToken('/platform/shops');
+    r = await pa.post(`/platform/shops/${newShop}/remove`);
+    check('shop removed and its users turned off', DB.prepare('SELECT subscription_status s FROM shops WHERE id=?').get(newShop).s === 'removed' && DB.prepare("SELECT active FROM users WHERE username='newshop_admin'").get().active === 0);
+    r = await ns.req('GET', '/'); check('removed shop users are signed out', r.status === 302 && r.location === '/login');
+    if (WEBHOOK_SECRET) {
+      DB.prepare("UPDATE shops SET stripe_customer_id='cus_removed_probe' WHERE id=?").run(newShop);
+      const payload = JSON.stringify({ id: 'evt_' + crypto.randomUUID(), object: 'event', type: 'customer.subscription.updated', data: { object: { id: 'sub_x', object: 'subscription', customer: 'cus_removed_probe', status: 'active' } } });
+      const t = Math.floor(Date.now() / 1000);
+      const sig = crypto.createHmac('sha256', WEBHOOK_SECRET).update(`${t}.${payload}`).digest('hex');
+      await fetch(BASE + '/api/billing/webhook', { method: 'POST', body: payload, headers: { 'content-type': 'application/json', 'stripe-signature': `t=${t},v1=${sig}` } });
+      check('Stripe webhook does not revive a removed shop', DB.prepare('SELECT subscription_status s FROM shops WHERE id=?').get(newShop).s === 'removed');
+      DB.prepare('UPDATE shops SET stripe_customer_id=NULL WHERE id=?').run(newShop);
+    }
+    await pa.freshToken('/platform/accounts');
+    r = await pa.post(`/platform/accounts/${userId('newshop_admin')}/reactivate`);
+    check('user in a removed shop cannot be reactivated alone', DB.prepare("SELECT active FROM users WHERE username='newshop_admin'").get().active === 0);
+    await pa.freshToken('/platform/shops');
+    r = await pa.post(`/platform/shops/${newShop}/restore`);
+    check('restore brings back the accounts the removal turned off', DB.prepare("SELECT active FROM users WHERE username='newshop_admin'").get().active === 1);
+    check('restore leaves accounts deactivated before removal off', DB.prepare("SELECT active FROM users WHERE username='ns_off_before'").get().active === 0);
+    check('restored shop is inactive until access is given', DB.prepare('SELECT subscription_status s FROM shops WHERE id=?').get(newShop).s === 'inactive');
+    await pa.freshToken('/platform/shops');
+    r = await pa.post(`/platform/shops/${newShop}/delete`);
+    check('a shop must be removed before delete', Boolean(DB.prepare('SELECT 1 FROM shops WHERE id=?').get(newShop)));
+    r = await pa.post(`/platform/shops/${metroId}/remove`); r = await pa.post(`/platform/shops/${metroId}/delete`);
+    check('a shop with jobs cannot be deleted', Boolean(DB.prepare('SELECT 1 FROM shops WHERE id=?').get(metroId)));
+    r = await pa.post(`/platform/shops/${metroId}/restore`);
+    DB.prepare("UPDATE shops SET subscription_status='active' WHERE id=?").run(metroId);
+    r = await admin.login('metro_admin', 'demo1234'); check('restored shop admin signs back in', r.status === 302 && r.location === '/');
+    r = await pa.post(`/platform/shops/${newShop}/remove`); r = await pa.post(`/platform/shops/${newShop}/delete`);
+    check('empty removed shop deleted with its accounts', !DB.prepare('SELECT 1 FROM shops WHERE id=?').get(newShop) && !DB.prepare("SELECT 1 FROM users WHERE username='newshop_admin'").get());
+    r = await pa.req('GET', '/platform/shops'); check('Shops page renders after removals', r.status === 200);
+  }
+
   // ─── Stripe / subscription ─────────────────────────────────────────────────
   heading('Stripe webhook & subscription');
   r = await anon.raw('POST', '/api/billing/webhook', '{}', 'application/json');
