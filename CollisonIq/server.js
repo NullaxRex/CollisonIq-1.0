@@ -215,6 +215,36 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_platform_access_log_shop ON platform_access_log(shop_id, id);
 `);
+// CREATE TABLE IF NOT EXISTS leaves an older table as it was. A database that
+// already had one of these tables from an earlier build (production had an
+// older job_assignments without removed_by) gets any missing columns added
+// here. Columns are added as nullable: ALTER TABLE cannot add NOT NULL columns
+// to a table that has rows, and older rows have no value for them.
+{
+  const expected = {
+    job_calibrations: ['item_key TEXT', 'item_name TEXT', 'kind TEXT', 'result TEXT', 'method TEXT', 'si_reference TEXT', 'tool TEXT',
+      'performed_by_name TEXT', 'performed_on TEXT', 'reason TEXT', 'notes TEXT', 'created_by INTEGER', 'created_at TEXT',
+      'voided_at TEXT', 'voided_by INTEGER', 'void_reason TEXT'],
+    job_calibration_files: ['calibration_id INTEGER', 'file_path TEXT', 'original_name TEXT', 'mime_type TEXT', 'size_bytes INTEGER',
+      'uploaded_by INTEGER', 'uploaded_at TEXT'],
+    job_signoffs: ['kind TEXT', 'user_id INTEGER', 'user_name TEXT', 'role TEXT', 'statement TEXT', 'justification TEXT',
+      'open_items TEXT', 'created_at TEXT'],
+    job_assignments: ['user_id INTEGER', 'assigned_by INTEGER', 'assigned_at TEXT', 'removed_by INTEGER', 'removed_at TEXT'],
+    platform_access: ['shop_id INTEGER', 'opened_by INTEGER', 'reason_type TEXT', 'note TEXT', 'opened_at TEXT', 'expires_at TEXT', 'closed_at TEXT'],
+    platform_access_log: ['access_id INTEGER', 'shop_id INTEGER', 'user_id INTEGER', 'method TEXT', 'path TEXT', 'at TEXT'],
+  };
+  for (const [table, cols] of Object.entries(expected)) {
+    const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
+    const added = [];
+    for (const def of cols) {
+      const name = def.split(' ')[0];
+      if (have.has(name)) continue;
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${def}`);
+      added.push(name);
+    }
+    if (added.length) console.log(`Added missing column(s) to older ${table} table: ${added.join(', ')}.`);
+  }
+}
 // One-time link for jobs saved before assignments existed: a job whose typed
 // technician name matches exactly one active technician in its shop (full name
 // or username) is assigned to that technician. Jobs that never had an
@@ -1801,9 +1831,14 @@ const USER_HISTORY_CHECKS = [
   'SELECT 1 FROM job_assignments WHERE user_id=? OR assigned_by=? OR removed_by=?',
   'SELECT 1 FROM platform_access WHERE opened_by=?',
   'SELECT 1 FROM platform_access_log WHERE user_id=?',
-].map((sql) => ({ stmt: db.prepare(sql + ' LIMIT 1'), n: (sql.match(/\?/g) || []).length }));
+].map((sql) => {
+  // Never let a schema surprise stop the server from booting. A check that
+  // can't run counts as "has history", so the account can't be deleted.
+  try { return { stmt: db.prepare(sql + ' LIMIT 1'), n: (sql.match(/\?/g) || []).length }; }
+  catch (err) { console.error(`[account history] check disabled (${err.message}): ${sql}`); return null; }
+});
 function userHasHistory(id) {
-  return USER_HISTORY_CHECKS.some(({ stmt, n }) => Boolean(stmt.get(...Array(n).fill(id))));
+  return USER_HISTORY_CHECKS.some((c) => !c || Boolean(c.stmt.get(...Array(c.n).fill(id))));
 }
 function shopDeleteBlocker(shopId) {
   if (db.prepare('SELECT 1 FROM jobs WHERE shop_id=? LIMIT 1').get(shopId)) return 'it has jobs';

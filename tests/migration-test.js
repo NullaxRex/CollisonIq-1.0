@@ -4,7 +4,8 @@
 //  (b) a v1-schema database (jobs table without shop_id etc.; needs ADD COLUMN only)
 // and checks schema, idempotency, and that no rows or values change.
 // Also (c): the one-time technician assignment link for older jobs,
-// and (d): leftover guest accounts are turned off at boot.
+// (d): leftover guest accounts are turned off at boot, and (e): older copies
+// of the new tables get their missing columns.
 // Usage: node tests/migration-test.js
 const { spawnSync } = require('child_process');
 const { DatabaseSync } = require('node:sqlite');
@@ -134,6 +135,27 @@ const g2 = boot(g, 'guest db, repeat boot');
   check('other accounts untouched by guest cleanup', d.prepare("SELECT active FROM users WHERE username='keep_tech'").get().active === 1);
   check('guest cleanup logs once', /Deactivated 1 leftover guest/.test(g1) && !/leftover guest/.test(g2));
   check('users.off_with_shop column added', d.prepare('PRAGMA table_info(users)').all().some((c) => c.name === 'off_with_shop'));
+  d.close();
+}
+
+// (e) older job_assignments table from an earlier build (production, Nov 2026):
+// no assigned_by / removed_by / removed_at. Boot crashed on it; now it adds them.
+const e = path.join(tmp, 'old-assign.db');
+{
+  const d = new DatabaseSync(e);
+  d.exec(`CREATE TABLE job_assignments (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, user_id INTEGER NOT NULL, assigned_at TEXT);
+    INSERT INTO job_assignments (job_id, user_id, assigned_at) VALUES ('OLD-1', 7, '2026-03-30T00:00:00Z');`);
+  d.close();
+}
+const e1 = boot(e, 'old job_assignments db, boot #1');
+const e2 = boot(e, 'old job_assignments db, boot #2');
+{
+  const d = new DatabaseSync(e, { readOnly: true });
+  const cols = d.prepare('PRAGMA table_info(job_assignments)').all().map((c) => c.name);
+  check('missing job_assignments columns added', ['assigned_by', 'removed_by', 'removed_at'].every((c) => cols.includes(c)), cols.join(','));
+  check('existing assignment kept and still active', d.prepare("SELECT removed_at FROM job_assignments WHERE job_id='OLD-1' AND user_id=7").get()?.removed_at === null);
+  check('column upgrade logs once', /Added missing column\(s\) to older job_assignments table: assigned_by, removed_by, removed_at/.test(e1) && !/Added missing column/.test(e2));
+  check('no history check disabled on a real schema', !/check disabled/.test(e1 + e2));
   d.close();
 }
 
